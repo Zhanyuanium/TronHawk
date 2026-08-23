@@ -11,7 +11,10 @@ name = "tronhawk-injector-launcher"
 path = "src/bin/launcher.rs"
 
 [dependencies]
-# Vendored electron-hook (see docs/AGENTS.md "Cloned Dependency Source"). Vendoring is
-# required because upstream ships a submodule + its own [workspace] + nightly, which cannot
-# be consumed as a plain crates.io/git dependency.
+# Vendored electron-hook (see vendor/electron-hook/VENDOR.md). Vendoring is required because
+# upstream ships a submodule + its own [workspace] + under-declares winapi features, which
+# cannot be consumed as a plain crates.io/git dependency.
 electron-hook = { path = "../../vendor/electron-hook" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

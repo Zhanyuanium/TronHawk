@@ -6,3 +6,6 @@
 //! This layer must NOT contain plugin logic or permission decisions (see docs/AGENTS.md).
 
 pub use electron_hook::*;
+
+#[cfg(windows)]
+pub mod registry;
