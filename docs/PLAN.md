@@ -10,6 +10,9 @@ roadmap, phased to the milestones in SPEC §15.
 - Post-review contract convergence applied: SDK public API frozen to the MVP surface; manager
   security baseline (CSP, no global Tauri, minimal capabilities); manager merged into the root
   workspace; CI now covers manager build, SDK/plugin typecheck, and the Electron fixture.
+- Phase 1 (Injection) PoC validated: electron-hook (vendored) injects into a packaged Electron 43.4.1
+  app — main-process + renderer (main world) capability confirmed; injector formalized with IFEO
+  registration + transparent bootstrap. See docs/adr/0001-injection-backend.md.
 - Toolchain: rustc/cargo 1.97.1 ✓, bun 1.4.0 ✓, Tauri CLI ✓ (via bun). Node not required — bun is
   the JS toolchain.
 

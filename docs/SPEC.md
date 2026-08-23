@@ -105,10 +105,14 @@ Approach: **Windows + IFEO + electron-hook + launcher fallback.** Do NOT do bina
 Chromium replacement, or V8 hook.
 
 Pre-production validation (must PoC → ADR before committing):
-1. electron-hook renderer capability
-2. electron-hook main-process capability
-3. latest Electron version compatibility
-4. ChatGPT Desktop, 5. VS Code
+1. electron-hook renderer capability — ✅ validated (main-world JS + CSS)
+2. electron-hook main-process capability — ✅ validated (full `require("electron")`)
+3. latest Electron version compatibility — ✅ validated on Electron 43.4.1
+4. ChatGPT Desktop, 5. VS Code — ⏳ real-target validation pending
+
+PoC → ADR: `docs/adr/0001-injection-backend.md`. electron-hook is **vendored** (`vendor/electron-hook/`,
+LGPL-3.0 + MIT Detours) and activates via a **launcher wrapper** (Detours), so IFEO's `Debugger` key
+routes launches through our injector launcher to preserve transparent-launch UX.
 
 Main challenges: entering the main process (BrowserWindow / ipcMain / session), and modern-Electron
 guards (contextIsolation, sandbox, ASAR, code cache, custom preload).
