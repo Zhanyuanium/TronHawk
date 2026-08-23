@@ -111,8 +111,9 @@ Pre-production validation (must PoC → ADR before committing):
 4. ChatGPT Desktop — ⚠️ installed build is the MSIX `OpenAI.Codex` (owl Electron fork): injection
    + app load work, but full GUI startup fails under raw-exe launch (needs AUMID; see ADR).
 5. VS Code — ❌ no `resources/app.asar` (unpacked `resources/app/`); the ASAR-remap path cannot
-   target it. Obsidian (standard Electron 43.3.0) validated instead — full injection + renderer
-   CSS/DOM injection (macOS-style traffic-light mod) work.
+   target it. Obsidian (standard Electron 43.3.0) validated instead — injection + renderer
+   CSS/DOM injection work, but it loads via a custom `app://` protocol so only the shell renders
+   (full UI needs application profiles; see ADR).
 
 PoC → ADR: `docs/adr/0001-injection-backend.md`. electron-hook is **vendored** (`vendor/electron-hook/`,
 LGPL-3.0 + MIT Detours) and activates via a **launcher wrapper** (Detours), so IFEO's `Debugger` key

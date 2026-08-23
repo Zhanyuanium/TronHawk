@@ -57,6 +57,8 @@ committing.
     Detours launch — the MSIX app needs AUMID launch (yields `userData`-path, `Invalid semantic
     version`, and registry access-denied errors). MSIX targets are a separate category (SPEC §18).
   - VS Code: unpacked `resources/app/` (no `app.asar`), so the ASAR-remap path cannot target it.
-  - Obsidian (Electron 43.3.0, standard): full success — injection + original app load + renderer
-    CSS/DOM injection (macOS-style traffic-light mod) all work, programmatically verified.
+  - Obsidian (Electron 43.3.0, standard): injection + original app load + renderer CSS/DOM
+    injection all work (programmatically verified), but Obsidian loads its renderer via a custom
+    `app://obsidian.md` protocol, so only the `index.html` shell renders — the full UI does not.
+    Custom-protocol apps need application profiles (SPEC §18).
 - Keep electron-hook isolated behind the Injector layer (SPEC §17 risk mitigation).
