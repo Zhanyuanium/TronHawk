@@ -169,7 +169,8 @@ Logging: three streams — Core, Runtime, Plugin (`[Plugin ID][Level][Timestamp]
 ## 13. SDK & DX
 
 `@tronhawk/sdk` provides types (`PluginContext`, `RendererContext`, `MainContext`), utilities
-(`injectCSS`, `createLogger`, `requestNetwork`), and testing helpers (`mockElectron`).
+(`injectCSS`, `createLogger`), and testing helpers (`createMockRendererContext`,
+`createMockMainContext`).
 Scaffolding CLI: `create-tronhawk-plugin`. Full API in `PLUGIN-SDK.md`.
 
 ## 14. Testing

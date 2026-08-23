@@ -1,0 +1,5 @@
+{
+  "name": "tronhawk",
+  "private": true,
+  "workspaces": ["sdk", "plugins/*"]
+}

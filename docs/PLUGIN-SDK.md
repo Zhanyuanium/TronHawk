@@ -14,9 +14,12 @@ my-plugin/
 
 ## Manifest
 
-Required: `id`, `name`, `version`, `author`, `tronhawk` (e.g. `"^1.0"`).
+Required: `id`, `name`, `version`, `author`, `tronhawk` (host runtime protocol version, e.g. `"^0.1"`).
 Optional: `entry.{renderer,main}` (renderer → Chromium renderer, main → Electron main process),
 `permissions[]`, `config{}`. Both entries optional (a CSS-only theme needs only `renderer`).
+
+The `tronhawk` field declares the TronHawk **runtime protocol version** the plugin targets — it is
+NOT the SDK npm version.
 
 ```json
 {
@@ -24,7 +27,7 @@ Optional: `entry.{renderer,main}` (renderer → Chromium renderer, main → Elec
   "name": "Glass UI",
   "version": "1.0.0",
   "author": "Example",
-  "tronhawk": "^1.0",
+  "tronhawk": "^0.1",
   "entry": { "renderer": "dist/renderer.js", "main": "dist/main.js" },
   "permissions": ["renderer.css"]
 }
@@ -37,11 +40,12 @@ Optional: `entry.{renderer,main}` (renderer → Chromium renderer, main → Elec
 | `renderer.css` | `ctx.css.insert()` / `ctx.css.remove()` | low |
 | `renderer.script` | `ctx.script.execute()` | medium |
 | `renderer.dom` | `ctx.dom.query()` / `ctx.dom.observe()` | medium |
-| `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` | — |
+| `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` / `setMica()` | — |
 | `electron.webContents` | DevTools, navigation, preload | — |
-| `electron.session` | User-Agent, proxy, cookies | — |
-| `electron.ipc` | observe / intercept IPC | high |
-| `network` | `ctx.network.request()` (domain whitelist) | proxy = high |
+| `electron.session` | User-Agent, proxy, cookies (future) | — |
+| `electron.ipc` | observe / intercept IPC (future) | high |
+| `network.access` | `ctx.network.request()` (domain whitelist) | — |
+| `network.proxy` | request interception / modification | high |
 | `runtime.unsafe` | `ctx.raw` (Electron / Node) | dev only |
 
 ## Lifecycle
@@ -53,10 +57,12 @@ export default {
 }
 ```
 
+`activate` / `deactivate` may return `void | Promise<void>`; the runtime awaits returned promises.
+
 ## Renderer API (`RendererContext`)
 
 ```ts
-interface RendererContext { css; dom; script; storage; events; }
+interface RendererContext extends PluginContext { css; dom; script; }
 ```
 
 - `ctx.css.insert(css)` / `ctx.css.remove(id)` — stylesheets carry owner plugin id + unique id
@@ -64,27 +70,30 @@ interface RendererContext { css; dom; script; storage; events; }
 - `ctx.dom.query(selector)`; `ctx.dom.observe(selector, cb)` — MutationObserver abstraction, for
   React/Vue dynamic DOM.
 - `ctx.script.execute(code)` — requires `renderer.script`; runs in plugin context.
-- `ctx.storage.get()/set()` — future; unified access to localStorage/IndexedDB (do NOT touch raw `localStorage`).
+- (future) `ctx.storage.get()/set()` — unified access to localStorage/IndexedDB (do NOT touch raw
+  `localStorage`).
 
 ## Main API (`MainContext`)
 
 ```ts
-interface MainContext { window; webContents; session; ipc; }
+interface MainContext extends PluginContext { window; webContents; }
 ```
 
-- `ctx.window.onCreated(cb)`; MVP `setOpacity()` / `setSize()` / `setPosition()`,
-  future `setVibrancy()` / `setMica()` / `setTrafficLightPosition()`.
-- `ctx.webContents`: MVP `openDevTools()` / `reload()` / `executeJavaScript()`,
-  future `injectPreload()` / `modifyNavigation()`.
-- `ctx.session.modify()` — future (User-Agent, proxy, request interception).
-- `ctx.ipc.on()/send()/intercept()` — future; high privilege.
+- `ctx.window.onCreated(cb)` — `cb` receives an opaque `WindowHandle`; every window mutation takes
+  that handle, so multi-window apps are unambiguous.
+- `ctx.window.setOpacity(win, n)` / `setSize(win, w, h)` / `setPosition(win, x, y)` — cross-platform.
+- `ctx.window.setVibrancy(win, material)` (macOS) / `setMica(win, enabled)` (Windows 11) — return a
+  structured error on unsupported platforms.
+- `ctx.webContents.openDevTools(win)` / `reload(win)` / `executeJavaScript(win, code)`.
+- (future) `ctx.session.modify()` (User-Agent, proxy, request interception).
+- (future) `ctx.ipc.on()/send()/intercept()` — high privilege.
 
 ## Logging & network
 
 - Log via `ctx.logger.info()/warn()/error()` — format `[Plugin ID][Level][Timestamp] message`.
   `console.log()` is not formal logging.
-- Network only via `await ctx.network.request({ url, method })`; Core enforces permission +
-  domain whitelist + logging/blocking.
+- Network only via `await ctx.network.request({ url, method })` (requires `network.access`); Core
+  enforces permission + domain whitelist + logging/blocking. Interception requires `network.proxy`.
 
 ## Config
 
@@ -93,6 +102,8 @@ Declare a schema in `manifest.json`; the Manager auto-generates a settings UI:
 ```json
 { "config": { "opacity": { "type": "number", "default": 0.8 } } }
 ```
+
+`ctx.config.get(key)` returns `unknown` until per-plugin schema typing lands; `ctx.config.set(key, value)`.
 
 ## Plugin-to-plugin communication
 

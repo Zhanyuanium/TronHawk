@@ -3,7 +3,7 @@
   "name": "Hello World",
   "version": "0.1.0",
   "author": "Example",
-  "tronhawk": "^1.0",
+  "tronhawk": "^0.1",
   "entry": { "renderer": "dist/renderer.js" },
   "permissions": ["renderer.css"]
 }
