@@ -108,7 +108,9 @@ Pre-production validation (must PoC → ADR before committing):
 1. electron-hook renderer capability — ✅ validated (main-world JS + CSS)
 2. electron-hook main-process capability — ✅ validated (full `require("electron")`)
 3. latest Electron version compatibility — ✅ validated on Electron 43.4.1
-4. ChatGPT Desktop, 5. VS Code — ⏳ real-target validation pending
+4. ChatGPT Desktop — ⚠️ installed build is the MSIX `OpenAI.Codex` (owl Electron fork): injection
+   + app load work, but full GUI startup fails under raw-exe launch (needs AUMID; see ADR).
+5. VS Code — ⏳ real-target validation pending
 
 PoC → ADR: `docs/adr/0001-injection-backend.md`. electron-hook is **vendored** (`vendor/electron-hook/`,
 LGPL-3.0 + MIT Detours) and activates via a **launcher wrapper** (Detours), so IFEO's `Debugger` key

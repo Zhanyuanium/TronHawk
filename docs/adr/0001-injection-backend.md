@@ -50,5 +50,11 @@ committing.
 - `crates/injector` = a cdylib (`pub use electron_hook::*`) + a launcher binary.
 - No special toolchain needed: the injector builds on stable 1.97.1.
 - `vendor/electron-hook/` must be committed; trim Detours to `src/` + `LICENSE`.
-- Real-target validation (ChatGPT Desktop, VS Code) remains (SPEC §8 items 4-5).
+- Real-target validation (2026-08-24): the installed "ChatGPT" is the `OpenAI.Codex` **MSIX**
+  package running a custom "owl" Electron fork (`process.versions.electron = 151.0.7922.170`, a
+  4-part non-semver string). Main-process injection succeeds and the original app loads (with a
+  `realpathSync` workaround for Electron 151), but the GUI does not fully start under raw-exe
+  Detours launch — the MSIX app needs AUMID launch, and raw launch yields `userData`-path,
+  `Invalid semantic version`, and registry access-denied errors. MSIX targets are a separate
+  category (SPEC §18 application profiles / Explorer mode). Non-MSIX VS Code remains to be tested.
 - Keep electron-hook isolated behind the Injector layer (SPEC §17 risk mitigation).
