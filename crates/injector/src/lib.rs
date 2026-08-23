@@ -1,9 +1,8 @@
-//! Enter target process, load bootstrap, establish comms. Must NOT contain plugin logic or permission decisions. (placeholder).
+//! TronHawk injector — wraps `electron-hook` to inject into target Electron apps.
+//!
+//! Re-exporting `electron_hook::*` compiles electron-hook's `DllMain` hook into this
+//! cdylib, so the built `.dll` performs the Detours injection + in-memory ASAR remap.
+//!
+//! This layer must NOT contain plugin logic or permission decisions (see docs/AGENTS.md).
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder_compiles() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub use electron_hook::*;

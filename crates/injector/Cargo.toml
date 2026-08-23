@@ -3,4 +3,15 @@ name = "tronhawk-injector"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "tronhawk-injector-launcher"
+path = "src/bin/launcher.rs"
+
 [dependencies]
+# Vendored electron-hook (see docs/AGENTS.md "Cloned Dependency Source"). Vendoring is
+# required because upstream ships a submodule + its own [workspace] + nightly, which cannot
+# be consumed as a plain crates.io/git dependency.
+electron-hook = { path = "../../vendor/electron-hook" }
