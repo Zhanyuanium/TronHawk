@@ -1,0 +1,6 @@
+{
+  "name": "tronhawk-plugin-hello-world",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "build": "echo \"no build step yet\"" }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "com.example.hello-world",
+  "name": "Hello World",
+  "version": "0.1.0",
+  "author": "Example",
+  "tronhawk": "^1.0",
+  "entry": { "renderer": "dist/renderer.js" },
+  "permissions": ["renderer.css"]
+}
