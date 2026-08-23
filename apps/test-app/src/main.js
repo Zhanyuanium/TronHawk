@@ -8,6 +8,10 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      // Deterministic, in-memory (non-persistent) session for integration tests.
+      partition: "tronhawk-test",
     },
   });
 

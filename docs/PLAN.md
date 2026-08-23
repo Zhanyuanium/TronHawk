@@ -5,8 +5,13 @@ roadmap, phased to the milestones in SPEC §15.
 
 ## Status
 
-- Repo is empty: only `docs/` exists, no commits yet.
-- Toolchain: rustc/cargo 1.97.1 ✓, bun 1.4.0 ✓; **node ✗**, **tauri-cli ✗** (install in Phase 0).
+- Phase 0 (Foundation) complete: Rust workspace, SDK, Tauri manager, Electron test-app all build
+  and pass their tests.
+- Post-review contract convergence applied: SDK public API frozen to the MVP surface; manager
+  security baseline (CSP, no global Tauri, minimal capabilities); manager merged into the root
+  workspace; CI now covers manager build, SDK/plugin typecheck, and the Electron fixture.
+- Toolchain: rustc/cargo 1.97.1 ✓, bun 1.4.0 ✓, Tauri CLI ✓ (via bun). Node not required — bun is
+  the JS toolchain.
 
 ## Research-driven corrections (Aug 2026)
 

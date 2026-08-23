@@ -6,12 +6,18 @@
 node_modules/
 **/node_modules/
 
-# Tauri
-**/src-tauri/target/
-apps/manager/dist/
+# Build output
+dist/
+out/
+release/
+coverage/
 
 # TronHawk artifacts
 *.thx
+
+# Env & secrets
+.env*
+!.env.example
 
 # OS / editor
 .DS_Store
