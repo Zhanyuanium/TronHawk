@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-08-24T00:00:00.000Z",
+  "dependencies": [
+    {
+      "name": "electron-hook",
+      "resolvedVersion": "0.2.2",
+      "repoUrl": "https://github.com/MeguminSama/Electron-Hook.git",
+      "ref": "c7e55b3d62f0b653abba87d363ceb8b07780cd78",
+      "path": ".slim/clonedeps/repos/MeguminSama__Electron-Hook",
+      "packagePath": "",
+      "reason": "Runtime Electron injection mechanism (Detours DLL injection + in-memory ASAR remap) that the TronHawk injector crate wraps"
+    }
+  ]
+}

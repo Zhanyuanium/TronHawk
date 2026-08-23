@@ -76,6 +76,13 @@ Correctness > Architecture > Maintainability > Performance > Convenience.
 1. Understand architecture / APIs / tests → 2. Plan (files, reason, risks) → 3. Implement (no unrelated refactor)
 → 4. Test (`cargo test`, `bun test`) → 5. Update docs.
 
+## Cloned Dependency Source
+
+Read-only dependency source repositories are available under `.slim/clonedeps/repos/` for
+inspection. Do not edit these clones.
+
+- `.slim/clonedeps/repos/MeguminSama__Electron-Hook/` - `electron-hook` at `c7e55b3d` (crate 0.2.2); the runtime injection mechanism (Detours DLL injection + in-memory ASAR remap) that `crates/injector` wraps.
+
 ## Deferred (not MVP)
 
 Application profiles, Explorer mode, plugin marketplace UI, native hooks, CEF support, macOS/Linux activation.
