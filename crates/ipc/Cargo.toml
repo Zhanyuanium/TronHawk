@@ -1,0 +1,6 @@
+[package]
+name = "tronhawk-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

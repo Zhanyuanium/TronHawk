@@ -1,0 +1,6 @@
+[package]
+name = "tronhawk-injector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

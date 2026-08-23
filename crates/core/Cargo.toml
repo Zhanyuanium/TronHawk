@@ -1,0 +1,6 @@
+[package]
+name = "tronhawk-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
