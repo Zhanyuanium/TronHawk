@@ -1,4 +1,6 @@
-//! .thx (ZIP) package parse/validate/register. (placeholder).
+//! `.thx` (ZIP) package format mechanics: manifest schema validation and safe extraction.
+//! A support crate for the Core layer. It must NOT make permission decisions, perform
+//! install orchestration, or register plugins — those responsibilities belong to `tronhawk-core`.
 
 #[cfg(test)]
 mod tests {

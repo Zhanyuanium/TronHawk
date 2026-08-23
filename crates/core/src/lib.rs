@@ -1,4 +1,6 @@
-//! Lifecycle, plugin parse, permission check, IPC, storage. Must NOT contain UI or depend on Electron internals. (placeholder).
+//! Core orchestration layer: lifecycle, plugin parse/registration, permission checks,
+//! IPC, and storage. Must NOT contain UI or depend on Electron internals.
+//! Consumes `tronhawk-package` for `.thx` format mechanics and `tronhawk-ipc` for transport.
 
 #[cfg(test)]
 mod tests {

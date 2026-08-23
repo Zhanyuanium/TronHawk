@@ -10,6 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test workspace
         run: cargo test --workspace
       - name: Build workspace
@@ -17,13 +18,33 @@ jobs:
 
   ts:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: "1.4.0"
+      - name: Install workspace
+        run: bun install
+      - name: Typecheck SDK
+        working-directory: sdk
+        run: bun run typecheck
       - name: Test SDK
+        working-directory: sdk
         run: bun test
+      - name: Typecheck hello-world plugin
+        working-directory: plugins/hello-world
+        run: bun run typecheck
+
+  electron-fixture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+      - name: Install Electron
+        working-directory: apps/test-app
+        run: bun install
+      - name: Verify Electron runs
+        working-directory: apps/test-app
+        run: bunx electron --version

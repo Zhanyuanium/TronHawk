@@ -18,6 +18,9 @@ boundaries; see `SPEC.md` for requirements/decisions and `PLUGIN-SDK.md` for the
 | Injector | `crates/injector` | enter process, load bootstrap, establish comms | plugin logic, permission decisions |
 | Runtime | `crates/runtime` | execute plugins, provide APIs, bridge to Electron | user / install management |
 
+Support crates: `crates/package` (`.thx` format mechanics) and `crates/ipc` (JSON-RPC transport)
+are owned by the Core layer — they never make permission, install, or registration decisions.
+
 ## Coding principles
 
 - Prefer abstraction over implementation — expose `window.set_vibrancy()`, never Electron private symbols unless approved.

@@ -1,6 +1,20 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/injector", "crates/runtime", "crates/ipc", "crates/package"]
+members = [
+    "crates/core",
+    "crates/injector",
+    "crates/runtime",
+    "crates/ipc",
+    "crates/package",
+    "apps/manager/src-tauri",
+]
+default-members = [
+    "crates/core",
+    "crates/injector",
+    "crates/runtime",
+    "crates/ipc",
+    "crates/package",
+]
 
 [workspace.package]
 version = "0.1.0"
