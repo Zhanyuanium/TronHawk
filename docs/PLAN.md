@@ -13,6 +13,9 @@ roadmap, phased to the milestones in SPEC §15.
 - Phase 1 (Injection) PoC validated: electron-hook (vendored) injects into a packaged Electron 43.4.1
   app — main-process + renderer (main world) capability confirmed; injector formalized with IFEO
   registration + transparent bootstrap. See docs/adr/0001-injection-backend.md.
+- Phase 2 (Renderer plugins) in progress: `.thx` ZIP packaging (pack/extract + manifest validation,
+  zip-slip guarded), Core install flow, and CSS hot reload (poll + re-inject) are done. Renderer JS
+  sandbox (open question #2) is deferred to a dedicated ADR.
 - Toolchain: rustc/cargo 1.97.1 ✓, bun 1.4.0 ✓, Tauri CLI ✓ (via bun). Node not required — bun is
   the JS toolchain.
 
