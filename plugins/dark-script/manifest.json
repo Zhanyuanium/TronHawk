@@ -1,0 +1,9 @@
+{
+  "id": "com.example.dark-script",
+  "name": "Dark Script",
+  "version": "0.1.0",
+  "author": "Example",
+  "tronhawk": "^0.1",
+  "entry": { "renderer": "renderer.js" },
+  "permissions": ["renderer.script"]
+}

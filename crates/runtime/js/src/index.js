@@ -104,6 +104,8 @@ function getQuickJS() {
 
 // pluginId -> { vm, deactivate }
 const mainPlugins = new Map();
+// `${pluginId}@${webContentsId}` -> { vm, deactivate }
+const rendererPlugins = new Map();
 
 function buildWindowApi(vm, app) {
   const win = vm.newObject();
@@ -224,6 +226,99 @@ function runMainPlugin(plugin, app) {
   }).catch((e) => log("QuickJS init failed: " + (e && e.message ? e.message : e)));
 }
 
+// --- Renderer-plugin sandbox (runs per window on did-finish-load) ---
+
+function runRendererPlugin(plugin, contents) {
+  getQuickJS().then((QuickJS) => {
+    const vm = QuickJS.newContext();
+    vm.runtime.setMemoryLimit(64 * 1024 * 1024);
+    vm.runtime.setMaxStackSize(1024 * 512);
+
+    const ctx = vm.newObject();
+    if (hasPermission(plugin.granted, "renderer.script")) {
+      const script = vm.newObject();
+      const execute = vm.newFunction("execute", (codeHandle) => {
+        const code = vm.getString(codeHandle);
+        // Fire-and-forget: run in the target window's renderer (main world), then read back
+        // the title to confirm execution.
+        contents
+          .executeJavaScript(code)
+          .then(() => contents.executeJavaScript("document.title"))
+          .then((title) => log("script.execute ran; title=" + title))
+          .catch((e) => log("script.execute failed: " + (e && e.message ? e.message : e)));
+        return vm.undefined;
+      });
+      vm.setProp(script, "execute", execute);
+      execute.dispose();
+      vm.setProp(ctx, "script", script);
+      script.dispose();
+    }
+    // (ctx.dom.query / ctx.dom.observe need async host functions — future.)
+    vm.setProp(vm.global, "ctx", ctx);
+    ctx.dispose();
+
+    const moduleObj = vm.newObject();
+    const exportsObj = vm.newObject();
+    vm.setProp(moduleObj, "exports", exportsObj);
+    vm.setProp(vm.global, "module", moduleObj);
+    vm.setProp(vm.global, "exports", exportsObj);
+    moduleObj.dispose();
+
+    const result = vm.evalCode(plugin.renderer || "");
+    if (result.error) {
+      const err = vm.dump(result.error);
+      result.error.dispose();
+      log("renderer plugin eval error (" + plugin.id + "): " + err);
+      vm.dispose();
+      return;
+    }
+    result.value.dispose();
+
+    const moduleHandle = vm.getProp(vm.global, "module");
+    const exportsHandle = vm.getProp(moduleHandle, "exports");
+    const activate = vm.getProp(exportsHandle, "activate");
+    const ctxHandle = vm.getProp(vm.global, "ctx");
+    if (vm.typeof(activate) === "function") {
+      const r = vm.callFunction(activate, exportsHandle, ctxHandle);
+      r.dispose();
+    }
+    activate.dispose();
+    ctxHandle.dispose();
+    exportsHandle.dispose();
+    moduleHandle.dispose();
+
+    const key = plugin.id + "@" + contents.id;
+    rendererPlugins.set(key, {
+      vm,
+      deactivate: () => {
+        try {
+          vm.dispose();
+        } catch (e) {
+          /* ignore */
+        }
+      },
+    });
+    log("renderer plugin loaded: " + plugin.id);
+  }).catch((e) => log("QuickJS init failed: " + (e && e.message ? e.message : e)));
+}
+
+function rendererPluginsForWindow(contents) {
+  for (const p of currentPlan.plugins) {
+    if (p.renderer && hasPermission(p.granted, "renderer.script")) {
+      runRendererPlugin(p, contents);
+    }
+  }
+}
+
+function cleanupRendererPlugins(contentsId) {
+  for (const [key, entry] of rendererPlugins) {
+    if (key.endsWith("@" + contentsId)) {
+      rendererPlugins.delete(key);
+      entry.deactivate();
+    }
+  }
+}
+
 function reconcileMainPlugins(app) {
   const wanted = new Set();
   for (const p of currentPlan.plugins) {
@@ -266,9 +361,11 @@ function start(app) {
     windows.set(contents.id, w);
     contents.on("destroyed", () => {
       windows.delete(contents.id);
+      cleanupRendererPlugins(contents.id);
     });
     contents.on("did-finish-load", () => {
       reconcile(w);
+      rendererPluginsForWindow(contents);
     });
   });
 }
