@@ -1,10 +1,10 @@
 // TronHawk Runtime (main-process side) — executes the plugin execution plan.
 // Provides gated APIs and bridges to Electron (docs/AGENTS.md: Runtime layer).
 //
-// Phase 2: CSS injection via `webContents.insertCSS` (data, never executed as JS), with
-// hot reload (re-inject into already-loaded windows when the plugin's CSS changes).
-// Renderer JS execution (`renderer.script` / `renderer.dom`) lands in a later phase with a
-// restricted realm/sandbox.
+// Phase 2: CSS injection via `webContents.insertCSS` (data, never executed as JS), with a
+// multi-plugin, revision-based state machine supporting hot reload, plugin removal, and
+// permission revocation. Renderer JS execution (`renderer.script`/`renderer.dom`) lands in a
+// later phase with a QuickJS sandbox (docs/adr/0002-renderer-js-sandbox.md).
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -15,70 +15,82 @@ function log(msg) {
   fs.appendFileSync(LOG, msg + "\n");
 }
 
-let currentPlugin = null;
-const windows = new Map(); // webContents.id -> { contents, cssKey }
+let currentPlan = { revision: "", plugins: [] };
+// webContents.id -> { contents, keys: Map(pluginId -> { css, key }) }
+const windows = new Map();
 
-function hasPermission(plugin, perm) {
-  return Array.isArray(plugin.permissions) && plugin.permissions.includes(perm);
+function hasPermission(granted, perm) {
+  return Array.isArray(granted) && granted.includes(perm);
 }
 
-function inject(contents) {
-  const plugin = currentPlugin;
-  if (!plugin || !plugin.css) return;
-  if (!hasPermission(plugin, "renderer.css")) {
-    log("refusing CSS injection: plugin lacks `renderer.css`");
+// Reconcile one window against the current plan: inject wanted CSS, remove stale CSS.
+function reconcile(w) {
+  const wanted = new Map(); // pluginId -> { css }
+  for (const p of currentPlan.plugins) {
+    if (p.css && hasPermission(p.granted, "renderer.css")) {
+      wanted.set(p.id, { css: p.css });
+    }
+  }
+
+  // Inject or re-inject wanted plugins.
+  for (const [pid, want] of wanted) {
+    const entry = w.keys.get(pid);
+    if (!entry) {
+      inject(w, pid, want.css);
+    } else if (entry.css !== want.css) {
+      w.keys.delete(pid);
+      w.contents
+        .removeInsertedCSS(entry.key)
+        .catch(() => {})
+        .then(() => inject(w, pid, want.css));
+    }
+    // else: unchanged — leave it.
+  }
+
+  // Remove keys for plugins no longer wanted.
+  for (const [pid, entry] of w.keys) {
+    if (!wanted.has(pid)) {
+      w.keys.delete(pid);
+      w.contents.removeInsertedCSS(entry.key).catch(() => {});
+      log("css removed for " + pid);
+    }
+  }
+}
+
+function inject(w, pid, css) {
+  w.contents
+    .insertCSS(css)
+    .then((key) => {
+      w.keys.set(pid, { css, key });
+      log("css injected for " + pid);
+    })
+    .catch((e) => log("insertCSS failed for " + pid + ": " + (e && e.message ? e.message : e)));
+}
+
+function applyPlan(plan) {
+  if (!plan || plan.revision === currentPlan.revision) {
     return;
   }
-  const prev = windows.get(contents.id);
-  const doInsert = () =>
-    contents
-      .insertCSS(plugin.css)
-      .then((key) => {
-        windows.set(contents.id, { contents, cssKey: key });
-        log("css injected for " + plugin.id);
-      })
-      .catch((e) => log("insertCSS failed: " + (e && e.message ? e.message : e)));
-
-  if (prev && prev.cssKey) {
-    contents
-      .removeInsertedCSS(prev.cssKey)
-      .catch(() => {})
-      .then(doInsert);
-  } else {
-    doInsert();
+  currentPlan = plan;
+  for (const w of windows.values()) {
+    reconcile(w);
   }
 }
 
 function start(app) {
   app.on("web-contents-created", (_e, contents) => {
-    // Only target the app's main windows, not DevTools / webviews / background pages.
     if (contents.getType() !== "window") {
       return;
     }
-    let attempts = 0;
-    const tryInject = () => {
-      if (!currentPlugin || !currentPlugin.css) {
-        if (attempts < 20) {
-          attempts += 1;
-          setTimeout(tryInject, 500);
-        }
-        return;
-      }
-      inject(contents);
-    };
-    contents.on("did-finish-load", tryInject);
+    const w = { contents, keys: new Map() };
+    windows.set(contents.id, w);
+    contents.on("destroyed", () => {
+      windows.delete(contents.id);
+    });
+    contents.on("did-finish-load", () => {
+      reconcile(w);
+    });
   });
 }
 
-function setPlugin(plugin) {
-  const cssChanged = !currentPlugin || currentPlugin.css !== plugin.css;
-  currentPlugin = plugin;
-  if (cssChanged) {
-    // Hot reload: re-inject into every already-loaded window.
-    for (const w of windows.values()) {
-      inject(w.contents);
-    }
-  }
-}
-
-module.exports = { start, setPlugin };
+module.exports = { start, applyPlan };

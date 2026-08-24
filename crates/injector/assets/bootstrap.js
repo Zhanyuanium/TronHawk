@@ -14,14 +14,14 @@ function log(msg) {
   fs.appendFileSync(LOG, msg + "\n");
 }
 
-function getPlugin(port, secret) {
+function getExecutionPlan(port, secret) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(port, "127.0.0.1", () => {
       sock.write(
         JSON.stringify({
           version: "0.1",
           id: 1,
-          method: "getPlugin",
+          method: "getExecutionPlan",
           params: {},
           secret,
         }) + "\n",
@@ -49,7 +49,6 @@ module.exports = function bootstrap(originalAsar) {
 
   const port = parseInt(process.env.TRONHAWK_IPC_PORT || "17777", 10);
   const secret = process.env.TRONHAWK_IPC_SECRET || "";
-  log("connecting to Core on port " + port);
 
   const { app } = require("electron");
   const runtime = require(path.join(__dirname, "runtime.js"));
@@ -57,39 +56,33 @@ module.exports = function bootstrap(originalAsar) {
   // Register the Runtime's window hooks early, before the app creates its windows.
   runtime.start(app);
 
-  const applyPlugin = (resp) => {
+  const apply = (resp) => {
     if (resp.error) {
       log("Core error: " + JSON.stringify(resp.error));
       return;
     }
-    const plugin = resp.result;
-    if (!plugin || typeof plugin !== "object" || typeof plugin.id !== "string") {
-      log("invalid plugin payload from Core; ignoring");
+    const plan = resp.result;
+    if (!plan || !Array.isArray(plan.plugins)) {
+      log("invalid plan payload from Core; ignoring");
       return;
     }
-    runtime.setPlugin(plugin);
+    runtime.applyPlan(plan);
   };
 
-  // Establish comms and hand the execution plan to the Runtime.
-  getPlugin(port, secret)
-    .then((resp) => {
-      applyPlugin(resp);
-      log("received plugin: " + (resp.result && resp.result.id));
-    })
-    .catch((e) => log("getPlugin failed: " + (e && e.message ? e.message : e)));
+  let polling = false;
+  const poll = () => {
+    if (polling) return;
+    polling = true;
+    getExecutionPlan(port, secret)
+      .then(apply)
+      .catch(() => {})
+      .then(() => {
+        polling = false;
+      });
+  };
 
-  // Poll for hot reload (CSS changes picked up by Core on each request).
-  setInterval(() => {
-    getPlugin(port, secret)
-      .then((resp) => {
-        const p = resp.result;
-        if (p && typeof p.id === "string") {
-          log("poll ok: css=" + (p.css ? JSON.stringify(p.css.slice(0, 30)) : "none"));
-          applyPlugin(resp);
-        }
-      })
-      .catch((e) => log("poll failed: " + (e && e.message ? e.message : e)));
-  }, 2000);
+  poll();
+  setInterval(poll, 2000);
 
   // Load the original app (transparent injection).
   try {
