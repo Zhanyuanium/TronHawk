@@ -1,11 +1,12 @@
 //! TronHawk Core daemon (MVP): loads a plugin (from a `.thx` package or an unpacked
-//! directory) and serves its execution plan over IPC, re-reading on each request for hot reload.
+//! directory) and serves its execution plan over IPC, using a cached snapshot for hot reload.
 //!
 //! Usage: tronhawk-core [<plugin.thx | plugin-dir>]
 //! `TRONHAWK_IPC_PORT` (default 17777) and `TRONHAWK_IPC_SECRET` (required) configure the
 //! listener. The secret is a per-launch token shared with the launcher/target.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -14,7 +15,13 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(17777);
-    let secret = std::env::var("TRONHAWK_IPC_SECRET").expect("TRONHAWK_IPC_SECRET is required");
+    let secret = match std::env::var("TRONHAWK_IPC_SECRET") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("TRONHAWK_IPC_SECRET is required");
+            std::process::exit(1);
+        }
+    };
 
     let input_path = Path::new(input);
     let is_thx = input_path
@@ -25,14 +32,22 @@ fn main() {
     // Resolve the plugin dir once (install .thx, or use the dir directly).
     let plugin_dir: PathBuf = if is_thx {
         let root = std::env::temp_dir().join("tronhawk-installed");
-        let (_, dir) = tronhawk_core::install(input_path, &root).expect("failed to install plugin");
-        dir
+        match tronhawk_core::install(input_path, &root) {
+            Ok((_, dir)) => dir,
+            Err(e) => {
+                eprintln!("[core] failed to install plugin: {e}");
+                std::process::exit(1);
+            }
+        }
     } else {
         input_path.to_path_buf()
     };
 
-    // Re-read the plugin on every request (hot reload).
-    let load = move || tronhawk_core::load_plan(&plugin_dir);
+    let loader = Arc::new(tronhawk_core::CachedLoader::new(plugin_dir));
+    let load = {
+        let loader = Arc::clone(&loader);
+        move || loader.load()
+    };
 
     match load() {
         Ok(plan) => {

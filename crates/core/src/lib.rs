@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 pub use tronhawk_package::Plugin;
 
@@ -79,6 +81,65 @@ pub fn to_plan(plugin: Plugin) -> ExecutionPlan {
 /// Load a plugin directory and convert it to an execution plan.
 pub fn load_plan(dir: &Path) -> Result<ExecutionPlan, String> {
     load_plugin_dir(dir).map(to_plan)
+}
+
+/// A cached execution plan, rebuilt only when the plugin directory changes (mtime-based).
+/// Avoids re-reading and re-validating files on every `getExecutionPlan` request.
+pub struct CachedLoader {
+    dir: PathBuf,
+    cache: Mutex<Option<(SystemTime, ExecutionPlan)>>,
+}
+
+impl CachedLoader {
+    pub fn new(dir: PathBuf) -> Self {
+        CachedLoader {
+            dir,
+            cache: Mutex::new(None),
+        }
+    }
+
+    pub fn load(&self) -> Result<ExecutionPlan, String> {
+        let mtime = latest_mtime(&self.dir)?;
+        let mut cache = self.cache.lock().unwrap();
+        let rebuild = match cache.as_ref() {
+            Some((t, _)) => *t != mtime,
+            None => true,
+        };
+        if rebuild {
+            let plan = load_plan(&self.dir)?;
+            *cache = Some((mtime, plan));
+        }
+        Ok(cache.as_ref().unwrap().1.clone())
+    }
+}
+
+fn latest_mtime(dir: &Path) -> Result<SystemTime, String> {
+    let mut latest = SystemTime::UNIX_EPOCH;
+    let mut any = false;
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read dir: {e}"))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            let m = latest_mtime(&path)?;
+            if m > latest {
+                latest = m;
+            }
+            any = true;
+        } else if path.is_file() {
+            let m = std::fs::metadata(&path)
+                .map_err(|e| format!("metadata: {e}"))?
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if m > latest {
+                latest = m;
+            }
+            any = true;
+        }
+    }
+    if !any {
+        return Err("plugin directory is empty".to_string());
+    }
+    Ok(latest)
 }
 
 fn hash_json<T: Serialize>(v: &T) -> String {
