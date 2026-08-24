@@ -22,12 +22,11 @@ fn main() {
         .map(|e| e.eq_ignore_ascii_case("thx"))
         .unwrap_or(false);
 
-    // Resolve the plugin dir once (extract .thx, or use the dir directly).
+    // Resolve the plugin dir once (install .thx, or use the dir directly).
     let plugin_dir: PathBuf = if is_thx {
         let root = std::env::temp_dir().join("tronhawk-installed");
-        std::fs::create_dir_all(&root).map_err(|e| e.to_string()).unwrap();
-        tronhawk_core::install(input_path, &root).expect("failed to install plugin");
-        root
+        let (_, dir) = tronhawk_core::install(input_path, &root).expect("failed to install plugin");
+        dir
     } else {
         input_path.to_path_buf()
     };

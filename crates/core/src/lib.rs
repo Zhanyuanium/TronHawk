@@ -3,7 +3,7 @@
 //!
 //! Consumes `tronhawk-package` for `.thx` format mechanics and `tronhawk-ipc` for transport.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use tronhawk_package::Plugin;
 
@@ -12,11 +12,34 @@ pub fn load_plugin_dir(dir: &Path) -> Result<Plugin, String> {
     tronhawk_package::load_plugin_dir(dir)
 }
 
-/// Install a `.thx` package by extracting it under `root` and validating the manifest.
-/// (Permission grants from the user are a Phase 4 Manager concern; MVP treats declared
-/// permissions as granted.)
-pub fn install(thx: &Path, root: &Path) -> Result<Plugin, String> {
-    tronhawk_package::extract(thx, root)
+/// Install a `.thx` package: validate, extract to a private staging dir, then commit
+/// atomically to `root/<id>`. Returns the plugin and its final installed directory.
+/// (User permission grants are a Phase 4 Manager concern; MVP treats declared as granted.)
+pub fn install(thx: &Path, root: &Path) -> Result<(Plugin, PathBuf), String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("install root: {e}"))?;
+
+    let staging = staging_dir(root);
+    let plugin = tronhawk_package::extract(thx, &staging).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        e
+    })?;
+
+    let final_dir = root.join(&plugin.id);
+    if final_dir.exists() {
+        std::fs::remove_dir_all(&final_dir).map_err(|e| format!("remove old: {e}"))?;
+    }
+    std::fs::rename(&staging, &final_dir).map_err(|e| format!("commit install: {e}"))?;
+
+    Ok((plugin, final_dir))
+}
+
+fn staging_dir(root: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    root.join(format!(".staging-{}-{nanos}", std::process::id()))
 }
 
 /// Run the Core IPC server, serving `getPlugin`. `load` is invoked on every request so
