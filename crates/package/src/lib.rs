@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 pub const KNOWN_PERMISSIONS: &[&str] = &[
@@ -18,6 +19,9 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "network.proxy",
     "runtime.unsafe",
 ];
+
+/// Maximum `manifest.json` size (bytes) read from a `.thx` archive.
+const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
 
 /// A parsed plugin manifest and its execution plan (MVP: declared == granted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,30 +38,62 @@ pub struct Plugin {
     pub renderer: Option<String>,
 }
 
-/// Validate a `manifest.json` value, resolving entry paths against `root`.
-/// Strict: required fields fail closed, unknown permissions are rejected.
+/// Validate a manifest's SCHEMA only (no entry-file reads). Call this before extracting an
+/// archive so that an invalid/unauthorized package never writes to disk.
+pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), String> {
+    require_str(manifest, "id")?;
+    require_str(manifest, "name")?;
+    require_str(manifest, "version")?;
+    require_str(manifest, "author")?;
+    require_str(manifest, "tronhawk")?;
+
+    if let Some(v) = manifest.get("permissions") {
+        let arr = v.as_array().ok_or("`permissions` must be an array")?;
+        for p in arr {
+            let s = p.as_str().ok_or("permission entries must be strings")?;
+            if !KNOWN_PERMISSIONS.contains(&s) {
+                return Err(format!("unknown permission `{s}`"));
+            }
+        }
+    }
+
+    if let Some(entry) = manifest.get("entry") {
+        for key in ["css", "renderer", "main"] {
+            if let Some(v) = entry.get(key) {
+                let rel = v
+                    .as_str()
+                    .ok_or_else(|| format!("`entry.{key}` must be a string"))?;
+                check_entry_path(rel)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_entry_path(rel: &str) -> Result<(), String> {
+    let p = Path::new(rel);
+    if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("entry path must be relative and not escape: {rel}"));
+    }
+    Ok(())
+}
+
+/// Validate a `manifest.json` value and resolve its entry files against `root`.
 pub fn validate_manifest(manifest: &serde_json::Value, root: &Path) -> Result<Plugin, String> {
+    validate_manifest_schema(manifest)?;
+
     let id = require_str(manifest, "id")?.to_string();
     let name = require_str(manifest, "name")?.to_string();
     let version = require_str(manifest, "version")?.to_string();
     let author = require_str(manifest, "author")?.to_string();
     let tronhawk = require_str(manifest, "tronhawk")?.to_string();
 
-    let permissions = match manifest.get("permissions") {
-        None => Vec::new(),
-        Some(v) => {
-            let arr = v.as_array().ok_or("`permissions` must be an array")?;
-            arr.iter()
-                .map(|p| {
-                    let s = p.as_str().ok_or("permission entries must be strings")?;
-                    if !KNOWN_PERMISSIONS.contains(&s) {
-                        return Err(format!("unknown permission `{s}`"));
-                    }
-                    Ok(s.to_string())
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        }
-    };
+    let permissions = manifest
+        .get("permissions")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
     let css = match manifest.get("css") {
         Some(v) => Some(v.as_str().ok_or("`css` must be a string")?.to_string()),
@@ -102,10 +138,21 @@ pub fn load_plugin_dir(dir: &Path) -> Result<Plugin, String> {
     validate_manifest(&manifest, &root)
 }
 
-/// Pack a plugin directory into a `.thx` (ZIP) archive.
+/// Pack a plugin directory into a `.thx` (ZIP) archive. Symlinks are refused, entries are
+/// sorted, and ZIP names use `/` separators.
 pub fn pack(dir: &Path, output: &Path) -> Result<(), String> {
+    let dir_canon = dir.canonicalize().map_err(|e| format!("pack dir: {e}"))?;
+    if let Some(parent) = output.parent() {
+        if let Ok(parent_canon) = parent.canonicalize() {
+            if parent_canon.starts_with(&dir_canon) {
+                return Err("output must not be inside the source directory".to_string());
+            }
+        }
+    }
+
     let mut entries = Vec::new();
-    collect_files(dir, &mut entries)?;
+    collect_files(&dir_canon, &mut entries)?;
+    entries.sort();
 
     let file = File::create(output).map_err(|e| format!("create thx: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -114,23 +161,29 @@ pub fn pack(dir: &Path, output: &Path) -> Result<(), String> {
 
     for entry in entries {
         let rel = entry
-            .strip_prefix(dir)
+            .strip_prefix(&dir_canon)
             .map_err(|e| format!("strip prefix: {e}"))?;
-        let rel_str = rel.to_str().ok_or("non-UTF8 path")?;
-        zip.start_file(rel_str, options)
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        zip.start_file(&rel_str, options)
             .map_err(|e| format!("zip start: {e}"))?;
-        let mut f = File::open(&entry).map_err(|e| format!("open {e}"))?;
+        let mut f = File::open(&entry).map_err(|e| format!("open {}: {e}", entry.display()))?;
         std::io::copy(&mut f, &mut zip).map_err(|e| format!("zip copy: {e}"))?;
     }
     zip.finish().map_err(|e| format!("zip finish: {e}"))?;
     Ok(())
 }
 
-/// Extract a `.thx` archive into `dest`, then validate + return the plugin.
+/// Extract a `.thx` archive into `dest`, validating the manifest schema *before* any file is
+/// written, then performing full validation after extraction.
 pub fn extract(thx: &Path, dest: &Path) -> Result<Plugin, String> {
     let file = File::open(thx).map_err(|e| format!("open thx: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("open zip: {e}"))?;
 
+    // Phase 1: read + validate the manifest schema before writing anything.
+    let manifest = read_manifest(&mut archive)?;
+    validate_manifest_schema(&manifest)?;
+
+    // Phase 2: extract all entries with strict path containment.
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
         let out_path = safe_join(dest, entry.name())?;
@@ -145,10 +198,36 @@ pub fn extract(thx: &Path, dest: &Path) -> Result<Plugin, String> {
         }
     }
 
+    // Phase 3: full validation (resolves + reads entry files).
     load_plugin_dir(dest)
 }
 
 // --- helpers ---
+
+fn read_manifest(archive: &mut zip::ZipArchive<File>) -> Result<serde_json::Value, String> {
+    let mut idx = None;
+    for i in 0..archive.len() {
+        let name = archive
+            .by_index(i)
+            .map_err(|e| format!("zip entry: {e}"))?
+            .name()
+            .replace('\\', "/");
+        if name == "manifest.json" {
+            idx = Some(i);
+            break;
+        }
+    }
+    let i = idx.ok_or("archive missing manifest.json")?;
+    let mut entry = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
+    if entry.size() > MAX_MANIFEST_SIZE {
+        return Err("manifest.json too large".to_string());
+    }
+    let mut s = String::new();
+    entry
+        .read_to_string(&mut s)
+        .map_err(|e| format!("read manifest: {e}"))?;
+    serde_json::from_str(&s).map_err(|e| format!("invalid manifest: {e}"))
+}
 
 fn require_str<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
     v.get(key)
@@ -174,15 +253,15 @@ fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-/// Guard against zip-slip: reject entries that escape `dest`.
+/// Guard against zip-slip: allow only `Normal` path components. Reject absolute paths,
+/// root-relative paths (`\foo`), drive-relative paths (`C:foo`), UNC, and `..`.
 fn safe_join(dest: &Path, name: &str) -> Result<PathBuf, String> {
     let normalized = name.replace('\\', "/");
     let p = Path::new(&normalized);
-    if p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, Component::ParentDir))
-    {
-        return Err(format!("archive entry escapes dest: {name}"));
+    for c in p.components() {
+        if !matches!(c, Component::Normal(_)) {
+            return Err(format!("archive entry escapes dest: {name}"));
+        }
     }
     Ok(dest.join(p))
 }
@@ -191,9 +270,13 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read dir: {e}"))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let path = entry.path();
-        if path.is_dir() {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("metadata: {e}"))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("refusing to pack symlink: {}", path.display()));
+        }
+        if meta.is_dir() {
             collect_files(&path, out)?;
-        } else if path.is_file() {
+        } else if meta.is_file() {
             out.push(path);
         }
     }
@@ -228,11 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zip_slip() {
-        assert!(safe_join(Path::new("C:/dest"), "../evil").is_err());
-        assert!(safe_join(Path::new("C:/dest"), "a/../../b").is_err());
-        assert!(safe_join(Path::new("C:/dest"), "C:/abs").is_err());
-        assert!(safe_join(Path::new("C:/dest"), "ok/file.txt").is_ok());
+    fn rejects_zip_slip_variants() {
+        let dest = Path::new("C:/dest");
+        assert!(safe_join(dest, "../evil").is_err());
+        assert!(safe_join(dest, "a/../../b").is_err());
+        assert!(safe_join(dest, "C:/abs").is_err());
+        assert!(safe_join(dest, "\\root-relative").is_err());
+        assert!(safe_join(dest, "/root-relative").is_err());
+        assert!(safe_join(dest, "C:drive-relative").is_err());
+        assert!(safe_join(dest, "//unc/path").is_err());
+        assert!(safe_join(dest, "ok/file.txt").is_ok());
     }
 
     #[test]
