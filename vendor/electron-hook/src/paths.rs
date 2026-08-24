@@ -93,7 +93,8 @@ mod tests {
     #[test]
     fn reads_are_proxied() {
         assert!(should_proxy_open(libc::O_RDONLY));
-        assert!(should_proxy_open(libc::O_RDONLY | libc::O_CLOEXEC));
+        // NOTE(tronhawk): removed the `libc::O_CLOEXEC` assertion — it is a Unix-only
+        // constant that does not exist on Windows `libc`.
         assert!(should_proxy_open(libc::O_RDWR));
     }
 

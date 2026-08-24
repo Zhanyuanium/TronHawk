@@ -16,6 +16,8 @@ Upstream cannot be consumed as a crates.io or git dependency because it:
 2. Added missing `winapi` features: `fileapi`, `processthreadsapi`, `winbase`,
    `libloaderapi`, `minwinbase`, `winnt`.
 3. Trimmed Detours to `src/` + license files (dropped `samples/`, `tests/`, `vc/`, `.github/`).
+4. Removed a `libc::O_CLOEXEC` assertion in `src/paths.rs` tests (Unix-only constant, fails on
+   Windows `libc`).
 
 ## License
 
