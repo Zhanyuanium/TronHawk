@@ -14,9 +14,9 @@ if (-not (Test-Path -LiteralPath $packagedExe)) {
     bunx @electron/packager "$repo\apps\test-app" test-app-packaged --platform=win32 --arch=x64 --asar --out $poc 2>&1 | Out-Null
 }
 
-# 2. Copy injector assets next to the built binaries.
+# 2. Copy injector + runtime assets next to the built binaries.
 Copy-Item "$repo\crates\injector\assets\bootstrap.js" "$bin\bootstrap.js" -Force
-Copy-Item "$repo\crates\injector\assets\runtime.js" "$bin\runtime.js" -Force
+Copy-Item "$repo\crates\runtime\assets\runtime.js" "$bin\runtime.js" -Force
 
 # 3. Start Core.
 $env:TRONHAWK_IPC_PORT = "17777"

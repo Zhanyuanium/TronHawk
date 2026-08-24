@@ -10,9 +10,17 @@ const fs = require("fs");
 const os = require("os");
 
 const LOG = path.join(os.tmpdir(), "tronhawk-runtime.log");
+const MAX_LOG = 256 * 1024;
 function log(msg) {
   console.log("[tronhawk-runtime] " + msg);
-  fs.appendFileSync(LOG, msg + "\n");
+  try {
+    if (fs.existsSync(LOG) && fs.statSync(LOG).size > MAX_LOG) {
+      fs.truncateSync(LOG, 0);
+    }
+    fs.appendFileSync(LOG, msg + "\n");
+  } catch (e) {
+    /* best-effort logging */
+  }
 }
 
 let currentPlan = { revision: "", plugins: [] };
