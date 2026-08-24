@@ -15,8 +15,9 @@ my-plugin/
 ## Manifest
 
 Required: `id`, `name`, `version`, `author`, `tronhawk` (host runtime protocol version, e.g. `"^0.1"`).
-Optional: `entry.{renderer,main}` (renderer → Chromium renderer, main → Electron main process),
-`permissions[]`, `config{}`. Both entries optional (a CSS-only theme needs only `renderer`).
+Optional: `css` (inline CSS string, or `entry.css` file) for CSS-only themes,
+`entry.{renderer,main}` (renderer → Chromium renderer, main → Electron main process),
+`permissions[]`, `config{}`. A CSS-only theme declares its CSS as **data** (never executed as JS).
 
 The `tronhawk` field declares the TronHawk **runtime protocol version** the plugin targets — it is
 NOT the SDK npm version.
@@ -119,8 +120,8 @@ Dev: `npm install` + `npm run dev`. Prod: `npm run build` → `plugin.thx`.
 
 ## Examples
 
-Dark mode (renderer): `permissions:["renderer.css"]` →
-`ctx.css.insert("body { background:#111; }")`.
+Dark mode (renderer): `permissions:["renderer.css"]` → declare the CSS as data:
+`"css": "body { background:#111; }"` (injected via `insertCSS`; no plugin JS is executed).
 
 Glass window (main): `permissions:["electron.window"]` →
 `ctx.window.onCreated(w => ctx.window.setVibrancy(w, "sidebar"))`.

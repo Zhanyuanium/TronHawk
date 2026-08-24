@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "author": "Example",
   "tronhawk": "^0.1",
-  "entry": { "renderer": "dist/renderer.js" },
+  "css": "body { background: #111 !important; color: #eee !important; }",
   "permissions": ["renderer.css"]
 }

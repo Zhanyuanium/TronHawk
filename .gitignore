@@ -8,8 +8,6 @@ node_modules/
 
 # Build output
 dist/
-# Plugin pre-built entries are committed until the TS build step lands (Phase 2).
-!plugins/*/dist/
 out/
 release/
 coverage/

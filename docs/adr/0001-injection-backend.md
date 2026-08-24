@@ -41,9 +41,11 @@ committing.
    compiles cleanly on stable 1.97.1 — no nightly requirement.
 3. **Packaged apps only.** Injection needs `resources/app.asar`, so targets must be packaged;
    unpackaged dev apps are not injectable through this path.
-4. **Renderer (open question #1): main world for MVP.** `webContents.executeJavaScript` (main
-   world) and `insertCSS` are validated. Isolated world (preload + `contextBridge`) is a future
-   hardening option, not MVP.
+4. **Renderer (open question #1): CSS is data, JS is sandboxed (Phase 2).** CSS-only plugins
+   declare their CSS as data (the `css` manifest field) and the Runtime injects it via
+   `webContents.insertCSS` — plugin JS is never executed for CSS. Arbitrary renderer JS
+   (`renderer.script`/`renderer.dom`) requires a restricted realm/sandbox and lands in Phase 2;
+   `executeJavaScript` in the page main world is not a safe execution boundary.
 
 ## Consequences / follow-ups
 
