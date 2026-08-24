@@ -11,6 +11,9 @@ fn main() {
     }
     let dir = Path::new(&args[1]);
     let out = Path::new(&args[2]);
-    tronhawk_package::pack(dir, out).expect("pack failed");
+    if let Err(e) = tronhawk_package::pack(dir, out) {
+        eprintln!("pack failed: {e}");
+        std::process::exit(1);
+    }
     println!("packed {} -> {}", dir.display(), out.display());
 }

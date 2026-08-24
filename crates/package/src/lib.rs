@@ -38,33 +38,89 @@ pub struct Plugin {
     pub renderer: Option<String>,
 }
 
-/// Validate a manifest's SCHEMA only (no entry-file reads). Call this before extracting an
-/// archive so that an invalid/unauthorized package never writes to disk.
-pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), String> {
-    require_str(manifest, "id")?;
-    require_str(manifest, "name")?;
-    require_str(manifest, "version")?;
-    require_str(manifest, "author")?;
-    require_str(manifest, "tronhawk")?;
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    id: String,
+    name: String,
+    version: String,
+    author: String,
+    tronhawk: String,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    css: Option<String>,
+    #[serde(default)]
+    entry: Option<Entry>,
+}
 
-    if let Some(v) = manifest.get("permissions") {
-        let arr = v.as_array().ok_or("`permissions` must be an array")?;
-        for p in arr {
-            let s = p.as_str().ok_or("permission entries must be strings")?;
-            if !KNOWN_PERMISSIONS.contains(&s) {
-                return Err(format!("unknown permission `{s}`"));
-            }
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    #[serde(default)]
+    css: Option<String>,
+    #[serde(default)]
+    renderer: Option<String>,
+    #[serde(default)]
+    main: Option<String>,
+}
+
+/// Validate a manifest's SCHEMA and semantic rules (no entry-file reads). Call this before
+/// extracting an archive so that an invalid/unauthorized package never writes to disk.
+pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), String> {
+    // Parse into a strict typed DTO (rejects unknown fields and wrong types).
+    let m: Manifest = serde_json::from_value(manifest.clone())
+        .map_err(|e| format!("manifest schema: {e}"))?;
+
+    if m.id.trim().is_empty() {
+        return Err("`id` must not be empty".to_string());
+    }
+    if m.name.trim().is_empty() {
+        return Err("`name` must not be empty".to_string());
+    }
+    if m.author.trim().is_empty() {
+        return Err("`author` must not be empty".to_string());
+    }
+    semver::Version::parse(&m.version).map_err(|e| format!("invalid `version`: {e}"))?;
+    semver::VersionReq::parse(&m.tronhawk).map_err(|e| format!("invalid `tronhawk` range: {e}"))?;
+
+    // Permissions: known + no duplicates.
+    let mut seen = std::collections::HashSet::new();
+    for p in &m.permissions {
+        if !KNOWN_PERMISSIONS.contains(&p.as_str()) {
+            return Err(format!("unknown permission `{p}`"));
+        }
+        if !seen.insert(p.clone()) {
+            return Err(format!("duplicate permission `{p}`"));
         }
     }
 
-    if let Some(entry) = manifest.get("entry") {
-        for key in ["css", "renderer", "main"] {
-            if let Some(v) = entry.get(key) {
-                let rel = v
-                    .as_str()
-                    .ok_or_else(|| format!("`entry.{key}` must be a string"))?;
-                check_entry_path(rel)?;
-            }
+    // Entry-permission coherence.
+    let has_css = m.css.is_some() || m.entry.as_ref().and_then(|e| e.css.as_ref()).is_some();
+    if has_css && !m.permissions.iter().any(|p| p == "renderer.css") {
+        return Err("a CSS entry requires the `renderer.css` permission".to_string());
+    }
+    let has_renderer = m.entry.as_ref().and_then(|e| e.renderer.as_ref()).is_some();
+    if has_renderer
+        && !m
+            .permissions
+            .iter()
+            .any(|p| p == "renderer.script" || p == "renderer.dom")
+    {
+        return Err("a `renderer` entry requires `renderer.script` or `renderer.dom`".to_string());
+    }
+
+    // Entry paths must be safe.
+    if let Some(entry) = &m.entry {
+        for rel in [
+            entry.css.as_ref(),
+            entry.renderer.as_ref(),
+            entry.main.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            check_entry_path(rel)?;
         }
     }
 
