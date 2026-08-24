@@ -125,10 +125,12 @@ guards (contextIsolation, sandbox, ASAR, code cache, custom preload).
 ## 9. Plugin Model
 
 Package `.thx` (ZIP): `manifest.json`, `dist/{renderer.js, main.js}`, `assets/`, `signature.json`, `metadata.json`.
-Manifest required fields: `id`, `name`, `version`, `author`, `tronhawk`; optional `entry.{renderer,main}` and `permissions[]`.
+Manifest required fields: `id`, `name`, `version`, `author`, `tronhawk`; optional `css` (inline CSS
+data, or `entry.css` file) for CSS-only themes, `entry.{renderer,main}`, and `permissions[]`.
 
 Execution contexts:
-- **Renderer** (Chromium/V8): CSS, JS, DOM (MVP); localStorage / IndexedDB (future).
+- **Renderer** (Chromium/V8): CSS (MVP, data-only); JS/DOM via a QuickJS sandbox (Phase 3, see
+  ADR 0002); localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw Electron.
 - **Developer mode** (`runtime.unsafe`): raw Electron/Node, off by default.
 
