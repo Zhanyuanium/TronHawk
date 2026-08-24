@@ -35,16 +35,17 @@ jobs:
         working-directory: plugins/hello-world
         run: bun run typecheck
 
-  electron-fixture:
+  integration:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.0"
-      - name: Install Electron
-        working-directory: apps/test-app
-        run: bun install
-      - name: Verify Electron runs
-        working-directory: apps/test-app
-        run: bunx electron --version
+      - name: Build injector + core
+        run: cargo build -p tronhawk-injector -p tronhawk-core
+      - name: Run injection integration test
+        shell: pwsh
+        run: pwsh tests/integration.ps1
