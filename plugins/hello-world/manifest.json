@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "author": "Example",
   "tronhawk": "^0.1",
-  "css": "body { background: #111 !important; color: #eee !important; }",
+  "entry": { "css": "style.css" },
   "permissions": ["renderer.css"]
 }

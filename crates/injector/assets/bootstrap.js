@@ -57,22 +57,39 @@ module.exports = function bootstrap(originalAsar) {
   // Register the Runtime's window hooks early, before the app creates its windows.
   runtime.start(app);
 
+  const applyPlugin = (resp) => {
+    if (resp.error) {
+      log("Core error: " + JSON.stringify(resp.error));
+      return;
+    }
+    const plugin = resp.result;
+    if (!plugin || typeof plugin !== "object" || typeof plugin.id !== "string") {
+      log("invalid plugin payload from Core; ignoring");
+      return;
+    }
+    runtime.setPlugin(plugin);
+  };
+
   // Establish comms and hand the execution plan to the Runtime.
   getPlugin(port, secret)
     .then((resp) => {
-      if (resp.error) {
-        log("Core error: " + JSON.stringify(resp.error));
-        return;
-      }
-      const plugin = resp.result;
-      if (!plugin || typeof plugin !== "object" || typeof plugin.id !== "string") {
-        log("invalid plugin payload from Core; ignoring");
-        return;
-      }
-      log("received plugin: " + plugin.id + " v" + plugin.version);
-      runtime.setPlugin(plugin);
+      applyPlugin(resp);
+      log("received plugin: " + (resp.result && resp.result.id));
     })
     .catch((e) => log("getPlugin failed: " + (e && e.message ? e.message : e)));
+
+  // Poll for hot reload (CSS changes picked up by Core on each request).
+  setInterval(() => {
+    getPlugin(port, secret)
+      .then((resp) => {
+        const p = resp.result;
+        if (p && typeof p.id === "string") {
+          log("poll ok: css=" + (p.css ? JSON.stringify(p.css.slice(0, 30)) : "none"));
+          applyPlugin(resp);
+        }
+      })
+      .catch((e) => log("poll failed: " + (e && e.message ? e.message : e)));
+  }, 2000);
 
   // Load the original app (transparent injection).
   try {
