@@ -107,3 +107,30 @@ fn write_response(writer: &mut TcpStream, resp: &Response) -> std::io::Result<()
     writer.write_all(b"\n")?;
     writer.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_roundtrip() {
+        let req = Request {
+            version: PROTOCOL_VERSION.into(),
+            id: 7,
+            method: "getPlugin".into(),
+            params: serde_json::json!({}),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.method, "getPlugin");
+    }
+
+    #[test]
+    fn error_response_shape() {
+        let v = serde_json::to_value(Response::err(3, -32601, "not found")).unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["error"]["code"], -32601);
+        assert_eq!(v["error"]["message"], "not found");
+    }
+}

@@ -75,3 +75,17 @@ pub fn serve(port: u16, plugin: Plugin) -> std::io::Result<()> {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_hello_world_plugin() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/hello-world");
+        let plugin = load_plugin(&dir).expect("load plugin");
+        assert_eq!(plugin.id, "com.example.hello-world");
+        assert!(plugin.permissions.iter().any(|p| p == "renderer.css"));
+        assert!(plugin.renderer.is_some());
+    }
+}
