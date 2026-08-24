@@ -75,13 +75,19 @@ function reconcile(w) {
     }
   }
 
-  for (const [pid, entry] of w.keys) {
+  // Invalidate + remove any plugin (pending or settled) that is no longer wanted.
+  const allIds = new Set([...w.keys.keys(), ...w.gens.keys()]);
+  for (const pid of allIds) {
     if (!wanted.has(pid)) {
-      // Invalidate any pending insert + remove the settled key.
+      // Invalidate any pending insert (so a late insertCSS discards its key), and remove
+      // the settled key if present.
       w.gens.set(pid, (w.gens.get(pid) || 0) + 1);
-      w.keys.delete(pid);
-      w.contents.removeInsertedCSS(entry.key).catch(() => {});
-      log("css removed for " + pid);
+      const entry = w.keys.get(pid);
+      if (entry) {
+        w.keys.delete(pid);
+        w.contents.removeInsertedCSS(entry.key).catch(() => {});
+        log("css removed for " + pid);
+      }
     }
   }
 }
