@@ -1,5 +1,5 @@
 //! TronHawk Core daemon (MVP): loads a plugin (from a `.thx` package or an unpacked
-//! directory) and serves it over IPC, re-reading the plugin on each request for hot reload.
+//! directory) and serves its execution plan over IPC, re-reading on each request for hot reload.
 //!
 //! Usage: tronhawk-core [<plugin.thx | plugin-dir>]
 //! `TRONHAWK_IPC_PORT` (default 17777) and `TRONHAWK_IPC_SECRET` (required) configure the
@@ -32,13 +32,17 @@ fn main() {
     };
 
     // Re-read the plugin on every request (hot reload).
-    let load = move || tronhawk_core::load_plugin_dir(&plugin_dir);
+    let load = move || tronhawk_core::load_plan(&plugin_dir);
 
     match load() {
-        Ok(p) => println!(
-            "[core] loaded plugin {} v{} (permissions: {:?})",
-            p.id, p.version, p.permissions
-        ),
+        Ok(plan) => {
+            for p in &plan.plugins {
+                println!(
+                    "[core] loaded plugin {} v{} (granted: {:?})",
+                    p.id, p.version, p.granted
+                );
+            }
+        }
         Err(e) => {
             eprintln!("[core] failed to load plugin: {e}");
             std::process::exit(1);

@@ -3,9 +3,27 @@
 //!
 //! Consumes `tronhawk-package` for `.thx` format mechanics and `tronhawk-ipc` for transport.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub use tronhawk_package::Plugin;
+
+/// Granted capabilities for one plugin in the execution plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginGrant {
+    pub id: String,
+    pub version: String,
+    pub granted: Vec<String>,
+    pub css: Option<String>,
+    pub renderer: Option<String>,
+}
+
+/// The execution plan served to the Runtime: a revision + the set of granted plugins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPlan {
+    pub revision: String,
+    pub plugins: Vec<PluginGrant>,
+}
 
 /// Load a plugin from an unpacked directory.
 pub fn load_plugin_dir(dir: &Path) -> Result<Plugin, String> {
@@ -14,7 +32,6 @@ pub fn load_plugin_dir(dir: &Path) -> Result<Plugin, String> {
 
 /// Install a `.thx` package: validate, extract to a private staging dir, then commit
 /// atomically to `root/<id>`. Returns the plugin and its final installed directory.
-/// (User permission grants are a Phase 4 Manager concern; MVP treats declared as granted.)
 pub fn install(thx: &Path, root: &Path) -> Result<(Plugin, PathBuf), String> {
     std::fs::create_dir_all(root).map_err(|e| format!("install root: {e}"))?;
 
@@ -42,12 +59,43 @@ fn staging_dir(root: &Path) -> PathBuf {
     root.join(format!(".staging-{}-{nanos}", std::process::id()))
 }
 
-/// Run the Core IPC server, serving `getPlugin`. `load` is invoked on every request so
+/// Convert a validated plugin into its execution plan. MVP: declared == granted
+/// (developer/test mode); user approval is a Phase 4 Manager concern.
+pub fn to_plan(plugin: Plugin) -> ExecutionPlan {
+    let grant = PluginGrant {
+        id: plugin.id,
+        version: plugin.version,
+        granted: plugin.permissions,
+        css: plugin.css,
+        renderer: plugin.renderer,
+    };
+    let revision = hash_json(&grant);
+    ExecutionPlan {
+        revision,
+        plugins: vec![grant],
+    }
+}
+
+/// Load a plugin directory and convert it to an execution plan.
+pub fn load_plan(dir: &Path) -> Result<ExecutionPlan, String> {
+    load_plugin_dir(dir).map(to_plan)
+}
+
+fn hash_json<T: Serialize>(v: &T) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let s = serde_json::to_string(v).unwrap_or_default();
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:x}", h.finish())
+}
+
+/// Run the Core IPC server, serving `getExecutionPlan`. `load` is invoked on every request so
 /// that hot-reloaded plugin content (e.g. an edited CSS file) is picked up.
 /// `secret` is a per-launch token that requests must present.
 pub fn serve<F>(port: u16, secret: &str, load: F) -> std::io::Result<()>
 where
-    F: Fn() -> Result<Plugin, String> + Send + Sync + 'static,
+    F: Fn() -> Result<ExecutionPlan, String> + Send + Sync + 'static,
 {
     let expected = secret.to_string();
     tronhawk_ipc::serve(port, move |req| {
@@ -57,9 +105,9 @@ where
         if req.secret != expected {
             return tronhawk_ipc::Response::err(req.id, -32001, "unauthorized");
         }
-        if req.method == "getPlugin" {
+        if req.method == "getExecutionPlan" {
             return match load() {
-                Ok(plugin) => match serde_json::to_value(&plugin) {
+                Ok(plan) => match serde_json::to_value(&plan) {
                     Ok(result) => tronhawk_ipc::Response::ok(req.id, result),
                     Err(e) => {
                         tronhawk_ipc::Response::err(req.id, -32603, format!("internal error: {e}"))
@@ -81,9 +129,27 @@ mod tests {
     #[test]
     fn loads_hello_world_plugin() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/hello-world");
-        let plugin = load_plugin_dir(&dir).expect("load plugin");
-        assert_eq!(plugin.id, "com.example.hello-world");
-        assert!(plugin.permissions.iter().any(|p| p == "renderer.css"));
-        assert!(plugin.css.is_some());
+        let plan = load_plan(&dir).expect("load plan");
+        assert_eq!(plan.plugins.len(), 1);
+        assert_eq!(plan.plugins[0].id, "com.example.hello-world");
+        assert!(plan.plugins[0].granted.iter().any(|p| p == "renderer.css"));
+        assert!(plan.plugins[0].css.is_some());
+    }
+
+    #[test]
+    fn revision_changes_with_css() {
+        let p1 = Plugin {
+            id: "a".into(),
+            name: "a".into(),
+            version: "1".into(),
+            author: "a".into(),
+            tronhawk: "^0.1".into(),
+            permissions: vec!["renderer.css".into()],
+            css: Some("body{}".into()),
+            renderer: None,
+        };
+        let mut p2 = p1.clone();
+        p2.css = Some("body{background:#111}".into());
+        assert_ne!(to_plan(p1).revision, to_plan(p2).revision);
     }
 }
