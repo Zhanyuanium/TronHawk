@@ -39,7 +39,6 @@ mod env {
     }
 
     pub static ASAR_PATH: LazyLock<String> = lazy_env!("MODLOADER_ASAR_PATH");
-    pub static EXE_PATH: LazyLock<String> = lazy_env!("MODLOADER_EXECUTABLE");
     pub static DLL_PATH: LazyLock<String> = lazy_env!("MODLOADER_LIBRARY_PATH");
 
     pub fn folder_name() -> String {
@@ -53,22 +52,13 @@ mod original {
     use winapi::um::{
         fileapi::{CreateFileW as CreateFileW_, GetFileAttributesW as GetFileAttributesW_},
         processthreadsapi::CreateProcessW as CreateProcessW_,
-        winbase::MoveFileExW as MoveFileExW_,
     };
-
-    #[link(name = "user32")]
-    unsafe extern "C" {
-        #[link_name = "SetCurrentProcessExplicitAppUserModelID"]
-        unsafe fn SetAUMID_(app_id: *const u16);
-    }
 
     type FnPtr = *mut std::ffi::c_void;
 
     pub static mut GetFileAttributesW: FnPtr = GetFileAttributesW_ as _;
     pub static mut CreateFileW: FnPtr = CreateFileW_ as _;
     pub static mut CreateProcessW: FnPtr = CreateProcessW_ as _;
-    pub static mut MoveFileExW: FnPtr = MoveFileExW_ as _;
-    pub static mut SetAUMID: FnPtr = SetAUMID_ as _;
     pub static mut uv_fs_lstat: FnPtr = std::ptr::null_mut();
 }
 
@@ -122,9 +112,7 @@ pub unsafe extern "system" fn DllMain(
 
     attach!(GetFileAttributesW, get_file_attributes_w);
     attach!(CreateFileW, create_file_w);
-    attach!(MoveFileExW, move_file_ex_w);
     attach!(CreateProcessW, create_process_w);
-    attach!(SetAUMID, set_aumid);
 
     fn get_executable_name() -> Option<CString> {
         let current_exe = std::env::current_exe().ok()?;
@@ -269,51 +257,6 @@ unsafe extern "C" fn create_file_w(
     }
 }
 
-type MoveFileExW = unsafe extern "C" fn(
-    lp_existing_file_name: LPCWSTR,
-    lp_new_file_name: LPCWSTR,
-    dw_flags: DWORD,
-) -> BOOL;
-
-// This is needed to stop the updater from renaming app.asar to _app.asar
-unsafe extern "C" fn move_file_ex_w(
-    lp_existing_file_name: LPCWSTR,
-    lp_new_file_name: LPCWSTR,
-    dw_flags: DWORD,
-) -> BOOL {
-    let move_file_ex_w: MoveFileExW = transmute(original::MoveFileExW);
-
-    let Some(new_file_name) = U16CString::from_ptr_str(lp_new_file_name)
-        .to_string()
-        .ok()
-    else {
-        return move_file_ex_w(lp_existing_file_name, lp_new_file_name, dw_flags);
-    };
-
-    // MoveFileExW moves _app.asar when we update Discord, so we should update MODLOADER_FOLDER_NAME just in case.
-    if new_file_name.contains("\\_app.asar") {
-        let redirect_to = new_file_name.replace("\\_app.asar", "\\app.asar");
-
-        if let Some(folder_name) = std::path::Path::new(&redirect_to)
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
-        {
-            std::env::set_var(
-                "MODLOADER_FOLDER_NAME",
-                folder_name.to_string_lossy().to_string(),
-            );
-        }
-
-        let redirect_to_c = std::ffi::CString::new(redirect_to.as_str()).unwrap();
-        let redirect_to = U16CString::from_str(redirect_to_c.to_str().unwrap()).unwrap();
-
-        return move_file_ex_w(lp_existing_file_name, redirect_to.as_ptr(), dw_flags);
-    }
-
-    move_file_ex_w(lp_existing_file_name, lp_new_file_name, dw_flags)
-}
-
 type CreateProcessW = unsafe extern "C" fn(
     lp_application_name: LPCWSTR,
     lp_command_line: LPWSTR,
@@ -406,15 +349,4 @@ unsafe extern "C" fn create_process_w(
     ResumeThread((*lp_process_information).hThread as _);
 
     success
-}
-
-type SetAUMID = unsafe extern "system" fn(lp_app_id: LPCWSTR);
-
-unsafe extern "system" fn set_aumid(_lp_app_id: LPCWSTR) {
-    let set_aumid: SetAUMID = std::mem::transmute(original::SetAUMID);
-
-    // We set the AUMID to be the path of the launcher exe, so it looks like the launcher in the taskbar.
-    // I spent way too long working on this.
-    let new_id = U16CString::from_str(env::EXE_PATH.as_str()).unwrap();
-    set_aumid(new_id.as_ptr());
 }

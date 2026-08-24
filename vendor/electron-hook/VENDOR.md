@@ -18,6 +18,10 @@ Upstream cannot be consumed as a crates.io or git dependency because it:
 3. Trimmed Detours to `src/` + license files (dropped `samples/`, `tests/`, `vc/`, `.github/`).
 4. Removed a `libc::O_CLOEXEC` assertion in `src/paths.rs` tests (Unix-only constant, fails on
    Windows `libc`).
+5. Removed the `MoveFileExW` and `SetAUMID` hooks in `src/windows/hooks.rs` — both are
+   Discord-specific and violate TronHawk's runtime-only / minimal-interference invariants
+   (`MoveFileExW` rewrote the target updater's file renames; `SetAUMID` rewrote the target's
+   taskbar/notification identity).
 
 ## License
 
