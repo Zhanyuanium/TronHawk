@@ -12,6 +12,9 @@ out/
 release/
 coverage/
 
+# Runtime build artifact (bundled QuickJS; rebuild with `bun run build` in crates/runtime/js)
+crates/runtime/assets/runtime.js
+
 # TronHawk artifacts
 *.thx
 

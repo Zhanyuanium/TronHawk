@@ -14,7 +14,14 @@ if (-not (Test-Path -LiteralPath $packagedExe)) {
     bunx @electron/packager "$repo\apps\test-app" test-app-packaged --platform=win32 --arch=x64 --asar --out $poc 2>&1 | Out-Null
 }
 
-# 2. Copy injector + runtime assets next to the built binaries.
+# 2. Build the runtime bundle (embeds QuickJS), then copy assets next to the binaries.
+Push-Location (Join-Path $repo "crates\runtime\js")
+try {
+    bun install 2>&1 | Out-Null
+    bun run build 2>&1 | Out-Null
+} finally {
+    Pop-Location
+}
 Copy-Item "$repo\crates\injector\assets\bootstrap.js" "$bin\bootstrap.js" -Force
 Copy-Item "$repo\crates\runtime\assets\runtime.js" "$bin\runtime.js" -Force
 

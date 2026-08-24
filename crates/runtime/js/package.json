@@ -1,0 +1,12 @@
+{
+  "name": "tronhawk-runtime-js",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "bun build src/index.js --target node --format cjs --external electron --outfile ../assets/runtime.js"
+  },
+  "dependencies": {
+    "quickjs-emscripten-core": "^0.32.0",
+    "@jitl/quickjs-singlefile-cjs-release-sync": "^0.32.0"
+  }
+}
