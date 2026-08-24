@@ -4157,6 +4157,11 @@ dependencies = [
 [[package]]
 name = "tronhawk-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tronhawk-ipc",
+]
 
 [[package]]
 name = "tronhawk-injector"
@@ -4169,6 +4174,10 @@ dependencies = [
 [[package]]
 name = "tronhawk-ipc"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "tronhawk-package"
