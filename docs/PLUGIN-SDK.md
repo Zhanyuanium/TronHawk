@@ -24,12 +24,12 @@ NOT the SDK npm version.
 
 ```json
 {
-  "id": "com.example.glass-ui",
-  "name": "Glass UI",
+  "id": "com.example.dark-theme",
+  "name": "Dark Theme",
   "version": "1.0.0",
   "author": "Example",
   "tronhawk": "^0.1",
-  "entry": { "renderer": "dist/renderer.js", "main": "dist/main.js" },
+  "entry": { "css": "theme.css" },
   "permissions": ["renderer.css"]
 }
 ```
