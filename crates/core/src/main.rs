@@ -1,7 +1,8 @@
 //! TronHawk Core daemon (MVP): loads the hello-world plugin and serves it over IPC.
 //!
 //! Usage: tronhawk-core [plugin-dir]
-//! Port is read from `TRONHAWK_IPC_PORT` (default 17777).
+//! `TRONHAWK_IPC_PORT` (default 17777) and `TRONHAWK_IPC_SECRET` (required) configure the
+//! listener. The secret is a per-launch token shared with the launcher/target.
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -10,6 +11,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(17777);
+    let secret = std::env::var("TRONHAWK_IPC_SECRET")
+        .expect("TRONHAWK_IPC_SECRET is required");
 
     let plugin = tronhawk_core::load_plugin(std::path::Path::new(plugin_dir))
         .expect("failed to load plugin");
@@ -19,7 +22,7 @@ fn main() {
     );
     println!("[core] listening on 127.0.0.1:{port}");
 
-    if let Err(e) = tronhawk_core::serve(port, plugin) {
+    if let Err(e) = tronhawk_core::serve(port, &secret, plugin) {
         eprintln!("[core] server error: {e}");
         std::process::exit(1);
     }

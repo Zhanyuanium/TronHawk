@@ -1,12 +1,18 @@
-//! JSON-RPC over a local TCP socket. Every message carries `version` and `id`;
-//! errors are returned as structured `RpcError` responses.
+//! JSON-RPC over a local TCP socket. Every message carries `version`, `id`, and a
+//! per-launch `secret`; errors are returned as structured `RpcError` responses.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 /// Protocol version carried in every message.
 pub const PROTOCOL_VERSION: &str = "0.1";
+
+/// Maximum accepted request frame size (bytes).
+const MAX_FRAME_SIZE: usize = 64 * 1024;
+/// Read timeout for a single frame.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -15,6 +21,9 @@ pub struct Request {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    /// Per-launch authentication token.
+    #[serde(default)]
+    pub secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,12 +71,18 @@ impl Response {
 }
 
 /// Run a blocking JSON-RPC server on 127.0.0.1, dispatching each newline-delimited
-/// request to `handler`.
+/// request to `handler`. Per-connection errors are isolated and never terminate the
+/// listener.
 pub fn serve(port: u16, handler: impl Fn(Request) -> Response) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     for stream in listener.incoming() {
-        let stream = stream?;
-        handle_connection(stream, &handler)?;
+        match stream {
+            Ok(stream) => {
+                // A misbehaving client only closes its own connection.
+                let _ = handle_connection(stream, &handler);
+            }
+            Err(_) => continue,
+        }
     }
     Ok(())
 }
@@ -76,16 +91,11 @@ fn handle_connection(
     stream: TcpStream,
     handler: &impl Fn(Request) -> Response,
 ) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(()); // EOF
-        }
-
+    while let Some(line) = read_frame(&mut reader)? {
         let req = match serde_json::from_str::<Request>(line.trim()) {
             Ok(r) => r,
             Err(e) => {
@@ -94,9 +104,38 @@ fn handle_connection(
                 continue;
             }
         };
-
         let resp = handler(req);
         write_response(&mut writer, &resp)?;
+    }
+    Ok(())
+}
+
+/// Read one newline-terminated frame, enforcing a size cap.
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None); // EOF with no data
+            }
+            // A final partial frame without a trailing newline.
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if buf.len() + available.len() > MAX_FRAME_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
+        }
+        let len = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(len);
     }
 }
 
@@ -119,11 +158,13 @@ mod tests {
             id: 7,
             method: "getPlugin".into(),
             params: serde_json::json!({}),
+            secret: "abc".into(),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, 7);
         assert_eq!(back.method, "getPlugin");
+        assert_eq!(back.secret, "abc");
     }
 
     #[test]
