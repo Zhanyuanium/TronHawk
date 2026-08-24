@@ -3,8 +3,10 @@
 //
 // Phase 2: CSS injection via `webContents.insertCSS` (data, never executed as JS), with a
 // multi-plugin, revision-based state machine supporting hot reload, plugin removal, and
-// permission revocation. Renderer JS execution (`renderer.script`/`renderer.dom`) lands in a
-// later phase with a QuickJS sandbox (docs/adr/0002-renderer-js-sandbox.md).
+// permission revocation. A per-(window,plugin) generation token makes async CSS operations
+// revoke-safe (a pending insert that resolves after a revoke is discarded).
+// Renderer JS execution (`renderer.script`/`renderer.dom`) lands in a later phase with a
+// QuickJS sandbox (docs/adr/0002-renderer-js-sandbox.md).
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -24,14 +26,40 @@ function log(msg) {
 }
 
 let currentPlan = { revision: "", plugins: [] };
-// webContents.id -> { contents, keys: Map(pluginId -> { css, key }) }
+// webContents.id -> { contents, keys: Map(pluginId -> { css, key }), gens: Map(pluginId -> n) }
 const windows = new Map();
 
 function hasPermission(granted, perm) {
   return Array.isArray(granted) && granted.includes(perm);
 }
 
-// Reconcile one window against the current plan: inject wanted CSS, remove stale CSS.
+// Inject (or re-inject) a plugin's CSS into a window. The generation token makes the
+// result revoke-safe: if the plan changed while insertCSS was pending, the key is removed.
+function inject(w, pid, css) {
+  const gen = (w.gens.get(pid) || 0) + 1;
+  w.gens.set(pid, gen);
+
+  const old = w.keys.get(pid);
+  w.keys.delete(pid);
+  const removeOld = old
+    ? w.contents.removeInsertedCSS(old.key).catch(() => {})
+    : Promise.resolve();
+
+  removeOld
+    .then(() => w.contents.insertCSS(css))
+    .then((key) => {
+      if (w.gens.get(pid) !== gen) {
+        // Stale: the plan changed while this insert was pending — discard it.
+        w.contents.removeInsertedCSS(key).catch(() => {});
+        return;
+      }
+      w.keys.set(pid, { css, key });
+      log("css injected for " + pid);
+    })
+    .catch((e) => log("insertCSS failed for " + pid + ": " + (e && e.message ? e.message : e)));
+}
+
+// Reconcile one window against the current plan.
 function reconcile(w) {
   const wanted = new Map(); // pluginId -> { css }
   for (const p of currentPlan.plugins) {
@@ -40,39 +68,22 @@ function reconcile(w) {
     }
   }
 
-  // Inject or re-inject wanted plugins.
   for (const [pid, want] of wanted) {
     const entry = w.keys.get(pid);
-    if (!entry) {
+    if (!entry || entry.css !== want.css) {
       inject(w, pid, want.css);
-    } else if (entry.css !== want.css) {
-      w.keys.delete(pid);
-      w.contents
-        .removeInsertedCSS(entry.key)
-        .catch(() => {})
-        .then(() => inject(w, pid, want.css));
     }
-    // else: unchanged — leave it.
   }
 
-  // Remove keys for plugins no longer wanted.
   for (const [pid, entry] of w.keys) {
     if (!wanted.has(pid)) {
+      // Invalidate any pending insert + remove the settled key.
+      w.gens.set(pid, (w.gens.get(pid) || 0) + 1);
       w.keys.delete(pid);
       w.contents.removeInsertedCSS(entry.key).catch(() => {});
       log("css removed for " + pid);
     }
   }
-}
-
-function inject(w, pid, css) {
-  w.contents
-    .insertCSS(css)
-    .then((key) => {
-      w.keys.set(pid, { css, key });
-      log("css injected for " + pid);
-    })
-    .catch((e) => log("insertCSS failed for " + pid + ": " + (e && e.message ? e.message : e)));
 }
 
 function applyPlan(plan) {
@@ -90,7 +101,7 @@ function start(app) {
     if (contents.getType() !== "window") {
       return;
     }
-    const w = { contents, keys: new Map() };
+    const w = { contents, keys: new Map(), gens: new Map() };
     windows.set(contents.id, w);
     contents.on("destroyed", () => {
       windows.delete(contents.id);

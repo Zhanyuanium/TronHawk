@@ -22,27 +22,39 @@ function log(msg) {
   }
 }
 
+let nextId = 1;
+
 function getExecutionPlan(port, secret) {
+  const id = nextId++;
   return new Promise((resolve, reject) => {
     const sock = net.connect(port, "127.0.0.1", () => {
       sock.write(
         JSON.stringify({
           version: "0.1",
-          id: 1,
+          id,
           method: "getExecutionPlan",
           params: {},
           secret,
         }) + "\n",
       );
     });
+    sock.setTimeout(5000, () => {
+      sock.destroy();
+      reject(new Error("ipc timeout"));
+    });
     let buf = "";
     sock.on("data", (d) => {
       buf += d.toString();
+      if (buf.length > 256 * 1024) {
+        sock.destroy();
+        reject(new Error("ipc response too large"));
+        return;
+      }
       const nl = buf.indexOf("\n");
       if (nl >= 0) {
         sock.destroy();
         try {
-          resolve(JSON.parse(buf.slice(0, nl)));
+          resolve({ id, resp: JSON.parse(buf.slice(0, nl)) });
         } catch (e) {
           reject(e);
         }
@@ -61,10 +73,21 @@ module.exports = function bootstrap(originalAsar) {
   const { app } = require("electron");
   const runtime = require(path.join(__dirname, "runtime.js"));
 
-  // Register the Runtime's window hooks early, before the app creates its windows.
   runtime.start(app);
 
-  const apply = (resp) => {
+  const apply = ({ id, resp }) => {
+    if (!resp || typeof resp !== "object") {
+      log("invalid IPC response; ignoring");
+      return;
+    }
+    if (resp.version !== "0.1") {
+      log("IPC response version mismatch; ignoring");
+      return;
+    }
+    if (resp.id !== id) {
+      log("IPC response id mismatch; ignoring");
+      return;
+    }
     if (resp.error) {
       log("Core error: " + JSON.stringify(resp.error));
       return;
@@ -78,12 +101,25 @@ module.exports = function bootstrap(originalAsar) {
   };
 
   let polling = false;
+  let lastError = null;
   const poll = () => {
     if (polling) return;
     polling = true;
     getExecutionPlan(port, secret)
-      .then(apply)
-      .catch(() => {})
+      .then((result) => {
+        if (lastError !== null) {
+          log("Core reconnected");
+          lastError = null;
+        }
+        apply(result);
+      })
+      .catch((e) => {
+        const msg = e && e.message ? e.message : String(e);
+        if (lastError !== msg) {
+          log("poll failed: " + msg);
+          lastError = msg;
+        }
+      })
       .then(() => {
         polling = false;
       });

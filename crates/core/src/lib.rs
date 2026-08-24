@@ -44,10 +44,26 @@ pub fn install(thx: &Path, root: &Path) -> Result<(Plugin, PathBuf), String> {
     })?;
 
     let final_dir = root.join(&plugin.id);
-    if final_dir.exists() {
-        std::fs::remove_dir_all(&final_dir).map_err(|e| format!("remove old: {e}"))?;
+    let backup = root.join(format!(".backup-{}", &plugin.id));
+
+    // Remove any stale backup, then move the existing install aside.
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup).map_err(|e| format!("remove stale backup: {e}"))?;
     }
-    std::fs::rename(&staging, &final_dir).map_err(|e| format!("commit install: {e}"))?;
+    if final_dir.exists() {
+        std::fs::rename(&final_dir, &backup).map_err(|e| format!("backup old: {e}"))?;
+    }
+
+    // Commit staging -> final; rollback to the backup on failure.
+    if let Err(e) = std::fs::rename(&staging, &final_dir) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, &final_dir);
+        }
+        return Err(format!("commit install: {e}"));
+    }
+    if backup.exists() {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
 
     Ok((plugin, final_dir))
 }
@@ -83,11 +99,11 @@ pub fn load_plan(dir: &Path) -> Result<ExecutionPlan, String> {
     load_plugin_dir(dir).map(to_plan)
 }
 
-/// A cached execution plan, rebuilt only when the plugin directory changes (mtime-based).
-/// Avoids re-reading and re-validating files on every `getExecutionPlan` request.
+/// A cached execution plan, rebuilt only when the plugin directory's content fingerprint
+/// changes. Avoids re-reading and re-validating files on every `getExecutionPlan` request.
 pub struct CachedLoader {
     dir: PathBuf,
-    cache: Mutex<Option<(SystemTime, ExecutionPlan)>>,
+    cache: Mutex<Option<(String, ExecutionPlan)>>,
 }
 
 impl CachedLoader {
@@ -99,56 +115,71 @@ impl CachedLoader {
     }
 
     pub fn load(&self) -> Result<ExecutionPlan, String> {
-        let mtime = latest_mtime(&self.dir)?;
-        let mut cache = self.cache.lock().unwrap();
+        let fp = fingerprint(&self.dir)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| "cache lock poisoned".to_string())?;
         let rebuild = match cache.as_ref() {
-            Some((t, _)) => *t != mtime,
+            Some((f, _)) => *f != fp,
             None => true,
         };
         if rebuild {
             let plan = load_plan(&self.dir)?;
-            *cache = Some((mtime, plan));
+            *cache = Some((fp, plan));
         }
         Ok(cache.as_ref().unwrap().1.clone())
     }
 }
 
-fn latest_mtime(dir: &Path) -> Result<SystemTime, String> {
-    let mut latest = SystemTime::UNIX_EPOCH;
-    let mut any = false;
+/// A content fingerprint of a plugin directory: sorted `(relpath, size, mtime_ns)` entries.
+/// Detects additions, deletions, and content/mtime changes (not just the latest mtime).
+fn fingerprint(dir: &Path) -> Result<String, String> {
+    let mut entries: Vec<String> = Vec::new();
+    collect_fingerprint(dir, "", &mut entries)?;
+    entries.sort();
+    Ok(hash_bytes(entries.join("\n").as_bytes()))
+}
+
+fn collect_fingerprint(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read dir: {e}"))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel_path = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
         if path.is_dir() {
-            let m = latest_mtime(&path)?;
-            if m > latest {
-                latest = m;
-            }
-            any = true;
+            collect_fingerprint(&path, &rel_path, out)?;
         } else if path.is_file() {
-            let m = std::fs::metadata(&path)
-                .map_err(|e| format!("metadata: {e}"))?
+            let meta = std::fs::metadata(&path).map_err(|e| format!("metadata: {e}"))?;
+            let mtime_ns = meta
                 .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            if m > latest {
-                latest = m;
-            }
-            any = true;
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            out.push(format!("{rel_path}\t{}\t{}", meta.len(), mtime_ns));
         }
     }
-    if !any {
-        return Err("plugin directory is empty".to_string());
+    Ok(())
+}
+
+/// Stable FNV-1a 64-bit hash (deterministic; unlike `DefaultHasher`, the algorithm is fixed).
+fn hash_bytes(data: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-    Ok(latest)
+    format!("{hash:016x}")
 }
 
 fn hash_json<T: Serialize>(v: &T) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let s = serde_json::to_string(v).unwrap_or_default();
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:x}", h.finish())
+    hash_bytes(s.as_bytes())
 }
 
 /// Run the Core IPC server, serving `getExecutionPlan`. `load` is invoked on every request so

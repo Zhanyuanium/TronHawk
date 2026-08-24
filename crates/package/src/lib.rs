@@ -22,6 +22,10 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
 
 /// Maximum `manifest.json` size (bytes) read from a `.thx` archive.
 const MAX_MANIFEST_SIZE: u64 = 1024 * 1024;
+/// Archive hardening limits.
+const MAX_ENTRIES: usize = 1000;
+const MAX_SINGLE_FILE: u64 = 16 * 1024 * 1024;
+const MAX_TOTAL_SIZE: u64 = 64 * 1024 * 1024;
 
 /// A parsed plugin manifest and its execution plan (MVP: declared == granted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +56,9 @@ struct Manifest {
     css: Option<String>,
     #[serde(default)]
     entry: Option<Entry>,
+    #[serde(default)]
+    #[allow(dead_code)] // accepted for forward-compat; not processed yet
+    config: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -72,9 +79,7 @@ pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), Stri
     let m: Manifest = serde_json::from_value(manifest.clone())
         .map_err(|e| format!("manifest schema: {e}"))?;
 
-    if m.id.trim().is_empty() {
-        return Err("`id` must not be empty".to_string());
-    }
+    validate_id(&m.id)?;
     if m.name.trim().is_empty() {
         return Err("`name` must not be empty".to_string());
     }
@@ -93,6 +98,14 @@ pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), Stri
         if !seen.insert(p.clone()) {
             return Err(format!("duplicate permission `{p}`"));
         }
+    }
+
+    // Mutually exclusive CSS sources + unsupported main entry.
+    if m.css.is_some() && m.entry.as_ref().and_then(|e| e.css.as_ref()).is_some() {
+        return Err("`css` and `entry.css` are mutually exclusive".to_string());
+    }
+    if m.entry.as_ref().and_then(|e| e.main.as_ref()).is_some() {
+        return Err("`entry.main` is not supported yet".to_string());
     }
 
     // Entry-permission coherence.
@@ -128,9 +141,34 @@ pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), Stri
 }
 
 fn check_entry_path(rel: &str) -> Result<(), String> {
+    if rel.is_empty() {
+        return Err("entry path must not be empty".to_string());
+    }
     let p = Path::new(rel);
-    if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!("entry path must be relative and not escape: {rel}"));
+    for c in p.components() {
+        if !matches!(c, Component::Normal(_)) {
+            return Err(format!("entry path must be a safe relative path: {rel}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a plugin ID: a safe identifier, not a filesystem path. Reverse-DNS-style ASCII
+/// (lowercase letters, digits, `.`, `-`, `_`), no separators, no empty dot-segments.
+fn validate_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err("`id` must be 1-128 characters".to_string());
+    }
+    for c in id.chars() {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_';
+        if !ok {
+            return Err(format!("`id` contains invalid character `{c}`"));
+        }
+    }
+    for seg in id.split('.') {
+        if seg.is_empty() {
+            return Err("`id` must not contain empty dot-segments (e.g. `..`)".to_string());
+        }
     }
     Ok(())
 }
@@ -197,6 +235,8 @@ pub fn load_plugin_dir(dir: &Path) -> Result<Plugin, String> {
 /// Pack a plugin directory into a `.thx` (ZIP) archive. Symlinks are refused, entries are
 /// sorted, and ZIP names use `/` separators.
 pub fn pack(dir: &Path, output: &Path) -> Result<(), String> {
+    // Validate the plugin before packing (same schema as install).
+    load_plugin_dir(dir).map_err(|e| format!("invalid plugin: {e}"))?;
     let dir_canon = dir.canonicalize().map_err(|e| format!("pack dir: {e}"))?;
     if let Some(parent) = output.parent() {
         if let Ok(parent_canon) = parent.canonicalize() {
@@ -238,6 +278,23 @@ pub fn extract(thx: &Path, dest: &Path) -> Result<Plugin, String> {
     // Phase 1: read + validate the manifest schema before writing anything.
     let manifest = read_manifest(&mut archive)?;
     validate_manifest_schema(&manifest)?;
+
+    // Phase 1b: enforce archive limits.
+    if archive.len() > MAX_ENTRIES {
+        return Err(format!("archive has too many entries ({})", archive.len()));
+    }
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
+        let size = entry.size();
+        if size > MAX_SINGLE_FILE {
+            return Err(format!("archive entry too large: {}", entry.name()));
+        }
+        total += size;
+        if total > MAX_TOTAL_SIZE {
+            return Err("archive uncompressed size too large".to_string());
+        }
+    }
 
     // Phase 2: extract all entries with strict path containment.
     for i in 0..archive.len() {
@@ -383,5 +440,20 @@ mod tests {
     fn rejects_path_traversal_manifest() {
         assert!(resolve_within(Path::new("C:/x"), "../etc/passwd").is_err());
         assert!(resolve_within(Path::new("C:/x"), "C:/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_malicious_plugin_id() {
+        for bad in ["..", ".", "a/../b", "a\\b", "C:\\x", "a..b", "UPPER", "a b"] {
+            let m = serde_json::json!({
+                "id": bad,
+                "name": "x",
+                "version": "1.0.0",
+                "author": "a",
+                "tronhawk": "^0.1",
+                "permissions": []
+            });
+            assert!(validate_manifest_schema(&m).is_err(), "id `{bad}` should be rejected");
+        }
     }
 }
