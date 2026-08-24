@@ -18,6 +18,7 @@ pub struct PluginGrant {
     pub granted: Vec<String>,
     pub css: Option<String>,
     pub renderer: Option<String>,
+    pub main: Option<String>,
 }
 
 /// The execution plan served to the Runtime: a revision + the set of granted plugins.
@@ -86,6 +87,7 @@ pub fn to_plan(plugin: Plugin) -> ExecutionPlan {
         granted: plugin.permissions,
         css: plugin.css,
         renderer: plugin.renderer,
+        main: plugin.main,
     };
     let revision = hash_json(&grant);
     ExecutionPlan {
@@ -239,6 +241,7 @@ mod tests {
             permissions: vec!["renderer.css".into()],
             css: Some("body{}".into()),
             renderer: None,
+            main: None,
         };
         let mut p2 = p1.clone();
         p2.css = Some("body{background:#111}".into());

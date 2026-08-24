@@ -38,8 +38,10 @@ pub struct Plugin {
     pub permissions: Vec<String>,
     /// CSS data to inject for `renderer.css` — injected via `insertCSS`, never executed as JS.
     pub css: Option<String>,
-    /// Renderer JS source for `renderer.script`/`renderer.dom` (Phase 2+).
+    /// Renderer JS source for `renderer.script`/`renderer.dom`.
     pub renderer: Option<String>,
+    /// Main-process JS source for `electron.*` capabilities.
+    pub main: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -100,12 +102,9 @@ pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), Stri
         }
     }
 
-    // Mutually exclusive CSS sources + unsupported main entry.
+    // Mutually exclusive CSS sources.
     if m.css.is_some() && m.entry.as_ref().and_then(|e| e.css.as_ref()).is_some() {
         return Err("`css` and `entry.css` are mutually exclusive".to_string());
-    }
-    if m.entry.as_ref().and_then(|e| e.main.as_ref()).is_some() {
-        return Err("`entry.main` is not supported yet".to_string());
     }
 
     // Entry-permission coherence.
@@ -210,6 +209,15 @@ pub fn validate_manifest(manifest: &serde_json::Value, root: &Path) -> Result<Pl
         None => None,
     };
 
+    let main = match manifest.get("entry").and_then(|e| e.get("main")) {
+        Some(v) => {
+            let rel = v.as_str().ok_or("`entry.main` must be a string")?;
+            let p = resolve_within(root, rel)?;
+            Some(std::fs::read_to_string(&p).map_err(|e| format!("read main: {e}"))?)
+        }
+        None => None,
+    };
+
     Ok(Plugin {
         id,
         name,
@@ -219,6 +227,7 @@ pub fn validate_manifest(manifest: &serde_json::Value, root: &Path) -> Result<Pl
         permissions,
         css,
         renderer,
+        main,
     })
 }
 
