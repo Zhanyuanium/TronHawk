@@ -1,8 +1,8 @@
 // TronHawk injector bootstrap — runs in the target's MAIN process.
 // Loaded via `require(MODLOADER_MOD_ENTRYPOINT)(originalAsar)` from the remapped app.asar.
 //
-// Phase 1: connects to Core over IPC, fetches the plugin, and injects its renderer
-// entry into the app's renderer with a minimal `ctx` runtime.
+// Injector responsibility (docs/AGENTS.md): enter process, establish comms with Core,
+// and load the trusted Runtime. NO plugin logic lives here.
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -14,12 +14,17 @@ function log(msg) {
   fs.appendFileSync(LOG, msg + "\n");
 }
 
-function getPlugin(port) {
+function getPlugin(port, secret) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(port, "127.0.0.1", () => {
       sock.write(
-        JSON.stringify({ version: "0.1", id: 1, method: "getPlugin", params: {} }) +
-          "\n",
+        JSON.stringify({
+          version: "0.1",
+          id: 1,
+          method: "getPlugin",
+          params: {},
+          secret,
+        }) + "\n",
       );
     });
     let buf = "";
@@ -43,70 +48,33 @@ module.exports = function bootstrap(originalAsar) {
   log("injected; electron=" + process.versions.electron);
 
   const port = parseInt(process.env.TRONHAWK_IPC_PORT || "17777", 10);
+  const secret = process.env.TRONHAWK_IPC_SECRET || "";
   log("connecting to Core on port " + port);
 
   const { app } = require("electron");
-  let plugin = null;
+  const runtime = require(path.join(__dirname, "runtime.js"));
 
-  app.on("web-contents-created", (_e, contents) => {
-    let attempts = 0;
-    const inject = () => {
-      if (!plugin || !plugin.renderer) {
-        if (attempts < 20) {
-          attempts += 1;
-          setTimeout(inject, 500);
-        }
-        return;
-      }
+  // Register the Runtime's window hooks early, before the app creates its windows.
+  runtime.start(app);
 
-      // Build the renderer runtime: a minimal `ctx` (css.insert) + the plugin source.
-      const built =
-        "(function () {" +
-        "  const ctx = {" +
-        "    css: {" +
-        "      insert: function (css) {" +
-        "        var s = document.createElement('style');" +
-        "        s.setAttribute('data-tronhawk', " +
-        JSON.stringify(plugin.id) +
-        ");" +
-        "        s.textContent = css;" +
-        "        document.head.appendChild(s);" +
-        "        return 'tronhawk://" +
-        plugin.id +
-        "/style-1';" +
-        "      }," +
-        "      remove: function () {}" +
-        "    }" +
-        "  };" +
-        "  const module = { exports: {} };" +
-        plugin.renderer +
-        "  if (module.exports.activate) module.exports.activate(ctx);" +
-        "})();";
-
-      contents
-        .executeJavaScript(built)
-        .then(() =>
-          contents.executeJavaScript(
-            "getComputedStyle(document.body).backgroundColor",
-          ),
-        )
-        .then((bg) => log("plugin injected; body backgroundColor=" + bg))
-        .catch((e) => log("inject failed: " + (e && e.message ? e.message : e)));
-    };
-    contents.on("did-finish-load", inject);
-  });
-
-  getPlugin(port)
+  // Establish comms and hand the execution plan to the Runtime.
+  getPlugin(port, secret)
     .then((resp) => {
       if (resp.error) {
         log("Core error: " + JSON.stringify(resp.error));
         return;
       }
-      plugin = resp.result;
+      const plugin = resp.result;
+      if (!plugin || typeof plugin !== "object" || typeof plugin.id !== "string") {
+        log("invalid plugin payload from Core; ignoring");
+        return;
+      }
       log("received plugin: " + plugin.id + " v" + plugin.version);
+      runtime.setPlugin(plugin);
     })
     .catch((e) => log("getPlugin failed: " + (e && e.message ? e.message : e)));
 
+  // Load the original app (transparent injection).
   try {
     const pkg = require(path.join(originalAsar, "package.json"));
     require(path.join(originalAsar, pkg.main || "index.js"));
