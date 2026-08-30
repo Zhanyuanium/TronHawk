@@ -129,9 +129,10 @@ Manifest required fields: `id`, `name`, `version`, `author`, `tronhawk`; optiona
 data, or `entry.css` file) for CSS-only themes, `entry.{renderer,main}`, and `permissions[]`.
 
 Execution contexts:
-- **Renderer** (Chromium/V8): CSS (MVP, data-only); JS/DOM via a QuickJS sandbox (Phase 3, see
-  ADR 0002); localStorage / IndexedDB (future).
-- **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw Electron.
+- **Renderer** (Chromium/V8): CSS (data-only) and JS (`renderer.script`) run via the QuickJS sandbox
+  (ADR 0002); `renderer.dom` query/observe is future; localStorage / IndexedDB (future).
+- **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
+  Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
 - **Developer mode** (`runtime.unsafe`): raw Electron/Node, off by default.
 
 Lifecycle: install → enable → load → app start → runtime hooks → unload → disable.
@@ -197,8 +198,8 @@ Scaffolding CLI: `create-tronhawk-plugin`. Full API in `PLUGIN-SDK.md`.
 |---|---|---|
 | 0 Foundation | Rust workspace, Tauri shell, SDK, test app | skeleton builds |
 | 1 Injection | electron-hook, IFEO, launcher fallback | launch test app → auto-inject → hello-world plugin runs |
-| 2 Renderer plugins | `.thx`, manifest, CSS+JS injection, CSS hot reload | ChatGPT dark theme |
-| 3 Main plugins | BrowserWindow API, window mod, permissions | ChatGPT glass window |
+| 2 Renderer plugins | `.thx`, manifest, CSS+JS injection, CSS hot reload | ✅ CSS + hot reload; JS injection landed in Phase 3 |
+| 3 Main plugins | BrowserWindow API, window mod, permissions | ✅ window mod (setOpacity); glass (vibrancy/mica) is future |
 | 4 Manager UI | install, enable/disable, logs, permissions | usable manager |
 | 5 OSS prep | docs, examples, contribution guide | public-ready |
 

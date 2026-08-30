@@ -17,6 +17,10 @@ roadmap, phased to the milestones in SPEC §15.
   validation, zip-slip guarded, archive limits), transactional install (staging → `root/<id>`),
   multi-plugin execution plan (granted capabilities + revision), CSS injection (data-only), and
   revoke-safe hot reload. Renderer JS sandbox decided (ADR 0002: QuickJS, Phase 3).
+- Phase 3 (QuickJS sandbox + plugins) in progress: embedded QuickJS (quickjs-emscripten, bundled
+  single-file) runs main-process plugins (`electron.window` → setOpacity/setSize/setPosition) and
+  renderer JS (`renderer.script` → executeJavaScript bridge), all gated by granted permissions.
+  Remaining follow-ups tracked in docs/BACKLOG.md.
 - Toolchain: rustc/cargo 1.97.1 ✓, bun 1.4.0 ✓, Tauri CLI ✓ (via bun). Node not required — bun is
   the JS toolchain.
 
