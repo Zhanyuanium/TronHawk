@@ -26,16 +26,22 @@ completed or superseded are no longer listed.
 - [ ] Real-time log push/streaming (current Logs view is manual refresh, read-only pagination).
 - [ ] Structured log export/full-text search; per-plugin log credentials for stronger attribution.
 
-## Resilience / availability (found in the post-M4 audit — genuinely open)
+## Resilience / availability (DUR-1 and CORE-3 resolved)
 
-- [ ] **DUR-1 — Core restart / OS suspend permanently orphans every running target.** Launch
-      sessions are in-memory only; after any Core restart (or >10min idle suspension) the target's
-      bootstrap polls forever with `-32001`, freezing its plan and dropping logs. No re-attach path.
-      Investigate a launcher-side session renewal keyed to the app or persisted sessions with
-      durable `last_used`. This is a real enforcement gap for policy/revocation.
-- [ ] **CORE-3 — daemon re-reads every installed plugin's full source on each `getExecutionPlan`.**
-      Each injected app polls every 2s; disk I/O scales with apps x plugins. `CachedLoader` was
-      removed as dead code; re-instate a content-fingerprint cache in the live daemon path.
+- [x] **DUR-1 — Core restart / OS suspend permanently orphans every running target.** Resolved:
+      launch tokens are now self-contained HMAC-signed (`v1.<app>.<issued>.<nonce>.<mac>` over a
+      separate persistent `launch.key`); no in-memory session map. A token authorizes plan/log RPCs
+      while <600s old and `renewSession` refreshes it up to one 24h absolute cap. The bootstrap
+      transport proactively renews (>540s) and passively recovers on `-32001`, so a target survives
+      a Core restart or long suspension without relaunching. Verified end-to-end (kill + restart Core
+      on the same root/port while the target stays alive; 'Core reconnected' observed).
+      Residual (accepted): >24h offline targets must relaunch; same-user can read `launch.key` to
+      mint tokens for registered apps (equivalent to reading `control.token`, no privilege widening).
+- [x] **CORE-3 — daemon re-reads every installed plugin's full source on each `getExecutionPlan`.**
+      Resolved: `ServiceInner.plugin_cache` holds a content-fingerprint (relpath/size/mtime_ns) of the
+      installed plugins and serves the parsed set on a hit; invalidation on install/remove. A rescan
+      failure after a fingerprint change logs `core.plugin.scan_failed` and falls back to the last good
+      cache (availability-first); per-app policy/plan filtering still applied each call.
 
 ## Package / install hardening
 
