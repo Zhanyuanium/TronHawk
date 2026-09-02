@@ -3,7 +3,7 @@
 Known follow-ups and deferred items, tracked outside the milestone plan. Keep this updated as
 work lands or new gaps are found.
 
-## Phase 3 — QuickJS sandbox (in progress)
+## Phase 3 — QuickJS sandbox (complete)
 
 - [ ] `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) — needs async host functions (the
       `asyncify` QuickJS variant) + a per-window DOM bridge returning serialized data.
@@ -11,10 +11,15 @@ work lands or new gaps are found.
       `setOpacity` / `setSize` / `setPosition` are implemented.
 - [ ] Plugin `deactivate(ctx)` lifecycle — the runtime currently only disposes the QuickJS `vm`;
       it does not invoke the plugin's own `deactivate`.
-- [ ] `onCreated` callback handle cleanup — QuickJS callback handles are held for the plugin's
-      lifetime, not released on deactivate.
-- [ ] `script.execute` return value — currently fire-and-forget; async host functions would let
-      it return the result.
+- [ ] QuickJS pending-job draining — required before lifecycle hooks may return promises and before
+      asynchronous host APIs can expose completion/results to plugins.
+
+## Phase 4 — Manager UI
+
+- [ ] `manifest.json` `config{}` settings UI — schema-driven auto-generated Manager form; not
+      implemented (config state exists in Core but no UI).
+- [ ] Real-time log push/streaming (current Logs view is manual refresh, read-only pagination).
+- [ ] Structured log export/full-text search; per-plugin log credentials for stronger attribution.
 
 ## Package / install hardening
 
@@ -49,8 +54,8 @@ work lands or new gaps are found.
 ## Real-target validation (Aug 2026)
 
 - [x] **Obsidian** (Electron 43.3.0) — injection + QuickJS sandbox + main plugin (`setOpacity`)
-      + renderer plugin (`script.execute`) all work. (UI renders shell-only via a custom `app://`
-      protocol — application-profile concern.)
+      + renderer plugin (`script.setDocumentTitle`) all work. (UI renders shell-only via a custom
+      `app://` protocol — application-profile concern.)
 - [ ] **OpenChamber** (Electron 43.3.0) — original app fails to start: the modded asar
       `package.json` lacks a `version`, so `app.getVersion()` falls back to the exe's 4-part
       `1.22.0.0`, which electron-updater rejects. Mitigation: copy the original asar's

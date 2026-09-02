@@ -39,7 +39,7 @@ NOT the SDK npm version.
 | Permission | API | Risk |
 |---|---|---|
 | `renderer.css` | `ctx.css.insert()` / `ctx.css.remove()` | low |
-| `renderer.script` | `ctx.script.execute()` | medium |
+| `renderer.script` | `ctx.script.setDocumentTitle()` | low |
 | `renderer.dom` | `ctx.dom.query()` / `ctx.dom.observe()` | medium |
 | `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` / `setMica()` | — |
 | `electron.webContents` | DevTools, navigation, preload | — |
@@ -58,7 +58,10 @@ export default {
 }
 ```
 
-`activate` / `deactivate` may return `void | Promise<void>`; the runtime awaits returned promises.
+`activate` / `deactivate` must complete synchronously and return JavaScript `undefined` (a normal
+function with no `return` statement does this). The runtime rejects any other result, including a
+Promise/thenable, and does not activate that plugin. Async lifecycle hooks are not supported until
+the QuickJS runtime implements pending-job draining.
 
 ## Renderer API (`RendererContext`)
 
@@ -70,7 +73,8 @@ interface RendererContext extends PluginContext { css; dom; script; }
   (`tronhawk://glass-ui/style-1`) to avoid conflicts between plugins.
 - `ctx.dom.query(selector)`; `ctx.dom.observe(selector, cb)` — MutationObserver abstraction, for
   React/Vue dynamic DOM.
-- `ctx.script.execute(code)` — requires `renderer.script`; runs in plugin context.
+- `ctx.script.setDocumentTitle(title)` — requires `renderer.script`; sets only `document.title`.
+  The host serializes the title as data and does not execute plugin-provided JavaScript source.
 - (future) `ctx.storage.get()/set()` — unified access to localStorage/IndexedDB (do NOT touch raw
   `localStorage`).
 
@@ -81,18 +85,22 @@ interface MainContext extends PluginContext { window; webContents; }
 ```
 
 - `ctx.window.onCreated(cb)` — `cb` receives an opaque `WindowHandle`; every window mutation takes
-  that handle, so multi-window apps are unambiguous.
+  that handle, so multi-window apps are unambiguous. The callback must complete synchronously and
+  return `undefined`; otherwise the runtime unregisters it.
 - `ctx.window.setOpacity(win, n)` / `setSize(win, w, h)` / `setPosition(win, x, y)` — cross-platform.
 - `ctx.window.setVibrancy(win, material)` (macOS) / `setMica(win, enabled)` (Windows 11) — return a
   structured error on unsupported platforms.
-- `ctx.webContents.openDevTools(win)` / `reload(win)` / `executeJavaScript(win, code)`.
+- `ctx.webContents.openDevTools(win)` / `reload(win)`.
 - (future) `ctx.session.modify()` (User-Agent, proxy, request interception).
 - (future) `ctx.ipc.on()/send()/intercept()` — high privilege.
 
 ## Logging & network
 
-- Log via `ctx.logger.info()/warn()/error()` — format `[Plugin ID][Level][Timestamp] message`.
-  `console.log()` is not formal logging.
+- Log string messages via `ctx.logger.info()/warn()/error()`. The host supplies this logger in both
+  main and renderer contexts and attributes every accepted event to the owning plugin; plugin code
+  cannot override the plugin identity or add arbitrary event fields. Non-string values are ignored.
+  Messages are bounded client-side and validated again by Core. `console.log()` is not captured and
+  is not formal logging.
 - Network only via `await ctx.network.request({ url, method })` (requires `network.access`); Core
   enforces permission + domain whitelist + logging/blocking. Interception requires `network.proxy`.
 
@@ -124,15 +132,16 @@ Dark mode (renderer): `permissions:["renderer.css"]` → declare the CSS as data
 `"css": "body { background:#111; }"` (injected via `insertCSS`; no plugin JS is executed).
 
 Glass window (main): `permissions:["electron.window"]` →
-`ctx.window.onCreated(w => ctx.window.setVibrancy(w, "sidebar"))`.
+`ctx.window.onCreated(w => { ctx.window.setVibrancy(w, "sidebar"); })`.
 
 ## Stability & design rules
 
 SemVer: major = breaking, minor = new capability, patch = fix. Every new API must have: a
 permission model, tests, docs, error handling, and no exposure of internal implementation.
 
-## Open questions
+## Sandbox limits
 
-1. Renderer sandbox: isolated world vs page world (needs electron-hook validation).
-2. Main-runtime JS loading: Node VM vs QuickJS sandbox vs V8 context isolation.
-3. Plugin dependency isolation: bundle vs shared runtime vs npm-style cache.
+Renderer and main plugin code runs in QuickJS without raw DOM, network, Node, or Electron access.
+Every evaluation and host-invoked plugin callback has a one-second CPU deadline, in addition to the
+runtime memory and stack limits. Renderer page access is restricted to documented host APIs; there
+is no arbitrary JavaScript execution bridge.

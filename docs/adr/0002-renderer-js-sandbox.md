@@ -1,10 +1,11 @@
 # ADR 0002 — Renderer JS sandbox (and main-runtime JS engine)
 
-Status: **Accepted** (implementation deferred to Phase 3)
+Status: **Accepted** (implemented in Phase 3)
 
 ## Context
 
-Plugins may declare `renderer.script` (execute page JS) and `renderer.dom` (DOM manipulation).
+Plugins may declare `renderer.script` for narrowly defined page operations and `renderer.dom`
+(DOM manipulation).
 Open question #1 asked: isolated world vs page world. The Phase 1 review established that running
 plugin JS in the page main world (`executeJavaScript`) is not a capability boundary — even a
 CSS-only plugin could reach `document` / `fetch` / the page preload bridge. Phase 2 made CSS
@@ -32,12 +33,19 @@ the remaining renderer-JS path.
 2. **`renderer.script` / `renderer.dom` plugins run in an embedded QuickJS engine**
    (`rquickjs` on the Rust side, or `quickjs-emscripten`), hosted in a worker/utility process. The
    QuickJS context has no `document` / `fetch` / `require` / `process`. Every granted capability
-   (`ctx.dom.query`, `ctx.script.execute`, …) is a **host function** that performs the allow-listed
-   operation on the real page via `webContents.executeJavaScript` (a privileged bridge). A plugin
-   therefore reaches the page only through its granted host functions — never raw DOM/network/Node.
+   (`ctx.dom.query`, `ctx.script.setDocumentTitle`, …) is a **host function** that performs an
+   allow-listed operation on the real page. `setDocumentTitle` may use
+   `webContents.executeJavaScript` only with a host-owned fixed assignment template; the title is
+   inserted solely through `JSON.stringify`, so plugin input never becomes JavaScript source. A
+   plugin therefore reaches the page only through its granted host functions — never raw
+   DOM/network/Node. No arbitrary page-world execution API is exposed.
 
 3. This also resolves open question #2 (main-runtime JS loading): use the same QuickJS engine for
    main-process plugins (`MainContext`) instead of Node `vm` or V8 context isolation.
+
+4. Every QuickJS source evaluation and host-invoked plugin callback has a one-second CPU deadline.
+   The runtime installs `shouldInterruptAfterDeadline` immediately before each operation and removes
+   the interrupt handler in `finally`; memory and stack limits remain independently enforced.
 
 ## Why not the alternatives
 
@@ -50,10 +58,10 @@ the remaining renderer-JS path.
 
 ## Consequences
 
-- Phase 3 adds an embedded JS engine (`rquickjs` / `quickjs-emscripten`) + host-function bindings
-  for the granted `ctx` APIs. Until then, `renderer.script` / `renderer.dom` are not exposed.
-- `renderer.script` / `renderer.dom` permission semantics: the plugin runs in the sandbox and
-  reaches the page only through its granted host functions.
+- Phase 3 adds `quickjs-emscripten` + host-function bindings for granted `ctx` APIs.
+- `renderer.script` means permission to call documented narrow host operations, currently only
+  `ctx.script.setDocumentTitle(title)`; it does not grant arbitrary page JavaScript execution.
+- Non-terminating evaluations and callbacks are interrupted after one second and logged.
 - `runtime.unsafe` remains the only path to raw Electron/Node (developer mode, off by default).
 
 ## References

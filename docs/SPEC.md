@@ -129,7 +129,8 @@ Manifest required fields: `id`, `name`, `version`, `author`, `tronhawk`; optiona
 data, or `entry.css` file) for CSS-only themes, `entry.{renderer,main}`, and `permissions[]`.
 
 Execution contexts:
-- **Renderer** (Chromium/V8): CSS (data-only) and JS (`renderer.script`) run via the QuickJS sandbox
+- **Renderer** (Chromium/V8): CSS is data-only; plugin JS runs in QuickJS with one-second evaluation
+  and callback CPU deadlines. `renderer.script` only allows the host-owned document-title setter
   (ADR 0002); `renderer.dom` query/observe is future; localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
   Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
@@ -156,7 +157,7 @@ privileged API verifies permission first.
 | Permission | Allows | Risk |
 |---|---|---|
 | `renderer.css` | inject CSS | low |
-| `renderer.script` | execute page JS | medium |
+| `renderer.script` | set `document.title` through a host-owned setter | low |
 | `renderer.dom` | modify DOM | medium |
 | `electron.window` | modify window (`setOpacity`, `setVibrancy`) | — |
 | `electron.webContents` | page load, DevTools | — |
@@ -174,9 +175,12 @@ MVP UI: Applications (with supported level), Plugins (enable / disable / remove)
 
 ## 12. Data & Config
 
-Storage root `%APPDATA%\TronHawk\` → `config/`, `plugins/{installed, cache}`, `logs/`, `profiles/`, `runtime/`.
+Storage root `%LOCALAPPDATA%\TronHawk\` (overridable via `TRONHAWK_STORAGE_ROOT`) → `config/`,
+`plugins/{installed, cache}`, `logs/`, `profiles/`, `runtime/`.
 Config tiers: global (`language`, `developerMode`), application (`enabledPlugins`), plugin (per-plugin settings).
-Logging: three streams — Core, Runtime, Plugin (`[Plugin ID][Level][Timestamp] message`).
+Logging: three durable streams — Core, Runtime, Plugin. Core owns a bounded JSONL ledger under
+`logs/` with strict Core-generated sequence and attribution; Control may query, a launch session
+may only append its own attributed Runtime/Plugin events, and the Manager displays it read-only.
 
 ## 13. SDK & DX
 
@@ -200,7 +204,7 @@ Scaffolding CLI: `create-tronhawk-plugin`. Full API in `PLUGIN-SDK.md`.
 | 1 Injection | electron-hook, IFEO, launcher fallback | launch test app → auto-inject → hello-world plugin runs |
 | 2 Renderer plugins | `.thx`, manifest, CSS+JS injection, CSS hot reload | ✅ CSS + hot reload; JS injection landed in Phase 3 |
 | 3 Main plugins | BrowserWindow API, window mod, permissions | ✅ window mod (setOpacity); glass (vibrancy/mica) is future |
-| 4 Manager UI | install, enable/disable, logs, permissions | usable manager |
+| 4 Manager UI | install, enable/disable, logs, permissions | usable manager — install/register, enable/disable, redacted control plane, three-stream logs |
 | 5 OSS prep | docs, examples, contribution guide | public-ready |
 
 ## 16. MVP Acceptance

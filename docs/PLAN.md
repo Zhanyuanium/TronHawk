@@ -17,10 +17,15 @@ roadmap, phased to the milestones in SPEC §15.
   validation, zip-slip guarded, archive limits), transactional install (staging → `root/<id>`),
   multi-plugin execution plan (granted capabilities + revision), CSS injection (data-only), and
   revoke-safe hot reload. Renderer JS sandbox decided (ADR 0002: QuickJS, Phase 3).
-- Phase 3 (QuickJS sandbox + plugins) in progress: embedded QuickJS (quickjs-emscripten, bundled
+- Phase 3 (QuickJS sandbox + plugins) complete: embedded QuickJS (quickjs-emscripten, bundled
   single-file) runs main-process plugins (`electron.window` → setOpacity/setSize/setPosition) and
-  renderer JS (`renderer.script` → executeJavaScript bridge), all gated by granted permissions.
-  Remaining follow-ups tracked in docs/BACKLOG.md.
+  renderer JS (`renderer.script` → host-owned document-title setter), all gated by granted
+  permissions, bounded by a one-second CPU deadline per evaluation/callback, with fail-closed
+  lifecycle and plan-generation revocation. Remaining follow-ups tracked in docs/BACKLOG.md.
+- Phase 4 (Manager UI) complete: a bundled Tauri Manager with native application/plugin selection,
+  a packaged Core sidecar, a redacted control plane, and read-only Core-owned three-stream logs
+  (Core / Runtime / Plugin) delivered through a durable JSONL ledger. Plugin `config{}` settings UI
+  and live log push remain deferred; see docs/BACKLOG.md.
 - Toolchain: rustc/cargo 1.97.1 ✓, bun 1.4.0 ✓, Tauri CLI ✓ (via bun). Node not required — bun is
   the JS toolchain.
 
@@ -85,8 +90,9 @@ Objective: `.thx` loads; CSS + JS renderer plugins work; CSS hot reload. Accepta
 
 - **`crates/package`**: `.thx` (ZIP) — validate manifest → check permissions → extract → register
   (install flow, no code execution during install).
-- **`crates/runtime`** (renderer side): `ctx.css.insert/remove`, `ctx.dom.query/observe`,
-  `ctx.script.execute`, each gated by `renderer.css` / `renderer.dom` / `renderer.script`.
+- **`crates/runtime`** (renderer side): `ctx.css.insert/remove`, `ctx.dom.query/observe`, and the
+  narrow `ctx.script.setDocumentTitle` host API, each gated by `renderer.css` / `renderer.dom` /
+  `renderer.script`; arbitrary page-world JavaScript execution is forbidden.
 - **CSS hot reload** (required) + optional JS reload.
 - **Core permission check** before every renderer privileged call.
 - Decide Open Question #3 (plugin dependency isolation) as part of package/loading design.
@@ -106,9 +112,11 @@ Objective: BrowserWindow APIs + permissions. Acceptance: ChatGPT glass window.
 Objective: usable manager. Acceptance per SPEC §11/§16.
 
 - Applications (supported level), Plugins (install/enable/disable/remove), Permissions view
-  (requested vs not-requested, accept/reject/details), Logs (three streams).
-- Config schema UI auto-generated from `manifest.json` `config{}`.
-- Manager stays within its lane: UI + display only; it never injects or touches target processes.
+  (requested vs granted, unavailable-at-level), Logs (three streams, read-only paginated).
+- Manager stays within its lane: UI + display only; it never injects or touches target processes;
+  it never exposes a generic RPC/credential to the frontend.
+- Deferred: `manifest.json` `config{}` settings UI (schema-driven), real-time log push, and
+  structured log export.
 
 ## Phase 5 — OSS prep (M5)
 
@@ -136,10 +144,7 @@ highest-risk choke point and must run early.
 
 1. **LGPL-3.0** on `electron-hook` — acceptable dependency posture? (Isolate it inside the
    Injector layer regardless.)
-2. **Renderer world** for M2: isolated world (preload) vs main world (`contextIsolation:false`
-   or `webFrame.executeJavaScript`) — decide at the M1 PoC.
-3. **Main-runtime JS sandbox** (VM vs QuickJS vs V8) — decide at M3.
-4. **Node LTS** install for Electron tooling — needed in Phase 0.
+2. **Node LTS** install for Electron tooling — needed in Phase 0.
 
 ## Risks
 
