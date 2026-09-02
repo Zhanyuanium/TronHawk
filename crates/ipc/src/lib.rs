@@ -123,6 +123,12 @@ fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
         }
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > MAX_FRAME_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
             buf.extend_from_slice(&available[..pos]);
             reader.consume(pos + 1);
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
@@ -173,5 +179,13 @@ mod tests {
         assert_eq!(v["id"], 3);
         assert_eq!(v["error"]["code"], -32601);
         assert_eq!(v["error"]["message"], "not found");
+    }
+
+    #[test]
+    fn newline_terminated_oversized_frame_is_rejected() {
+        let mut input = vec![b'x'; MAX_FRAME_SIZE + 1];
+        input.push(b'\n');
+        let error = read_frame(&mut std::io::Cursor::new(input)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }
