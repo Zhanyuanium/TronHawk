@@ -1,18 +1,12 @@
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: &str = "0.1";
 const DEFAULT_IPC_PORT: u16 = 17_777;
-const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -20,35 +14,7 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct CoreClient {
     root: PathBuf,
     port: u16,
-    next_id: AtomicU64,
     startup: Mutex<()>,
-}
-
-#[derive(Serialize)]
-struct Request<'a> {
-    version: &'static str,
-    id: u64,
-    method: &'a str,
-    params: Value,
-    secret: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Response {
-    version: String,
-    id: u64,
-    #[serde(default)]
-    result: Option<Value>,
-    #[serde(default)]
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RpcError {
-    code: i32,
-    message: String,
 }
 
 impl CoreClient {
@@ -60,7 +26,6 @@ impl CoreClient {
         Self {
             root,
             port,
-            next_id: AtomicU64::new(1),
             startup: Mutex::new(()),
         }
     }
@@ -71,55 +36,17 @@ impl CoreClient {
         self.call_with_token(method, params, &token)
     }
 
-    fn call_with_token(
-        &self,
-        method: &str,
-        params: Value,
-        token: &str,
-    ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let request = Request {
-            version: PROTOCOL_VERSION,
-            id,
-            method,
-            params,
-            secret: token,
-        };
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port);
-        let mut stream = TcpStream::connect_timeout(&address.into(), CONNECT_TIMEOUT)
-            .map_err(|_| "Core is unavailable".to_owned())?;
-        stream
-            .set_read_timeout(Some(RPC_TIMEOUT))
-            .and_then(|_| stream.set_write_timeout(Some(RPC_TIMEOUT)))
-            .map_err(|_| "failed to configure the Core connection".to_owned())?;
-
-        serde_json::to_writer(&mut stream, &request)
-            .map_err(|_| "failed to encode the Core request".to_owned())?;
-        stream
-            .write_all(b"\n")
-            .and_then(|_| stream.flush())
-            .map_err(|_| "failed to send the Core request".to_owned())?;
-
-        let mut encoded = String::new();
-        let bytes = BufReader::new(stream)
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_line(&mut encoded)
-            .map_err(|_| "failed to read the Core response".to_owned())?;
-        if bytes == 0 {
-            return Err("Core closed the connection without a response".into());
-        }
-        if bytes as u64 > MAX_RESPONSE_BYTES {
-            return Err("Core response exceeded the size limit".into());
-        }
-        if !encoded.ends_with('\n') {
-            return Err("Core returned an unterminated response frame".into());
-        }
-
-        parse_response(&encoded, id)
+    /// One authenticated control RPC over the shared `tronhawk-ipc` client. The client first
+    /// makes the peer prove it holds the control token (`verify_server`) and only then sends the
+    /// token, so the credential never reaches a port-squatter.
+    fn call_with_token(&self, method: &str, params: Value, token: &str) -> Result<Value, String> {
+        tronhawk_ipc::call_control(self.port, token, method, params, RPC_TIMEOUT)
     }
 
     fn ensure_core_available(&self) -> Result<(), String> {
-        if can_connect(self.port) {
+        // Reachability is not "Core is available": only a peer that proves it holds the control
+        // token counts. If a daemon already passes identity verification, reuse it.
+        if self.verified_core().is_some() {
             return Ok(());
         }
 
@@ -127,7 +54,7 @@ impl CoreClient {
             .startup
             .lock()
             .map_err(|_| "Core startup state is unavailable".to_owned())?;
-        if can_connect(self.port) {
+        if self.verified_core().is_some() {
             return Ok(());
         }
 
@@ -145,12 +72,20 @@ impl CoreClient {
 
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < deadline {
-            if can_connect(self.port) {
+            if self.verified_core().is_some() {
                 return Ok(());
             }
             thread::sleep(STARTUP_POLL_INTERVAL);
         }
-        Err("Core did not become available in time".into())
+        Err("Core did not pass server identity verification in time".into())
+    }
+
+    /// Returns the control token only when a peer on `self.port` proves it holds that token;
+    /// otherwise `None` (missing token file, unreachable, or an impostor that fails the probe).
+    fn verified_core(&self) -> Option<String> {
+        let token = self.read_control_token().ok()?;
+        tronhawk_ipc::verify_server(self.port, &token, PROBE_TIMEOUT).ok()?;
+        Some(token)
     }
 
     fn read_control_token(&self) -> Result<String, String> {
@@ -162,30 +97,6 @@ impl CoreClient {
         }
         Ok(token.to_owned())
     }
-}
-
-fn parse_response(encoded: &str, expected_id: u64) -> Result<Value, String> {
-    let response: Response = serde_json::from_str(encoded.trim_end())
-        .map_err(|_| "Core returned a malformed response".to_owned())?;
-    if response.version != PROTOCOL_VERSION {
-        return Err("Core returned an unsupported protocol version".into());
-    }
-    if response.id != expected_id {
-        return Err("Core response id did not match the request".into());
-    }
-    match (response.result, response.error) {
-        (Some(result), None) => Ok(result),
-        (None, Some(error)) => Err(format!(
-            "Core rejected the request ({}): {}",
-            error.code, error.message
-        )),
-        _ => Err("Core returned an invalid response envelope".into()),
-    }
-}
-
-fn can_connect(port: u16) -> bool {
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-    TcpStream::connect_timeout(&address.into(), CONNECT_TIMEOUT).is_ok()
 }
 
 fn storage_root() -> PathBuf {
@@ -232,66 +143,180 @@ fn approved_file(path: PathBuf) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    const CONTROL_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn free_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    fn read_request_frame(stream: &TcpStream) -> Value {
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .expect("expected a request frame");
+        serde_json::from_str(line.trim_end()).unwrap()
+    }
+
+    fn write_frame(stream: &mut TcpStream, frame: &Value) {
+        stream
+            .write_all(serde_json::to_string(frame).unwrap().as_bytes())
+            .and_then(|_| stream.write_all(b"\n"))
+            .unwrap();
+    }
+
+    fn proof_response(request: &Value) -> Value {
+        let challenge = request["params"]["challenge"].as_str().unwrap();
+        serde_json::json!({
+            "version": tronhawk_ipc::PROTOCOL_VERSION,
+            "id": request["id"],
+            "result": { "proof": tronhawk_ipc::compute_server_proof(CONTROL_TOKEN, challenge) }
+        })
+    }
+
+    fn ok_response(request: &Value) -> Value {
+        serde_json::json!({
+            "version": tronhawk_ipc::PROTOCOL_VERSION,
+            "id": request["id"],
+            "result": { "ok": true }
+        })
+    }
+
+    /// Answer the identity probe on the first accepted connection, then hand control to
+    /// `control_handler` for the second (control) connection.
+    fn serve_core(port: u16, control_handler: impl FnOnce(TcpStream, Value) + Send + 'static) {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        thread::spawn(move || {
+            // Connection 1: the unauthenticated identity probe.
+            let (stream, _) = listener.accept().unwrap();
+            let request = read_request_frame(&stream);
+            assert_eq!(request["method"], "getServerProof");
+            assert_eq!(request["secret"], "");
+            let mut stream = stream;
+            write_frame(&mut stream, &proof_response(&request));
+
+            // Connection 2: the authenticated control call.
+            let (stream, _) = listener.accept().unwrap();
+            let request = read_request_frame(&stream);
+            assert_eq!(request["version"], tronhawk_ipc::PROTOCOL_VERSION);
+            assert_eq!(request["method"], "getManagerSnapshot");
+            assert_eq!(request["secret"], CONTROL_TOKEN);
+            control_handler(stream, request);
+        });
+    }
 
     #[test]
-    fn sends_one_newline_delimited_request_and_accepts_matching_response() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            assert!(line.ends_with('\n'));
-            let request: Value = serde_json::from_str(line.trim_end()).unwrap();
-            assert_eq!(request["version"], PROTOCOL_VERSION);
-            assert_eq!(request["method"], "getManagerSnapshot");
-            assert_eq!(request["secret"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-            (&stream)
-                .write_all(b"{\"version\":\"0.1\",\"id\":1,\"result\":{\"ok\":true}}\n")
-                .unwrap();
+    fn sends_probe_then_control_and_accepts_matching_response() {
+        let port = free_port();
+        serve_core(port, |mut stream, request| {
+            write_frame(&mut stream, &ok_response(&request));
         });
 
         let client = CoreClient::new(PathBuf::new(), port);
         let result = client
-            .call_with_token(
-                "getManagerSnapshot",
-                serde_json::json!({}),
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
+            .call_with_token("getManagerSnapshot", serde_json::json!({}), CONTROL_TOKEN)
             .unwrap();
         assert_eq!(result, serde_json::json!({ "ok": true }));
+    }
+
+    #[test]
+    fn rejects_an_impostor_and_never_sends_the_control_secret() {
+        let port = free_port();
+        let server = thread::spawn(move || {
+            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let request = read_request_frame(&stream);
+            // The impostor only ever sees the identity probe, never a control frame.
+            assert_eq!(request["method"], "getServerProof");
+            assert_eq!(request["secret"], "");
+            let mut stream = stream;
+            write_frame(
+                &mut stream,
+                &serde_json::json!({
+                    "version": tronhawk_ipc::PROTOCOL_VERSION,
+                    "id": request["id"],
+                    "result": { "proof": "0".repeat(64) }
+                }),
+            );
+            // A control frame carrying the token must never arrive on this connection.
+            let mut second = String::new();
+            match BufReader::new(stream.try_clone().unwrap()).read_line(&mut second) {
+                Ok(0) => {}
+                Ok(_) => panic!("impostor received a control frame containing the token: {second}"),
+                Err(error) => {
+                    let kind = error.kind();
+                    assert!(
+                        kind == std::io::ErrorKind::WouldBlock
+                            || kind == std::io::ErrorKind::TimedOut,
+                        "unexpected read error: {error}"
+                    );
+                }
+            }
+        });
+
+        let client = CoreClient::new(PathBuf::new(), port);
+        let error = client
+            .call_with_token("getManagerSnapshot", serde_json::json!({}), CONTROL_TOKEN)
+            .unwrap_err();
+        assert!(
+            error.contains("identity verification failed"),
+            "error: {error}"
+        );
         server.join().unwrap();
     }
 
     #[test]
-    fn rejects_unterminated_and_mismatched_response_frames() {
-        assert!(parse_response(
-            "{\"version\":\"0.1\",\"id\":9,\"result\":null}",
-            1
-        )
-        .unwrap_err()
-        .contains("id did not match"));
+    fn rejects_a_control_response_with_a_mismatched_id() {
+        let port = free_port();
+        serve_core(port, |mut stream, request| {
+            write_frame(
+                &mut stream,
+                &serde_json::json!({
+                    "version": tronhawk_ipc::PROTOCOL_VERSION,
+                    "id": request["id"].as_u64().unwrap() + 1,
+                    "result": { "ok": true }
+                }),
+            );
+        });
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
+        let client = CoreClient::new(PathBuf::new(), port);
+        let error = client
+            .call_with_token("getManagerSnapshot", serde_json::json!({}), CONTROL_TOKEN)
+            .unwrap_err();
+        assert!(error.contains("id did not match"), "error: {error}");
+    }
+
+    #[test]
+    fn rejects_an_unterminated_control_response_frame() {
+        let port = free_port();
+        thread::spawn(move || {
+            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            // Connection 1: identity probe.
+            let (stream, _) = listener.accept().unwrap();
+            let request = read_request_frame(&stream);
+            let mut stream = stream;
+            write_frame(&mut stream, &proof_response(&request));
+            // Connection 2: control, answered with an unterminated frame.
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut request)
-                .unwrap();
+            let request = read_request_frame(&stream);
+            assert_eq!(request["secret"], CONTROL_TOKEN);
             stream
-                .write_all(b"{\"version\":\"0.1\",\"id\":1,\"result\":null}")
+                .write_all(br#"{"version":"0.1","id":1,"result":{"ok":true}}"#)
                 .unwrap();
         });
+
         let client = CoreClient::new(PathBuf::new(), port);
-        assert!(client
-            .call_with_token("getManagerSnapshot", serde_json::json!({}), "secret")
-            .unwrap_err()
-            .contains("unterminated"));
-        server.join().unwrap();
+        let error = client
+            .call_with_token("getManagerSnapshot", serde_json::json!({}), CONTROL_TOKEN)
+            .unwrap_err();
+        assert!(error.contains("unterminated"), "error: {error}");
     }
 }
