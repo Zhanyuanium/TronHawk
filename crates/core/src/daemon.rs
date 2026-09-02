@@ -1,19 +1,35 @@
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::log_store::{LogLevel, LogQuery, LogStore, LogStream, NewLogRecord};
-use crate::{hash_json, plugin_grant, transaction_dir, transaction_file, ExecutionPlan, Plugin};
+use crate::{
+    hash_bytes, hash_json, plugin_grant, transaction_dir, transaction_file, ExecutionPlan, Plugin,
+};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Idle window (and the value advertised as `expiresAfterIdleSeconds`). Single source of truth:
+/// the signed token's freshness and the wire contract both derive from SESSION_IDLE_TIMEOUT.
+const SESSION_IDLE_TIMEOUT_SECS: u64 = 600;
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
+/// Absolute lifetime of a launch token; a token older than this can no longer even renew.
+const TOKEN_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+/// Clock-skew tolerance for launch-token `issued_at` (accept at most 5s in the future).
+const TOKEN_FUTURE_TOLERANCE_SECS: u64 = 5;
 const IMPLEMENTED_RENDERER_CAPABILITIES: &[&str] = &["renderer.css", "renderer.script"];
 const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] =
     &["renderer.css", "renderer.script", "electron.window"];
+const APPLICATION_ID_PREFIX: &str = "winexe-v1:";
+/// Rolling rate-limit window and budget shared by every launch token of an application.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+const RATE_MAX_EVENTS: usize = 120;
+/// A log-rate entry idle for this long has its budget reset on the next event.
+const RATE_IDLE_RESET: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -66,18 +82,37 @@ impl Default for DaemonState {
     }
 }
 
-#[derive(Debug)]
-struct LaunchSession {
+/// Claims recovered from a verified, self-contained launch token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchClaims {
     application_id: String,
-    last_used: Instant,
-    allowed_plan_plugins: HashSet<String>,
+    issued_at: u64,
+}
+
+/// Per-application runtime log-ingest budget, shared across every launch token of that
+/// application. Idle entries have their budget reset lazily on the next event (see
+/// [`RATE_IDLE_RESET`]); restart resets all budgets, which is a DoS-only regression (accepted).
+#[derive(Debug)]
+struct LogRate {
+    last_activity: Instant,
     log_events: VecDeque<Instant>,
+}
+
+/// Content-fingerprinted snapshot of the installed plugins. Served from memory while the
+/// installed-plugin directory fingerprint is unchanged. When `stale` is set the cached plugins
+/// are a last-good fallback because the most recent rescan failed.
+#[derive(Debug, Clone)]
+struct PluginCache {
+    fingerprint: String,
+    plugins: Vec<Plugin>,
+    stale: bool,
 }
 
 #[derive(Debug)]
 struct ServiceInner {
     state: DaemonState,
-    sessions: HashMap<String, LaunchSession>,
+    plugin_cache: Option<PluginCache>,
+    log_rates: HashMap<String, LogRate>,
 }
 
 /// Single-writer Core state and request router.
@@ -87,6 +122,10 @@ pub struct CoreService {
     state_path: PathBuf,
     control_token_path: PathBuf,
     control_token: String,
+    /// Persistent HMAC key for self-contained launch tokens. Never derived from the control
+    /// token. Deleting `launch.key` is a manual rotation: all previously minted launch tokens
+    /// stop verifying, so every running target must relaunch to acquire a fresh one.
+    launch_key: String,
     inner: Mutex<ServiceInner>,
     logs: Mutex<LogStore>,
 }
@@ -98,6 +137,7 @@ impl CoreService {
         let config_root = root.join("config");
         let state_path = config_root.join("state.json");
         let control_token_path = config_root.join("control.token");
+        let launch_key_path = config_root.join("launch.key");
         std::fs::create_dir_all(&installed_root)
             .map_err(|e| format!("create installed root: {e}"))?;
         // A crash mid-install/remove can leave hidden transaction dirs behind; sweep them
@@ -109,7 +149,8 @@ impl CoreService {
         if state_needs_write {
             write_state(&state_path, &state)?;
         }
-        let control_token = read_or_create_control_token(&control_token_path)?;
+        let control_token = read_or_create_secret(&control_token_path, "control token")?;
+        let launch_key = read_or_create_secret(&launch_key_path, "launch key")?;
         let logs = LogStore::new(&root)?;
 
         Ok(Self {
@@ -118,10 +159,12 @@ impl CoreService {
             state_path,
             control_token_path,
             control_token,
+            launch_key,
             logs: Mutex::new(logs),
             inner: Mutex::new(ServiceInner {
                 state,
-                sessions: HashMap::new(),
+                plugin_cache: None,
+                log_rates: HashMap::new(),
             }),
         })
     }
@@ -147,39 +190,51 @@ impl CoreService {
             return self.server_proof(request);
         }
 
+        // Control-token requests are authorized by possession of the persistent control token.
+        if constant_time_eq(request.secret.as_bytes(), self.control_token.as_bytes()) {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return rpc_error(request.id, -32603, "internal error"),
+            };
+            return self.handle_control(request, &mut inner);
+        }
+
+        // Launch tokens are self-contained and stateless (DUR-1): verify signature + claims here,
+        // with no in-memory session table to lose across restarts.
+        let now_secs = match now_unix_seconds() {
+            Ok(now) => now,
+            Err(_) => return rpc_error(request.id, -32603, "internal error"),
+        };
+        let Some(claims) = verify_launch_token(now_secs, &self.launch_key, &request.secret) else {
+            return rpc_error(request.id, -32001, "unauthorized");
+        };
+
+        if request.method == "renewSession" {
+            if !is_empty_params(&request.params) {
+                return rpc_error(request.id, -32602, "invalid params");
+            }
+            if now_secs.saturating_sub(claims.issued_at) >= TOKEN_MAX_AGE_SECS {
+                return rpc_error(request.id, -32001, "unauthorized");
+            }
+            // Renewal is a stateless re-sign; no per-renew core log event is emitted.
+            return self.mint_session_response(request.id, &claims.application_id);
+        }
+        if now_secs.saturating_sub(claims.issued_at) >= SESSION_IDLE_TIMEOUT_SECS {
+            return rpc_error(request.id, -32001, "unauthorized");
+        }
+
+        let application_id = claims.application_id;
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return rpc_error(request.id, -32603, "internal error"),
         };
-        inner
-            .sessions
-            .retain(|_, session| session.last_used.elapsed() < SESSION_IDLE_TIMEOUT);
-
-        if constant_time_eq(request.secret.as_bytes(), self.control_token.as_bytes()) {
-            return self.handle_control(request, &mut inner);
-        }
-
-        let Some(session) = inner.sessions.get(&request.secret) else {
-            return rpc_error(request.id, -32001, "unauthorized");
-        };
-        let application_id = session.application_id.clone();
         match request.method.as_str() {
             "getExecutionPlan" => {
                 if !is_empty_params(&request.params) {
                     return rpc_error(request.id, -32602, "invalid params");
                 }
-                match self.execution_plan(&inner.state, &application_id) {
-                    Ok(plan) => {
-                        if let Some(session) = inner.sessions.get_mut(&request.secret) {
-                            session.allowed_plan_plugins = plan
-                                .plugins
-                                .iter()
-                                .map(|plugin| plugin.id.clone())
-                                .collect();
-                            session.last_used = Instant::now();
-                        }
-                        rpc_ok(request.id, plan)
-                    }
+                match self.execution_plan(&mut inner, &application_id) {
+                    Ok(plan) => rpc_ok(request.id, plan),
                     Err(_) => rpc_error(request.id, -32603, "internal error"),
                 }
             }
@@ -187,6 +242,31 @@ impl CoreService {
             "appendPluginLogs" => self.append_plugin_logs(request, &mut inner, &application_id),
             _ => rpc_error(request.id, -32003, "forbidden"),
         }
+    }
+
+    /// Mint a fresh self-contained launch token for `application_id` and respond with the
+    /// canonical `createLaunchSession`/`renewSession` shape.
+    fn mint_session_response(
+        &self,
+        request_id: u64,
+        application_id: &str,
+    ) -> tronhawk_ipc::Response {
+        match self.session_json(application_id) {
+            Ok(value) => rpc_ok(request_id, value),
+            Err(_) => rpc_error(request_id, -32603, "internal error"),
+        }
+    }
+
+    /// Canonical launch-session JSON: a fresh HMAC-signed launch token for `application_id`.
+    fn session_json(&self, application_id: &str) -> RouterResult {
+        let now_secs = now_unix_seconds()
+            .map_err(|_| RouterError::Internal("system clock is before Unix epoch".into()))?;
+        let token = mint_launch_token(now_secs, &self.launch_key, application_id)?;
+        Ok(serde_json::json!({
+            "token": token,
+            "applicationId": application_id,
+            "expiresAfterIdleSeconds": SESSION_IDLE_TIMEOUT.as_secs(),
+        }))
     }
 
     /// Answer the SEC-1 server-identity probe. Requires a 64-lowercase-hex `challenge` and
@@ -218,7 +298,7 @@ impl CoreService {
             "registerApplication" => self.register_application(inner, request.params),
             "getManagerSnapshot" => {
                 if is_empty_params(&request.params) {
-                    self.manager_snapshot(&inner.state)
+                    self.manager_snapshot(inner)
                 } else {
                     Err(RouterError::InvalidParams("expected empty params".into()))
                 }
@@ -226,12 +306,14 @@ impl CoreService {
             "installPlugin" => self.install_plugin(inner, request.params),
             "setApplicationPluginPolicy" => self.set_policy(inner, request.params),
             "removePlugin" => self.remove_plugin(inner, request.params),
-            "createLaunchSession" => self.create_launch_session(inner, request.params),
+            "createLaunchSession" => self.create_launch_session(request.params),
             "queryLogs" => self.query_logs(request.params),
             "appendRuntimeLogs" | "appendPluginLogs" => {
                 return rpc_error(request.id, -32003, "forbidden")
             }
-            "getExecutionPlan" => return rpc_error(request.id, -32003, "forbidden"),
+            "getExecutionPlan" | "renewSession" => {
+                return rpc_error(request.id, -32003, "forbidden")
+            }
             _ => return rpc_error(request.id, -32601, "method not found"),
         };
         match result {
@@ -304,7 +386,7 @@ impl CoreService {
         ) {
             return rpc_error(request.id, -32602, "invalid params");
         }
-        if !session_rate_available(inner.sessions.get_mut(&request.secret), params.events.len()) {
+        if !log_rate_available(inner, application_id, params.events.len()) {
             return rpc_error(request.id, -32004, "log rate limit exceeded");
         }
         let mut logs = match self.logs.lock() {
@@ -326,7 +408,7 @@ impl CoreService {
                 return rpc_error(request.id, -32603, "internal error");
             }
         }
-        commit_session_log_ingest(inner.sessions.get_mut(&request.secret), params.events.len());
+        commit_log_ingest(inner, application_id, params.events.len());
         rpc_ok(
             request.id,
             serde_json::json!({ "accepted": params.events.len() }),
@@ -364,21 +446,29 @@ impl CoreService {
         ) {
             return rpc_error(request.id, -32602, "invalid params");
         }
-        let Some(session) = inner.sessions.get_mut(&request.secret) else {
-            return rpc_error(request.id, -32001, "unauthorized");
+        // Each event's plugin must be granted in the CURRENT plan for this application
+        // (derived from the cached plugins + in-memory policy each request), so a policy
+        // revoke takes effect immediately — there is no stored allowed-set to go stale.
+        let allowed: HashSet<String> = match self.execution_plan(inner, application_id) {
+            Ok(plan) => plan
+                .plugins
+                .iter()
+                .map(|plugin| plugin.id.clone())
+                .collect(),
+            Err(_) => return rpc_error(request.id, -32603, "internal error"),
         };
         if params
             .events
             .iter()
-            .any(|event| !session.allowed_plan_plugins.contains(&event.plugin_id))
+            .any(|event| !allowed.contains(&event.plugin_id))
         {
             return rpc_error(
                 request.id,
                 -32003,
-                "plugin was not in the last execution plan",
+                "plugin was not in the current execution plan",
             );
         }
-        if !session_rate_available(Some(session), params.events.len()) {
+        if !log_rate_available(inner, application_id, params.events.len()) {
             return rpc_error(request.id, -32004, "log rate limit exceeded");
         }
         let mut logs = match self.logs.lock() {
@@ -400,7 +490,7 @@ impl CoreService {
                 return rpc_error(request.id, -32603, "internal error");
             }
         }
-        commit_session_log_ingest(inner.sessions.get_mut(&request.secret), params.events.len());
+        commit_log_ingest(inner, application_id, params.events.len());
         rpc_ok(
             request.id,
             serde_json::json!({ "accepted": params.events.len() }),
@@ -463,11 +553,7 @@ impl CoreService {
         }))
     }
 
-    fn create_launch_session(
-        &self,
-        inner: &mut ServiceInner,
-        params: serde_json::Value,
-    ) -> RouterResult {
+    fn create_launch_session(&self, params: serde_json::Value) -> RouterResult {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Params {
@@ -476,27 +562,13 @@ impl CoreService {
         let params: Params = parse_params(params)?;
         let canonical = canonical_executable(&params.executable_path)?;
         let application_id = application_id_for_canonical_path(&canonical.path);
-        let token = random_token()?;
-        inner.sessions.insert(
-            token.clone(),
-            LaunchSession {
-                application_id: application_id.clone(),
-                last_used: Instant::now(),
-                allowed_plan_plugins: HashSet::new(),
-                log_events: VecDeque::new(),
-            },
-        );
         self.append_core_event(
             &application_id,
             None,
             "core.launch_session.created",
             "Launch session created",
         );
-        Ok(serde_json::json!({
-            "token": token,
-            "applicationId": application_id,
-            "expiresAfterIdleSeconds": SESSION_IDLE_TIMEOUT.as_secs(),
-        }))
+        self.session_json(&application_id)
     }
 
     fn set_policy(&self, inner: &mut ServiceInner, params: serde_json::Value) -> RouterResult {
@@ -513,6 +585,7 @@ impl CoreService {
             .state
             .applications
             .get(&params.application_id)
+            .cloned()
             .ok_or_else(|| RouterError::InvalidParams("application not found".into()))?;
         if params.enabled && application.support_level == 0 {
             return Err(RouterError::InvalidParams(
@@ -520,7 +593,7 @@ impl CoreService {
             ));
         }
         let plugin = self
-            .installed_plugins()?
+            .installed_plugins(inner)?
             .into_iter()
             .find(|plugin| plugin.id == params.plugin_id)
             .ok_or_else(|| RouterError::InvalidParams("plugin not found".into()))?;
@@ -651,6 +724,9 @@ impl CoreService {
         if backup.exists() {
             remove_directory(&backup, "remove prior plugin backup")?;
         }
+        // The installed directory changed; drop the cached plugin snapshot so the next read
+        // rescans and repopulates it.
+        inner.plugin_cache = None;
         Ok(())
     }
 
@@ -662,7 +738,7 @@ impl CoreService {
         }
         let params: Params = parse_params(params)?;
         let plugin = self
-            .installed_plugins()?
+            .installed_plugins(inner)?
             .into_iter()
             .find(|plugin| plugin.id == params.plugin_id)
             .ok_or_else(|| RouterError::InvalidParams("plugin not found".into()))?;
@@ -670,6 +746,9 @@ impl CoreService {
         let trash = transaction_dir(&self.installed_root, "remove", &plugin.id);
         std::fs::rename(&final_dir, &trash)
             .map_err(|e| RouterError::Internal(format!("stage plugin removal: {e}")))?;
+        // The installed directory changed; drop the cached plugin snapshot immediately so a
+        // concurrently served plan cannot keep advertising a plugin that is being removed.
+        inner.plugin_cache = None;
         let mut next = inner.state.clone();
         for application in next.applications.values_mut() {
             application.plugins.remove(&plugin.id);
@@ -708,20 +787,84 @@ impl CoreService {
         }
     }
 
-    fn installed_plugins(&self) -> Result<Vec<Plugin>, RouterError> {
+    /// Cached read of the installed plugins (CORE-3). Returns the cached snapshot while the
+    /// installed-root fingerprint is unchanged; rescans and repopulates on change. If a rescan
+    /// fails after a fingerprint change (a plugin directory was damaged or removed out-of-band),
+    /// a single recovery event is logged and the last good cache is served so plan/snapshot stay
+    /// available (availability-first, like CORE-2); policy ∩ permissions ∩ support-level
+    /// filtering is still applied to whatever payload is produced.
+    fn installed_plugins(&self, inner: &mut ServiceInner) -> Result<Vec<Plugin>, RouterError> {
+        let fingerprint = fingerprint(&self.installed_root).ok();
+        if let (Some(current), Some(cache)) = (&fingerprint, &inner.plugin_cache) {
+            if cache.fingerprint == *current && !cache.stale {
+                return Ok(cache.plugins.clone());
+            }
+        }
+
+        // Fingerprint changed (or no cache yet): rescan, repairing the cache on success.
+        let rescanned = match &fingerprint {
+            Some(_) => self.scan_installed_plugins(),
+            // The installed root itself is unreadable; there is nothing to scan.
+            None => Err("installed plugin root is unreadable".into()),
+        };
+        match rescanned {
+            Ok(plugins) => {
+                inner.plugin_cache = Some(PluginCache {
+                    fingerprint: fingerprint.unwrap_or_default(),
+                    plugins: plugins.clone(),
+                    stale: false,
+                });
+                Ok(plugins)
+            }
+            Err(error) => match inner
+                .plugin_cache
+                .as_ref()
+                .map(|cache| cache.plugins.clone())
+            {
+                Some(plugins) => {
+                    let already_falling_back = inner
+                        .plugin_cache
+                        .as_ref()
+                        .map(|cache| cache.stale)
+                        .unwrap_or(true);
+                    if let Some(cache) = inner.plugin_cache.as_mut() {
+                        cache.stale = true;
+                    }
+                    if !already_falling_back {
+                        self.append_core_event(
+                            "global",
+                            None,
+                            "core.plugin.scan_failed",
+                            "Installed-plugin scan failed; serving the last cached plugin set",
+                        );
+                    }
+                    let _ = error;
+                    Ok(plugins)
+                }
+                None => Err(RouterError::Internal(format!(
+                    "scan installed plugins: {error}"
+                ))),
+            },
+        }
+    }
+
+    fn scan_installed_plugins(&self) -> Result<Vec<Plugin>, String> {
         let mut plugins = Vec::new();
         for entry in std::fs::read_dir(&self.installed_root)
-            .map_err(|e| RouterError::Internal(format!("scan installed plugins: {e}")))?
+            .map_err(|e| format!("scan installed plugins: {e}"))?
         {
-            let entry = entry.map_err(|e| RouterError::Internal(e.to_string()))?;
+            let entry = entry.map_err(|e| format!("scan install entry: {e}"))?;
             let name = entry.file_name();
             if name.to_string_lossy().starts_with('.') || !entry.path().is_dir() {
                 continue;
             }
-            let plugin = crate::load_plugin_dir(&entry.path()).map_err(RouterError::Internal)?;
+            let plugin = crate::load_plugin_dir(&entry.path())
+                .map_err(|e| format!("invalid installed plugin {}: {e}", entry.path().display()))?;
             if name.to_string_lossy() != plugin.id {
-                return Err(RouterError::Internal(
-                    "installed plugin directory does not match its id".into(),
+                return Err(format!(
+                    "installed directory `{}` does not match plugin id `{}`",
+                    name.to_string_lossy(),
+                    plugin.id
                 ));
             }
             plugins.push(plugin);
@@ -730,33 +873,34 @@ impl CoreService {
         Ok(plugins)
     }
 
-    fn manager_snapshot(&self, state: &DaemonState) -> RouterResult {
-        let plugins = self
-            .installed_plugins()?
+    fn manager_snapshot(&self, inner: &mut ServiceInner) -> RouterResult {
+        let plugins = self.installed_plugins(inner)?;
+        let plugins = plugins
             .iter()
             .map(plugin_metadata_value)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(serde_json::json!({
-            "global": { "developerMode": state.global.developer_mode },
-            "applications": state.applications,
+            "global": { "developerMode": inner.state.global.developer_mode },
+            "applications": inner.state.applications,
             "plugins": plugins,
         }))
     }
 
     fn execution_plan(
         &self,
-        state: &DaemonState,
+        inner: &mut ServiceInner,
         application_id: &str,
     ) -> Result<ExecutionPlan, RouterError> {
-        let Some(application) = state.applications.get(application_id) else {
+        let Some(application) = inner.state.applications.get(application_id) else {
             return Ok(empty_plan());
         };
+        let application = application.clone();
         if application.support_level == 0 {
             return Ok(empty_plan());
         }
         let supported = capabilities_for_support_level(application.support_level);
         let mut grants = Vec::new();
-        for mut plugin in self.installed_plugins()? {
+        for mut plugin in self.installed_plugins(inner)? {
             let Some(policy) = application.plugins.get(&plugin.id) else {
                 continue;
             };
@@ -827,26 +971,34 @@ fn valid_log_batch(messages: &[&str]) -> bool {
             .all(|message| message.as_bytes().len() <= 1024)
 }
 
-fn session_rate_available(session: Option<&mut LaunchSession>, count: usize) -> bool {
-    let Some(session) = session else { return false };
-    let cutoff = Instant::now() - Duration::from_secs(60);
-    while session
-        .log_events
-        .front()
-        .is_some_and(|time| *time <= cutoff)
-    {
-        session.log_events.pop_front();
+/// Rolling per-application log budget check. `application_id` keys the budget so every launch
+/// token of the same application shares one limit. Budgets reset lazily after
+/// [`RATE_IDLE_RESET`] of inactivity; restart resets all budgets (DoS-only, accepted).
+fn log_rate_available(inner: &mut ServiceInner, application_id: &str, count: usize) -> bool {
+    let now = Instant::now();
+    let rate = inner
+        .log_rates
+        .entry(application_id.to_owned())
+        .or_insert_with(|| LogRate {
+            last_activity: now,
+            log_events: VecDeque::new(),
+        });
+    if rate.last_activity.elapsed() > RATE_IDLE_RESET {
+        rate.last_activity = now;
+        rate.log_events.clear();
     }
-    session.log_events.len() + count <= 120
+    let cutoff = now - RATE_WINDOW;
+    while rate.log_events.front().is_some_and(|time| *time <= cutoff) {
+        rate.log_events.pop_front();
+    }
+    rate.log_events.len() + count <= RATE_MAX_EVENTS
 }
 
-fn commit_session_log_ingest(session: Option<&mut LaunchSession>, count: usize) {
-    if let Some(session) = session {
+fn commit_log_ingest(inner: &mut ServiceInner, application_id: &str, count: usize) {
+    if let Some(rate) = inner.log_rates.get_mut(application_id) {
         let now = Instant::now();
-        session
-            .log_events
-            .extend(std::iter::repeat(now).take(count));
-        session.last_used = now;
+        rate.last_activity = now;
+        rate.log_events.extend(std::iter::repeat(now).take(count));
     }
 }
 
@@ -998,8 +1150,12 @@ fn random_token() -> Result<String, RouterError> {
     Ok(hex(&bytes))
 }
 
-fn read_or_create_control_token(path: &Path) -> Result<String, String> {
-    let token = random_token().map_err(|error| match error {
+/// Read a persistent 64-hex secret (control token or launch key) or create it atomically with
+/// `create_new` and owner-only permissions. `label` only shapes error messages. On Unix the
+/// existing-file read rejects group/other permissions and uses `O_NOFOLLOW | O_CLOEXEC`; on
+/// Windows it opens the reparse point itself and rejects non-regular/reparse targets.
+fn read_or_create_secret(path: &Path, label: &str) -> Result<String, String> {
+    let secret = random_token().map_err(|error| match error {
         RouterError::Internal(message) | RouterError::InvalidParams(message) => message,
     })?;
     let mut options = std::fs::OpenOptions::new();
@@ -1012,20 +1168,19 @@ fn read_or_create_control_token(path: &Path) -> Result<String, String> {
     match options.open(path) {
         Ok(mut file) => {
             use std::io::Write;
-            file.write_all(token.as_bytes())
-                .map_err(|e| format!("write control token: {e}"))?;
-            file.sync_all()
-                .map_err(|e| format!("sync control token: {e}"))?;
-            Ok(token)
+            file.write_all(secret.as_bytes())
+                .map_err(|e| format!("write {label}: {e}"))?;
+            file.sync_all().map_err(|e| format!("sync {label}: {e}"))?;
+            Ok(secret)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_existing_control_token(path)
+            read_existing_secret(path, label)
         }
-        Err(error) => Err(format!("create control token: {error}")),
+        Err(error) => Err(format!("create {label}: {error}")),
     }
 }
 
-fn read_existing_control_token(path: &Path) -> Result<String, String> {
+fn read_existing_secret(path: &Path, label: &str) -> Result<String, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1041,18 +1196,18 @@ fn read_existing_control_token(path: &Path) -> Result<String, String> {
     }
     let mut file = options
         .open(path)
-        .map_err(|e| format!("open control token safely: {e}"))?;
+        .map_err(|e| format!("open {label} safely: {e}"))?;
     let metadata = file
         .metadata()
-        .map_err(|e| format!("inspect control token: {e}"))?;
+        .map_err(|e| format!("inspect {label}: {e}"))?;
     if !metadata.file_type().is_file() {
-        return Err("control token must be a regular file".into());
+        return Err(format!("{label} must be a regular file"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.mode() & 0o077 != 0 {
-            return Err("control token permissions must be owner-only".into());
+            return Err(format!("{label} permissions must be owner-only"));
         }
     }
     #[cfg(windows)]
@@ -1060,18 +1215,18 @@ fn read_existing_control_token(path: &Path) -> Result<String, String> {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err("control token must not be a reparse point".into());
+            return Err(format!("{label} must not be a reparse point"));
         }
     }
     use std::io::Read;
-    let mut token = String::new();
-    file.read_to_string(&mut token)
-        .map_err(|e| format!("read control token: {e}"))?;
-    let token = token.trim().to_string();
-    if token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(token)
+    let mut secret = String::new();
+    file.read_to_string(&mut secret)
+        .map_err(|e| format!("read {label}: {e}"))?;
+    let secret = secret.trim().to_string();
+    if secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(secret)
     } else {
-        Err("invalid control token".into())
+        Err(format!("invalid {label}"))
     }
 }
 
@@ -1237,6 +1392,161 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+fn now_unix_seconds() -> Result<u64, ()> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ())
+}
+
+fn is_application_id(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix(APPLICATION_ID_PREFIX) else {
+        return false;
+    };
+    digest.len() == 64 && is_lowercase_hex(digest)
+}
+
+/// Launch-token payload: `v1.<application_id>.<issued_at_secs>.<nonce>`.
+fn launch_token_payload(application_id: &str, issued_at: u64, nonce: &str) -> String {
+    format!("{}.{}.{}.{}", "v1", application_id, issued_at, nonce)
+}
+
+fn launch_token_mac(launch_key: &str, payload: &str) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(launch_key.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(payload.as_bytes());
+    hex(&mac.finalize().into_bytes())
+}
+
+/// Sign a launch token for `application_id` issued at `now` (unix seconds) with `nonce`
+/// (16 lowercase hex). Pure: given identical inputs it always produces the same token.
+fn sign_launch_token(launch_key: &str, application_id: &str, now_secs: u64, nonce: &str) -> String {
+    let payload = launch_token_payload(application_id, now_secs, nonce);
+    format!("{payload}.{}", launch_token_mac(launch_key, &payload))
+}
+
+/// Mint a fresh launch token for `application_id` issued at `now` with a fresh 8-byte nonce.
+fn mint_launch_token(
+    now_secs: u64,
+    launch_key: &str,
+    application_id: &str,
+) -> Result<String, RouterError> {
+    let mut nonce = [0_u8; 8];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|e| RouterError::Internal(format!("secure token nonce: {e}")))?;
+    Ok(sign_launch_token(
+        launch_key,
+        application_id,
+        now_secs,
+        &hex(&nonce),
+    ))
+}
+
+/// Verify a self-contained launch token at `now_secs` (unix seconds). Returns the claims only
+/// when the signature is valid, the structure matches, and `issued_at` is not more than 5s in
+/// the future (clock-skew tolerance). Age-based authorization is applied by the caller.
+fn verify_launch_token(now_secs: u64, launch_key: &str, token: &str) -> Option<LaunchClaims> {
+    let (payload, mac) = token.rsplit_once('.')?;
+    if !is_lowercase_hex(mac) || mac.len() != 64 {
+        return None;
+    }
+    let expected = launch_token_mac(launch_key, payload);
+    if !constant_time_eq(mac.as_bytes(), expected.as_bytes()) {
+        return None;
+    }
+    let mut segments = payload.split('.');
+    let version = segments.next()?;
+    let application_id = segments.next()?;
+    let issued_at = segments.next()?.parse::<u64>().ok()?;
+    let nonce = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    if version != "v1" || !is_application_id(application_id) {
+        return None;
+    }
+    if nonce.len() != 16 || !is_lowercase_hex(nonce) {
+        return None;
+    }
+    if issued_at > now_secs.saturating_add(TOKEN_FUTURE_TOLERANCE_SECS) {
+        return None;
+    }
+    Some(LaunchClaims {
+        application_id: application_id.to_owned(),
+        issued_at,
+    })
+}
+
+/// Recursive content fingerprint of a plugin tree: sorted `(relpath, kind, size, mtime_ns)`
+/// lines hashed via the crate's stable hash. Detects additions, deletions, and content/mtime
+/// changes. Symlinks are recorded as leaf entries but never traversed, so a directory symlink
+/// cannot cause infinite recursion.
+fn fingerprint(root: &Path) -> Result<String, String> {
+    let mut entries = Vec::new();
+    collect_fingerprint(root, "", &mut entries)?;
+    entries.sort();
+    Ok(hash_bytes(entries.join("\n").as_bytes()))
+}
+
+fn collect_fingerprint(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read plugin dir: {e}"))? {
+        let entry = entry.map_err(|e| format!("plugin dir entry: {e}"))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel_path = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("plugin entry type: {e}"))?;
+        if file_type.is_dir() {
+            collect_fingerprint(&path, &rel_path, out)?;
+            let mtime_ns = file_mtime_ns(&entry)?;
+            out.push(format!("{rel_path}/\t0\t{mtime_ns}"));
+        } else if file_type.is_file() {
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("plugin file metadata: {e}"))?;
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            out.push(format!("{rel_path}\t{}\t{}", meta.len(), mtime_ns));
+        } else {
+            // Symlinks and other special files count as opaque leaves (size of the link target
+            // metadata, which DirEntry::metadata reports without following).
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("plugin entry metadata: {e}"))?;
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            out.push(format!("{rel_path}*\t{}\t{mtime_ns}", meta.len()));
+        }
+    }
+    Ok(())
+}
+
+fn file_mtime_ns(entry: &std::fs::DirEntry) -> Result<u128, String> {
+    let meta = entry
+        .metadata()
+        .map_err(|e| format!("plugin dir metadata: {e}"))?;
+    Ok(meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0))
 }
 
 pub fn serve_service(port: u16, service: std::sync::Arc<CoreService>) -> std::io::Result<()> {
@@ -1485,20 +1795,13 @@ mod tests {
     }
 
     #[test]
-    fn plugin_logs_require_the_most_recent_successful_plan() {
+    fn plugin_logs_must_target_plugins_in_the_current_plan() {
         let temp = TempRoot::new("plugin-log-plan");
         let app = temp.executable("Plan.exe");
         let package = temp.package("log-plugin", "com.example.daemon", "1.0.0");
         let (service, control) = service(&temp);
         let application_id = register(&service, &control, &app, 2);
         install_package(&service, &control, &package);
-        ok(set_policy(
-            &service,
-            &control,
-            &application_id,
-            true,
-            &["renderer.css"],
-        ));
         let token = launch_token(&service, &control, &app);
         let params = serde_json::json!({
             "events": [{
@@ -1507,15 +1810,54 @@ mod tests {
                 "message": "plugin event"
             }]
         });
+        let params_for_unknown = serde_json::json!({
+            "events": [{
+                "pluginId": "com.example.not-granted",
+                "level": "error",
+                "message": "plugin event"
+            }]
+        });
+
+        // A plugin that is not in the CURRENT plan (default-deny until enabled) is rejected,
+        // with no need to call getExecutionPlan first.
         assert_eq!(
             error_code(call(&service, &token, "appendPluginLogs", params.clone())),
             -32003
         );
-        plan(&service, &token);
+
+        // Enable with a grant: now the same plugin_id is in the current plan and accepted.
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
         assert_eq!(
-            ok(call(&service, &token, "appendPluginLogs", params))["accepted"],
+            ok(call(&service, &token, "appendPluginLogs", params.clone()))["accepted"],
             1
         );
+
+        // A plugin_id outside the current plan is rejected even while the app has the daemon
+        // plugin enabled.
+        assert_eq!(
+            error_code(call(
+                &service,
+                &token,
+                "appendPluginLogs",
+                params_for_unknown.clone()
+            )),
+            -32003
+        );
+
+        // Disabling the policy revokes the grant immediately: the very next append is rejected
+        // without any further getExecutionPlan round-trip.
+        ok(set_policy(&service, &control, &application_id, false, &[]));
+        assert_eq!(
+            error_code(call(&service, &token, "appendPluginLogs", params.clone())),
+            -32003
+        );
+
         let logs = query_logs(&service, &control);
         let plugin = logs["events"]
             .as_array()
@@ -1802,7 +2144,13 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
-        assert_eq!(service.installed_plugins().unwrap()[0].version, "1.0.0");
+        {
+            let mut inner = service.inner.lock().unwrap();
+            assert_eq!(
+                service.installed_plugins(&mut inner).unwrap()[0].version,
+                "1.0.0"
+            );
+        }
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(temp.0.join("config/state.json")).unwrap())
                 .unwrap();
@@ -1996,38 +2344,219 @@ mod tests {
     }
 
     #[test]
-    fn expired_launch_session_is_rejected() {
-        let temp = TempRoot::new("session-expiry");
+    fn launch_token_pure_roundtrip_and_tamper_rejection() {
+        let key = "ab".repeat(32);
+        let app_id = format!("winexe-v1:{}", "c".repeat(64));
+        let now = 1_700_000_000_u64;
+
+        // Valid round-trip.
+        let token = sign_launch_token(&key, &app_id, now, "deadbeefdeadbeef");
+        let claims = verify_launch_token(now, &key, &token).expect("valid token verifies");
+        assert_eq!(claims.application_id, app_id);
+        assert_eq!(claims.issued_at, now);
+        // `issued_at` exactly `now` and within +5s tolerance is accepted.
+        assert!(verify_launch_token(now, &key, &token).is_some());
+
+        // Tampered application_id segment -> reject.
+        let other_app = format!("winexe-v1:{}", "d".repeat(64));
+        let tampered_payload = launch_token_payload(&other_app, now, "deadbeefdeadbeef");
+        let tampered_app = format!("{tampered_payload}.{}", token.rsplit_once('.').unwrap().1);
+        assert!(verify_launch_token(now, &key, &tampered_app).is_none());
+
+        // Tampered mac -> reject.
+        let mut tampered_mac = token.clone();
+        let last = tampered_mac.pop().unwrap();
+        let replacement = if last == '0' { '1' } else { '0' };
+        tampered_mac.push(replacement);
+        assert!(verify_launch_token(now, &key, &tampered_mac).is_none());
+
+        // Wrong key -> reject (covers deleting/rotating launch.key).
+        assert!(verify_launch_token(now, &"ff".repeat(32), &token).is_none());
+
+        // issued_at more than 5s in the future -> reject.
+        let future = sign_launch_token(&key, &app_id, now + 10, "deadbeefdeadbeef");
+        assert!(verify_launch_token(now, &key, &future).is_none());
+
+        // Malformed structure -> reject.
+        assert!(verify_launch_token(now, &key, "not-a-token").is_none());
+        assert!(verify_launch_token(now, &key, "v1.app.123.abc.deadbeef").is_none());
+
+        // Nonce uniqueness: two mints at the same instant differ but both verify.
+        let first = mint_launch_token(now, &key, &app_id).unwrap();
+        let second = mint_launch_token(now, &key, &app_id).unwrap();
+        assert_ne!(first, second);
+        assert!(verify_launch_token(now, &key, &first).is_some());
+        assert!(verify_launch_token(now, &key, &second).is_some());
+    }
+
+    fn read_launch_key(temp: &TempRoot) -> String {
+        std::fs::read_to_string(temp.0.join("config/launch.key"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn launch_token_signed_at(launch_key: &str, application_id: &str, issued_at: u64) -> String {
+        sign_launch_token(launch_key, application_id, issued_at, "deadbeefdeadbeef")
+    }
+
+    #[test]
+    fn launch_token_freshness_windows_and_renewal() {
+        let temp = TempRoot::new("token-windows");
         let executable = temp.executable("App.exe");
         let (service, control) = service(&temp);
-        register(&service, &control, &executable, 2);
+        let application_id = register(&service, &control, &executable, 2);
+        let launch_key = read_launch_key(&temp);
+        let now = now_unix_seconds().unwrap();
+
+        // Fresh minted token is accepted and is self-contained (not a 64-hex random id).
         let launch = ok(call(
             &service,
             &control,
             "createLaunchSession",
             serde_json::json!({ "executablePath": executable }),
         ));
-        let token = launch["token"].as_str().unwrap();
-        assert_eq!(token.len(), 64);
+        let fresh = launch["token"].as_str().unwrap().to_string();
         assert_eq!(launch["expiresAfterIdleSeconds"], 600);
+        assert_eq!(launch["applicationId"], application_id);
+        assert_ne!(fresh.len(), 64);
+        assert!(verify_launch_token(now, &launch_key, &fresh).is_some());
+        assert!(plan(&service, &fresh)["plugins"].is_array());
 
-        service
-            .inner
-            .lock()
-            .unwrap()
-            .sessions
-            .get_mut(token)
-            .unwrap()
-            .last_used = Instant::now() - SESSION_IDLE_TIMEOUT - Duration::from_secs(1);
+        // issued_at = now - 601s: normal methods are rejected...
+        let idle_expired = launch_token_signed_at(&launch_key, &application_id, now - 601);
         assert_eq!(
             error_code(call(
                 &service,
-                token,
+                &idle_expired,
                 "getExecutionPlan",
                 serde_json::json!({}),
             )),
             -32001
         );
+        // ...but renewSession still works and the fresh token is usable...
+        let renewed = ok(call(
+            &service,
+            &idle_expired,
+            "renewSession",
+            serde_json::json!({}),
+        ));
+        let renewed_token = renewed["token"].as_str().unwrap().to_string();
+        assert_eq!(renewed["applicationId"], application_id);
+        assert_eq!(renewed["expiresAfterIdleSeconds"], 600);
+        assert_ne!(renewed_token, idle_expired);
+        assert!(plan(&service, &renewed_token)["plugins"].is_array());
+
+        // renewSession with non-empty params is rejected.
+        assert_eq!(
+            error_code(call(
+                &service,
+                &idle_expired,
+                "renewSession",
+                serde_json::json!({ "unexpected": true }),
+            )),
+            -32602
+        );
+
+        // issued_at = now - 25h: renewSession is also rejected (absolute 24h cap).
+        let ancient = launch_token_signed_at(&launch_key, &application_id, now - 25 * 3600);
+        assert_eq!(
+            error_code(call(
+                &service,
+                &ancient,
+                "renewSession",
+                serde_json::json!({}),
+            )),
+            -32001
+        );
+        assert_eq!(
+            error_code(call(
+                &service,
+                &ancient,
+                "getExecutionPlan",
+                serde_json::json!({}),
+            )),
+            -32001
+        );
+        drop(service);
+    }
+
+    #[test]
+    fn launch_token_survives_service_restart() {
+        let temp = TempRoot::new("restart-token");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        assert_eq!(
+            plan(&service, &token)["plugins"].as_array().unwrap().len(),
+            1
+        );
+        drop(service);
+
+        // A restarted daemon over the same root still accepts the SAME token (DUR-1 regression:
+        // sessions used to be in-memory and died with the process).
+        let rebuilt = CoreService::new(&temp.0).unwrap();
+        assert_eq!(
+            plan(&rebuilt, &token)["plugins"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn launch_key_is_persistent_distinct_from_control_and_rotation_invalidates_tokens() {
+        let temp = TempRoot::new("launch-key-rotate");
+        let executable = temp.executable("App.exe");
+        let (service, control) = service(&temp);
+        register(&service, &control, &executable, 2);
+        let launch_key = read_launch_key(&temp);
+        assert_eq!(launch_key.len(), 64);
+        assert!(is_lowercase_hex(&launch_key));
+        assert_ne!(
+            launch_key, control,
+            "launch key must never equal the control token"
+        );
+        let token = launch_token(&service, &control, &executable);
+        drop(service);
+
+        // Deleting/rotating launch.key invalidates existing tokens.
+        let replacement = format!("{:016x}", 0x0123_4567_89ab_cdef_u64).repeat(4);
+        std::fs::write(temp.0.join("config/launch.key"), replacement).unwrap();
+        let rotated = CoreService::new(&temp.0).unwrap();
+        assert_eq!(
+            error_code(call(
+                &rotated,
+                &token,
+                "getExecutionPlan",
+                serde_json::json!({}),
+            )),
+            -32001,
+            "a token minted under the old key must stop verifying after rotation"
+        );
+        let relaunch = ok(call(
+            &rotated,
+            &control,
+            "createLaunchSession",
+            serde_json::json!({ "executablePath": executable }),
+        ));
+        assert!(plan(&rotated, relaunch["token"].as_str().unwrap())["plugins"].is_array());
+    }
+
+    #[test]
+    fn launch_key_rejects_non_regular_file() {
+        let temp = TempRoot::new("launch-key-nonregular");
+        let launch_key_path = temp.0.join("config/launch.key");
+        std::fs::create_dir_all(&launch_key_path).unwrap();
+        assert!(CoreService::new(&temp.0).is_err());
     }
 
     #[test]
@@ -2220,6 +2749,143 @@ mod tests {
         if symlink_dir(&target, temp.0.join("config")).is_ok() {
             assert!(CoreService::new(&temp.0).is_err());
         }
+    }
+
+    #[test]
+    fn plugin_cache_picks_up_source_edits_and_stays_stable_while_unchanged() {
+        let temp = TempRoot::new("cache-edit");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.script"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        let installed_dir = temp
+            .0
+            .join("plugins")
+            .join("installed")
+            .join("com.example.daemon");
+
+        let first = plan(&service, &token);
+        let revision = first["revision"].as_str().unwrap().to_string();
+        assert_eq!(first["plugins"][0]["renderer"], "renderer source");
+
+        // Unchanged polls stay stable (fingerprint cache hit).
+        assert_eq!(plan(&service, &token)["revision"], revision);
+        assert_eq!(plan(&service, &token)["revision"], revision);
+
+        // Editing the plugin source (size change) must change the next plan within 2 polls.
+        std::fs::write(
+            installed_dir.join("renderer.js"),
+            "renderer source v2 — longer",
+        )
+        .unwrap();
+        let after_edit = plan(&service, &token);
+        let after_edit_revision = after_edit["revision"].as_str().unwrap().to_string();
+        assert_ne!(
+            after_edit_revision, revision,
+            "source edit must change the plan revision"
+        );
+        assert_eq!(
+            after_edit["plugins"][0]["renderer"],
+            "renderer source v2 — longer"
+        );
+        assert_eq!(plan(&service, &token)["revision"], after_edit_revision);
+        drop(service);
+    }
+
+    #[test]
+    fn plugin_scan_failure_falls_back_to_last_good_cache() {
+        let temp = TempRoot::new("cache-stale");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        let installed_dir = temp
+            .0
+            .join("plugins")
+            .join("installed")
+            .join("com.example.daemon");
+
+        // Warm the cache.
+        let warmed = plan(&service, &token);
+        assert_eq!(warmed["plugins"][0]["id"], "com.example.daemon");
+
+        // Damage the plugin directory out-of-band so a rescan fails (manifest removed) while the
+        // directory still exists. The daemon must keep serving the last good plan instead of
+        // erroring (availability-first).
+        std::fs::remove_file(installed_dir.join("manifest.json")).unwrap();
+        let stale = plan(&service, &token);
+        assert_eq!(
+            stale["plugins"][0]["id"], "com.example.daemon",
+            "stale cache fallback must still return the last plan"
+        );
+        // A manager snapshot must also remain available.
+        let snapshot = ok(call(
+            &service,
+            &control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert_eq!(snapshot["plugins"][0]["id"], "com.example.daemon");
+        drop(service);
+    }
+
+    #[test]
+    fn install_and_remove_are_immediately_reflected_in_plans() {
+        let temp = TempRoot::new("cache-install-remove");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        let token = launch_token(&service, &control, &executable);
+        assert!(plan(&service, &token)["plugins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // InstallPlugin must be visible to the very next plan poll.
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+        assert_eq!(
+            plan(&service, &token)["plugins"].as_array().unwrap().len(),
+            1
+        );
+
+        // removePlugin must be gone from the very next plan poll.
+        ok(call(
+            &service,
+            &control,
+            "removePlugin",
+            serde_json::json!({ "pluginId": "com.example.daemon" }),
+        ));
+        assert!(plan(&service, &token)["plugins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        drop(service);
     }
 
     #[test]

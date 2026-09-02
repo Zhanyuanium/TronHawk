@@ -401,6 +401,7 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
                 "core.application.registered"
                     | "core.plugin.installed"
                     | "core.plugin.removed"
+                    | "core.plugin.scan_failed"
                     | "core.policy.updated"
                     | "core.launch_session.created"
             )
