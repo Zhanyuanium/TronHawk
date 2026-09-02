@@ -1,5 +1,8 @@
 {
   "name": "tronhawk",
   "private": true,
-  "workspaces": ["sdk", "plugins/*"]
+  "scripts": {
+    "create-tronhawk-plugin": "bun tools/create-tronhawk-plugin/src/cli.ts"
+  },
+  "workspaces": ["sdk", "plugins/*", "tools/*"]
 }

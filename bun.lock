@@ -15,19 +15,64 @@
         "typescript": "^5",
       },
     },
+    "plugins/ui-tweaks": {
+      "name": "tronhawk-plugin-ui-tweaks",
+      "version": "0.1.0",
+      "dependencies": {
+        "@tronhawk/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "^5",
+      },
+    },
+    "plugins/window-effects": {
+      "name": "tronhawk-plugin-window-effects",
+      "version": "0.1.0",
+      "dependencies": {
+        "@tronhawk/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "^5",
+      },
+    },
     "sdk": {
       "name": "@tronhawk/sdk",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "devDependencies": {
+        "typescript": "^5",
+      },
+    },
+    "tools/create-tronhawk-plugin": {
+      "name": "@tronhawk/cli-create-plugin",
+      "version": "0.1.0",
+      "bin": {
+        "create-tronhawk-plugin": "./src/cli.ts",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.4.0",
         "typescript": "^5",
       },
     },
   },
   "packages": {
+    "@tronhawk/cli-create-plugin": ["@tronhawk/cli-create-plugin@workspace:tools/create-tronhawk-plugin"],
+
     "@tronhawk/sdk": ["@tronhawk/sdk@workspace:sdk"],
+
+    "@types/bun": ["@types/bun@1.4.0", "https://registry.npmmirror.com/@types/bun/-/bun-1.4.0.tgz", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
+
+    "@types/node": ["@types/node@26.4.1", "https://registry.npmmirror.com/@types/node/-/node-26.4.1.tgz", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-k97ENvZWtvA6yqz5/FS6a7duDgOPEeOQOc2iKS/nY6mX6qJUKtLnWzQS+Xj6tXweyj6ZcTAK2Qecetnvi9nCLA=="],
+
+    "bun-types": ["bun-types@1.4.0", "https://registry.npmmirror.com/bun-types/-/bun-types-1.4.0.tgz", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
 
     "tronhawk-plugin-hello-world": ["tronhawk-plugin-hello-world@workspace:plugins/hello-world"],
 
+    "tronhawk-plugin-ui-tweaks": ["tronhawk-plugin-ui-tweaks@workspace:plugins/ui-tweaks"],
+
+    "tronhawk-plugin-window-effects": ["tronhawk-plugin-window-effects@workspace:plugins/window-effects"],
+
     "typescript": ["typescript@5.9.3", "https://registry.npmmirror.com/typescript/-/typescript-5.9.3.tgz", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@8.3.0", "https://registry.npmmirror.com/undici-types/-/undici-types-8.3.0.tgz", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
   }
 }

@@ -1,0 +1,24 @@
+{
+  "name": "@tronhawk/cli-create-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Scaffold a new TronHawk plugin project (package.json, manifest.json, src templates).",
+  "bin": {
+    "create-tronhawk-plugin": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "create-tronhawk-plugin": "bun ./src/cli.ts",
+    "build": "bun build ./src/cli.ts --target=bun --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5"
+  }
+}
