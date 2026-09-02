@@ -131,6 +131,39 @@ fn find_real_asar(target_exe: &str) -> Option<PathBuf> {
         .and_then(|candidate| std::fs::canonicalize(candidate).ok())
 }
 
+/// After building a merged asar into electron-hook's cache, make its `<merged>.asar.unpacked`
+/// sibling resolve to the target's real `resources\app.asar.unpacked` via a junction (no admin
+/// needed). Native modules (e.g. `better-sqlite3`) live in that `.unpacked` dir and must be
+/// reachable from the merged asar's unpacked path; otherwise Electron resolves the sibling in the
+/// cache dir (absent) and the native binding fails to load.
+fn link_app_asar_unpacked(real_asar: &Path, merged_asar: &Path) -> Result<(), String> {
+    let Some(real_unpacked) = real_asar
+        .parent()
+        .map(|parent| parent.join("app.asar.unpacked"))
+        .filter(|path| path.is_dir())
+    else {
+        return Ok(()); // no native modules
+    };
+    let merged_unpacked = PathBuf::from(format!("{}.unpacked", merged_asar.display()));
+    if merged_unpacked.exists() {
+        return Ok(()); // already linked
+    }
+    let link = merged_unpacked
+        .to_str()
+        .ok_or_else(|| "cache unpacked path is not valid UTF-8".to_string())?;
+    let target = real_unpacked
+        .to_str()
+        .ok_or_else(|| "real unpacked path is not valid UTF-8".to_string())?;
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", link, target])
+        .status()
+        .map_err(|error| format!("failed to run mklink /J: {error}"))?;
+    if !status.success() {
+        return Err(format!("mklink /J failed for {link} -> {target}"));
+    }
+    Ok(())
+}
+
 fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     let dir = launcher_dir();
     let dll = dir.join(DLL_NAME);
@@ -167,6 +200,9 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
                     report.output_bytes,
                     report.source.display()
                 );
+                if let Err(error) = link_app_asar_unpacked(&report.source, &cache) {
+                    eprintln!("[launcher] failed to link app.asar.unpacked: {error}");
+                }
                 cache
             }
             Err(e) => {
@@ -274,6 +310,9 @@ fn aumid(aumid: &str) -> Result<(), String> {
         report.output_bytes,
         report.source.display()
     );
+    if let Err(error) = link_app_asar_unpacked(&real_asar, &cache) {
+        eprintln!("[probe] failed to link app.asar.unpacked: {error}");
+    }
     let asar_str = cache
         .to_str()
         .ok_or_else(|| format!("asar cache path is not valid UTF-8: {}", cache.display()))?
