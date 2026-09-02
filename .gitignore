@@ -31,3 +31,10 @@ Thumbs.db
 # BEGIN oh-my-opencode-slim clonedeps
 .slim/clonedeps/repos/
 # END oh-my-opencode-slim clonedeps
+
+# Local deepwork progress state
+.slim/deepwork/
+
+# Runtime storage artifacts (control.token is a sensitive credential; never commit)
+/config/control.token
+/config/state.json

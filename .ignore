@@ -7,3 +7,7 @@
 .slim/clonedeps/repos/**/.git/
 .slim/clonedeps/repos/**/.git/**
 # END oh-my-opencode-slim clonedeps
+
+# Keep local deepwork progress readable to OpenCode.
+!.slim/deepwork/
+!.slim/deepwork/**
