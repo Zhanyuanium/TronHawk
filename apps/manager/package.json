@@ -4,9 +4,17 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "dev": "vite src --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "vite build src --outDir ../dist --emptyOutDir",
+    "stage:core": "pwsh -NoProfile -File scripts/stage-core.ps1",
+    "bundle": "bun run stage:core && bunx tauri build",
     "tauri": "tauri"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "vite": "^7.1.7"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
   }
 }
