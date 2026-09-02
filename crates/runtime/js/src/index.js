@@ -12,6 +12,12 @@
 // (docs/adr/0002-renderer-js-sandbox.md).
 const { BrowserWindow } = require("electron");
 
+// Compat adapter (compat profile) loader — see src/adapters.js. Adapters are trusted runtime
+// substrate statically bundled into runtime.js (never loaded from disk, never installable), and
+// their selection/bootstrap runs synchronously inside start(), BEFORE bootstrap.js requires the
+// original target app.
+const adapters = require("./adapters");
+
 const MAX_LOG_MESSAGE_BYTES = 1024;
 let runtimeLogSink = (level, message) => console.log(`[tronhawk-runtime][${level}] ${message}`);
 let pluginLogSink = (pluginId, level, message) =>
@@ -45,6 +51,9 @@ let planGeneration = 0;
 // webContents.id -> { contents, keys: Map(pluginId -> { css, key }), gens: Map(pluginId -> n) }
 const windows = new Map();
 let appRef = null;
+// Adapter selected by the current start(); the did-finish-load handler consults it for the
+// optional `renderer.gate(win, ready)` timing seam (Path A). No gate -> default timing.
+let activeAdapter = null;
 
 function hasPermission(granted, perm) {
   return Array.isArray(granted) && granted.includes(perm);
@@ -854,6 +863,35 @@ function start(app, sinks = {}) {
     log("no plan request transport supplied; plan polling disabled", "warn");
   }
   appRef = app;
+
+  // Adapter (compat profile) selection and onBootstrap. Critical ordering invariant: this runs
+  // synchronously inside start(), so it happens BEFORE bootstrap.js requires the original target
+  // app (bootstrap.js: runtime.start(...) then require(originalAsar)). Phase B adapters hook
+  // protocol.handle here. Fail-open: never crash the target.
+  try {
+    // Adapter-facing logger is level-first; the runtime log() is (message, level).
+    adapters.init({ log: (level, message) => log(message, level) });
+    const appInfo = adapters.buildAppInfo(app);
+    const adapter = adapters.select(appInfo);
+    // Set BEFORE the `if (adapter)` block: the web-contents-created/did-finish-load handlers are
+    // registered below and consult activeAdapter for the optional renderer.gate timing seam.
+    activeAdapter = adapter;
+    if (adapter) {
+      const ctx = {
+        app,
+        appInfo,
+        protocol: require("electron").protocol,
+        log: (level, message) => log(message, level),
+      };
+      adapters.runOnBootstrap(adapter, ctx);
+      log("adapter active: " + adapter.id);
+    } else {
+      log("no compat adapter matched", "warn");
+    }
+  } catch (e) {
+    log("compat adapter bootstrap failed: " + (e && e.message ? e.message : e), "error");
+  }
+
   app.on("web-contents-created", (_e, contents) => {
     if (contents.getType() !== "window") {
       return;
@@ -871,11 +909,33 @@ function start(app, sinks = {}) {
       cleanupRendererPlugins(contents.id);
     });
     contents.on("did-finish-load", () => {
-      w.loaded = true;
-      w.rendererGeneration += 1;
-      cleanupRendererPlugins(contents.id);
-      reconcile(w);
-      reconcileRendererPlugins(w);
+      // Path A renderer-timing seam: the active adapter may opt into `renderer.gate(win, ready)`
+      // to delay injection until the app's OWN UI-ready signal (e.g. Obsidian's `.workspace`).
+      // `win` is this window record; `ready()` runs the existing reconcile. Fail-open: the gate
+      // must call ready() exactly once within a bounded timeout (makeSelectorGate), and a throwing
+      // gate falls back to the default timing below.
+      const onReady = () => {
+        w.loaded = true;
+        w.rendererGeneration += 1;
+        cleanupRendererPlugins(contents.id);
+        reconcile(w);
+        reconcileRendererPlugins(w);
+      };
+      const gate =
+        activeAdapter &&
+        activeAdapter.renderer &&
+        typeof activeAdapter.renderer.gate === "function"
+          ? activeAdapter.renderer.gate
+          : null;
+      if (gate) {
+        try {
+          gate(w, onReady);
+          return;
+        } catch (e) {
+          log("adapter renderer.gate threw; using default timing: " + (e && e.message ? e.message : e), "warn");
+        }
+      }
+      onReady();
     });
   });
 }

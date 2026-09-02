@@ -16,3 +16,12 @@ document.addEventListener("DOMContentLoaded", () => {
     status.textContent = result;
   });
 });
+
+// Late-mounted element so the Phase B timing seam has a deterministic consumer: it appears only
+// after an initial quiet window following DOMContentLoaded.
+setTimeout(() => {
+  const late = document.createElement("div");
+  late.id = "late-root";
+  late.textContent = "late-mount-ok";
+  document.body.appendChild(late);
+}, 1200);
