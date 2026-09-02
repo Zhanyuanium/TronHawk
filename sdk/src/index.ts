@@ -7,8 +7,11 @@ export type WindowHandle = string;
 // --- Base context (cross-cutting services available in every execution context) ---
 
 export interface Logger {
+  /** Submit a string message attributed to this plugin by the host. */
   info(message: string): void;
+  /** Submit a string message attributed to this plugin by the host. */
   warn(message: string): void;
+  /** Submit a string message attributed to this plugin by the host. */
   error(message: string): void;
 }
 
@@ -56,8 +59,8 @@ export interface DomAPI {
 }
 
 export interface ScriptAPI {
-  /** Requires the `renderer.script` permission. */
-  execute(code: string): unknown;
+  /** Set the page document title. Requires the `renderer.script` permission. */
+  setDocumentTitle(title: string): void;
 }
 
 export interface RendererContext extends PluginContext {
@@ -69,7 +72,7 @@ export interface RendererContext extends PluginContext {
 // --- Main context (MVP) ---
 
 export interface WindowAPI {
-  onCreated(cb: (window: WindowHandle) => void): void;
+  onCreated(cb: (window: WindowHandle) => undefined): void;
   setOpacity(window: WindowHandle, opacity: number): void;
   setSize(window: WindowHandle, width: number, height: number): void;
   setPosition(window: WindowHandle, x: number, y: number): void;
@@ -82,7 +85,6 @@ export interface WindowAPI {
 export interface WebContentsAPI {
   openDevTools(window: WindowHandle): void;
   reload(window: WindowHandle): void;
-  executeJavaScript(window: WindowHandle, code: string): Promise<unknown>;
 }
 
 export interface MainContext extends PluginContext {
@@ -93,16 +95,17 @@ export interface MainContext extends PluginContext {
 // --- Plugin module lifecycle ---
 
 export type PluginModule<C extends PluginContext = PluginContext> = {
-  activate(ctx: C): void | Promise<void>;
-  deactivate(ctx: C): void | Promise<void>;
+  activate(ctx: C): undefined;
+  deactivate(ctx: C): undefined;
 };
 
 // --- Utilities ---
 
-/** Dev/testing helper. The runtime injects the real logger via `ctx.logger`. */
+/** Dev/testing helper. The runtime injects a host-attributed logger via `ctx.logger`. */
 export function createLogger(pluginId: string): Logger {
-  const log = (level: string) => (message: string): void =>
-    console.log(`[${pluginId}][${level}] ${message}`);
+  const log = (level: string) => (message: string): void => {
+    if (typeof message === "string") console.log(`[${pluginId}][${level}] ${message}`);
+  };
   return { info: log("info"), warn: log("warn"), error: log("error") };
 }
 
@@ -124,7 +127,7 @@ export function createMockRendererContext(
     config: { get: () => undefined, set: () => {} },
     css: { insert: () => "mock-style", remove: () => {} },
     dom: { query: () => null, observe: () => () => {} },
-    script: { execute: () => undefined },
+    script: { setDocumentTitle: () => {} },
     ...overrides,
   };
 }
@@ -151,7 +154,6 @@ export function createMockMainContext(
     webContents: {
       openDevTools: () => {},
       reload: () => {},
-      executeJavaScript: async () => undefined,
     },
     ...overrides,
   };

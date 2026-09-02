@@ -1,9 +1,7 @@
-// Dark Script — a renderer plugin that runs page JS via the sandboxed bridge.
+// Dark Script — a renderer plugin that uses a narrow, permission-gated page capability.
 module.exports = {
   activate(ctx) {
-    ctx.script.execute(
-      "document.title = 'TRONHAWK-INJECTED'; document.body.style.background = '#123456';",
-    );
+    ctx.script.setDocumentTitle("TRONHAWK-INJECTED");
   },
   deactivate() {},
 };
