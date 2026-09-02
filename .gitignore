@@ -35,6 +35,11 @@ Thumbs.db
 # Local deepwork progress state
 .slim/deepwork/
 
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
+
 # Runtime storage artifacts (control.token is a sensitive credential; never commit)
 /config/control.token
 /config/state.json
