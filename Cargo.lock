@@ -4464,6 +4464,7 @@ dependencies = [
 name = "tronhawk-injector"
 version = "0.1.0"
 dependencies = [
+ "asar",
  "electron-hook",
  "serde",
  "serde_json",

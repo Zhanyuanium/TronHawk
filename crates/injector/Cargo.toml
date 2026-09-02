@@ -15,6 +15,9 @@ path = "src/bin/launcher.rs"
 # upstream ships a submodule + its own [workspace] + under-declares winapi features, which
 # cannot be consumed as a plain crates.io/git dependency.
 electron-hook = { path = "../../vendor/electron-hook" }
+# Same crate/version/features electron-hook already pulls (asar 0.3.0, write => integrity).
+# Used to build the merged modded asar (see src/asar_merge.rs).
+asar = { version = "0.3.0", default-features = false, features = ["write"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tronhawk-ipc = { path = "../ipc" }

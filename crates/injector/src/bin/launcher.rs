@@ -9,7 +9,7 @@
 //! so the four artifacts (`launcher.exe`, `tronhawk_injector.dll`, `bootstrap.js`, `runtime.js`)
 //! are deployed side by side.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use electron_hook::asar::Asar;
 
@@ -78,6 +78,43 @@ fn require_arg<'a>(args: &'a [String], idx: usize, usage: &str) -> &'a str {
     }
 }
 
+/// The minimal-stub asar (only index.js + package.json) — the pre-Path-I behavior, kept behind
+/// the explicit `TRONHAWK_MINIMAL_ASAR` lever and as the fallback when no real app.asar exists
+/// or the merged build fails.
+fn minimal_stub(bootstrap: &Path) -> Result<PathBuf, String> {
+    let entrypoint = bootstrap
+        .to_str()
+        .ok_or_else(|| format!("bootstrap path is not valid UTF-8: {}", bootstrap.display()))?;
+    Asar::new()
+        .with_id("tronhawk")
+        .with_template(tronhawk_injector::asar_merge::ENTRY_TEMPLATE)
+        .with_mod_entrypoint(entrypoint)
+        .create()
+        .map_err(|error| format!("failed to create modded asar: {error:?}"))
+}
+
+/// Find the real `resources/app.asar` for the target executable, used as the source of the
+/// merged asar. Candidates, in order:
+///   - `<exe_dir>/resources/app.asar` (flat layout, e.g. Obsidian)
+///   - `<exe_dir>/app-*/resources/app.asar` (electron-hook `app-<version>` layout)
+/// Returns the first that exists, canonicalized best-effort.
+fn find_real_asar(target_exe: &str) -> Option<PathBuf> {
+    let exe_dir = Path::new(target_exe).parent()?;
+    let mut candidates = vec![exe_dir.join("resources").join("app.asar")];
+    if let Some(app_dir) = std::fs::read_dir(exe_dir).ok()?.find_map(|entry| {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        name.starts_with("app-").then_some(entry.path())
+    }) {
+        candidates.push(app_dir.join("resources").join("app.asar"));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+}
+
 fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     let dir = launcher_dir();
     let dll = dir.join(DLL_NAME);
@@ -94,16 +131,45 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
         return Err(format!("runtime not found: {}", runtime.display()));
     }
 
-    let asar = Asar::new()
-        .with_id("tronhawk")
-        .with_template(
-            r#"require(process.env.MODLOADER_MOD_ENTRYPOINT)(require("path").resolve(__dirname, "../_app.asar"));"#,
-        )
-        .with_mod_entrypoint(bootstrap.to_str().unwrap())
-        .create()
-        .map_err(|error| format!("failed to create modded asar: {error:?}"))?;
+    let bootstrap_abs = bootstrap
+        .to_str()
+        .ok_or_else(|| format!("bootstrap path is not valid UTF-8: {}", bootstrap.display()))?
+        .to_string();
 
-    println!("[launcher] asar: {}", asar.display());
+    // Path I: prefer a merged asar (entire real app.asar + overridden entrypoint) so that
+    // app.getAppPath()/module resolution serve real files. Kept only in electron-hook's cache
+    // dir; the target's own files are never touched.
+    let asar_path = if std::env::var_os("TRONHAWK_MINIMAL_ASAR").is_some() {
+        minimal_stub(&bootstrap)? // explicit A/B lever
+    } else if let Some(real) = find_real_asar(target_exe) {
+        let cache = electron_hook::paths::asar_cache_path("tronhawk");
+        match tronhawk_injector::asar_merge::build_merged_asar(&real, &cache, &bootstrap_abs) {
+            Ok(report) => {
+                println!(
+                    "[launcher] merged asar: {} entries, {} bytes from {}",
+                    report.entries,
+                    report.output_bytes,
+                    report.source.display()
+                );
+                cache
+            }
+            Err(e) => {
+                eprintln!("[launcher] merged asar failed ({e}); falling back to minimal stub");
+                minimal_stub(&bootstrap)?
+            }
+        }
+    } else {
+        minimal_stub(&bootstrap)? // unpacked app (no app.asar): unchanged behavior
+    };
+
+    let dll_str = dll
+        .to_str()
+        .ok_or_else(|| format!("injector dll path is not valid UTF-8: {}", dll.display()))?;
+    let asar_str = asar_path
+        .to_str()
+        .ok_or_else(|| format!("asar path is not valid UTF-8: {}", asar_path.display()))?;
+
+    println!("[launcher] asar: {}", asar_path.display());
     println!("[launcher] dll: {}", dll.display());
     println!("[launcher] bootstrap: {}", bootstrap.display());
     println!("[launcher] runtime: {}", runtime.display());
@@ -117,8 +183,8 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
         || {
             electron_hook::launch(
                 target_exe,
-                dll.to_str().unwrap(),
-                asar.to_str().unwrap(),
+                dll_str,
+                asar_str,
                 target_args.to_vec(),
                 true,
             )

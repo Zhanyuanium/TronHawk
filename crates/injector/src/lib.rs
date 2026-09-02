@@ -7,6 +7,7 @@
 
 pub use electron_hook::*;
 
+pub mod asar_merge;
 pub mod launch_session;
 
 #[cfg(windows)]
