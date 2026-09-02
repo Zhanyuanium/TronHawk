@@ -157,9 +157,9 @@ privileged API verifies permission first.
 | Permission | Allows | Risk |
 |---|---|---|
 | `renderer.css` | inject CSS | low |
-| `renderer.script` | set `document.title` through a host-owned setter | low |
+| `renderer.script` | set `document.title` through a host-owned setter | medium |
 | `renderer.dom` | modify DOM | medium |
-| `electron.window` | modify window (`setOpacity`, `setVibrancy`) | — |
+| `electron.window` | modify window (`setOpacity`, `setVibrancy`) | high |
 | `electron.webContents` | page load, DevTools | — |
 | `electron.session` | UA, proxy, cookies | — |
 | `electron.ipc` | observe / intercept IPC | high |

@@ -3,6 +3,35 @@
 Public API for plugin developers. Plugins must NOT depend on Electron private APIs, Chromium
 internals, or target-app implementation details.
 
+## Implemented vs. future API surface
+
+The types below are the stable public contract, but **not every API is wired into the host
+runtime yet**. A plugin that calls a future API will not get a working call today; do not build
+a plugin on an API that is marked *future*. The authoritative runtime behavior lives in
+`crates/runtime` (`crates/runtime/js/src/index.js`); remaining work is tracked in
+`docs/BACKLOG.md`.
+
+| Where | API | Status |
+|---|---|---|
+| both | `ctx.logger` (info/warn/error) | Implemented — host-attributed, string-only |
+| renderer | `renderer.css`: data-only CSS pipeline (CSS-only plugins via a manifest `css`/`entry.css` file) | Implemented — stylesheets are injected into each window via `webContents.insertCSS` and removed on unload/revocation; CSS-only plugins never execute JS |
+| renderer | `ctx.css.insert` / `ctx.css.remove` | Future — the `CssAPI` host functions are typed in the SDK but not yet exposed to the renderer QuickJS context; CSS-injection today is data-only from the manifest, not a runtime-callable host function |
+| renderer | `ctx.script.setDocumentTitle` (`renderer.script`) | Implemented — host-owned fixed assignment; input is data, never JS source |
+| main | `ctx.window.onCreated` / `setOpacity` / `setSize` / `setPosition` (`electron.window`) | Implemented |
+| renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Future — needs async host functions (the sync QuickJS variant cannot drain pending jobs) |
+| main | `ctx.window.setVibrancy` / `setMica` | Future — true glass not wired; only opacity/size/position exist today |
+| main | `ctx.webContents.*` | Future |
+| both | `ctx.session.*` | Future |
+| both | `ctx.ipc.*` | Future |
+| both | `ctx.network.request` (`network.access`) | Future — typed, but Core permission + domain-whitelist enforcement is not wired yet |
+| both | `ctx.config.get` / `ctx.config.set` | Future — config persistence is not wired to a settings store yet |
+| both | `ctx.raw` (`runtime.unsafe`, developer mode) | Future — nothing enables developer mode today |
+
+**Lifecycle contract (binding):** `activate`, `deactivate`, and window callbacks must complete
+**synchronously** and return JavaScript `undefined`. The runtime rejects any other result,
+including a Promise/thenable. Async (Promise-returning) lifecycle is future — it requires
+QuickJS pending-job draining and a `deactivate(ctx)` call that is not yet invoked.
+
 ## Plugin structure
 
 ```
@@ -39,9 +68,9 @@ NOT the SDK npm version.
 | Permission | API | Risk |
 |---|---|---|
 | `renderer.css` | `ctx.css.insert()` / `ctx.css.remove()` | low |
-| `renderer.script` | `ctx.script.setDocumentTitle()` | low |
+| `renderer.script` | `ctx.script.setDocumentTitle()` | medium |
 | `renderer.dom` | `ctx.dom.query()` / `ctx.dom.observe()` | medium |
-| `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` / `setMica()` | — |
+| `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` / `setMica()` | high |
 | `electron.webContents` | DevTools, navigation, preload | — |
 | `electron.session` | User-Agent, proxy, cookies (future) | — |
 | `electron.ipc` | observe / intercept IPC (future) | high |
