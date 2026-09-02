@@ -50,6 +50,17 @@ module.exports = {
           // ignore
         }
       }
+      // Diagnostic (env-gated, off by default): confirm the native module actually loads. If the
+      // merged asar packed the .unpacked files (lost the unpacked index), require() fails and the
+      // stack shows the virtual app.asar path — the signal for the asar_merge unpacked fix.
+      if (process.env.TRONHAWK_DIAG_NATIVE) {
+        try {
+          require("better-sqlite3");
+          log("info", "chatgpt:diag better-sqlite3 ok");
+        } catch (e) {
+          log("error", "chatgpt:diag better-sqlite3: " + ((e && e.stack) || e));
+        }
+      }
     } catch (e) {
       log("error", "chatgpt:adapter onBootstrap failed: " + (e && e.message ? e.message : e));
     }
