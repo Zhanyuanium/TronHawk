@@ -163,16 +163,44 @@ The launcher now creates a junction `<cache>\tronhawk.asar.unpacked` → the tar
 `resources\app.asar.unpacked` after building the merged asar (no admin). Verified on
 `openai-codex-electron`:
 
-- The previous `better-sqlite3 is only bundled with the Electron app` database error is **gone**.
 - The injected main process stays up (~742 MB) with a full renderer/GPU child tree, a real `ChatGPT`
   window, and the app's own UI logic executing (its `uiM`/`CHATGPT_MATH_BLOCK`/math renderer
   components log to the attached debug console).
 - Bootstrap logs `[tronhawk] injected; electron=152.x` and `[tronhawk] original app loaded`.
 
 So the AUMID-activation + race-attach path, combined with the merged asar (ADR 0004), the realpathSync
-workaround, and the `.asar.unpacked` junction, gets the MSIX ChatGPT app to **start normally while
-injected** — answering the original question: it is feasible and the full GUI is reachable (via the
-compat-adapter `renderer.gate` on the real UI root).
+workaround, and the `.asar.unpacked` junction, gets the MSIX ChatGPT app's main process to **load while
+injected**. (An earlier draft claimed the SQLite error was gone — that was premature; see the
+corrected finding below.)
+
+## Fourth finding (corrected) — the app's module guard rejects better-sqlite3
+
+A diagnostic `require("better-sqlite3")` in the injected main process throws:
+
+```
+Error: Cannot require module better-sqlite3
+    at ...runtime.js:123:23   (the adapter's require, bundled into runtime.js)
+    at Object.start (bootstrap.js:311)
+    at Object.<anonymous> (...\resources\app.asar\index.js:1:46)   (merged asar entry template)
+```
+
+This is **not** a Node `MODULE_NOT_FOUND` ("Cannot find module 'X'") nor a `ERR_DLOPEN_FAILED` — it is a
+**custom require guard in the app / owl Electron fork** that refuses to load `better-sqlite3`. Under
+injection the module resolves through the **cache-path merged asar**, which the guard does not
+recognize as the real bundled native module, so it rejects it. That prevents the SQLite database
+(`.codex\sqlite\codex-dev.db`) from opening, so the app cannot finish launching, the UI never mounts
+`#__next`, and no CSS is injected. Neither the `.asar.unpacked` pass-through guard nor the merged-asar
+unpacked-index fix (ADR 0004) nor the junction addresses this: they are correct at the *path
+reachability* layer, but the app's guard rejects on *path identity*.
+
+**Consequence for the original question:** injection into ChatGPT/Codex is **mechanically feasible**
+(native AUMID + race-attach loads the runtime, adapter selected, original app loads), but the app's
+own module-loading guard blocks its critical native module (`better-sqlite3`), so it cannot fully
+launch under the merged-asar-in-cache shape. Unblocking requires either (a) making the merged asar
+resolve at the *logical* `resources\app.asar` path identity the guard expects (needs writing to the
+read-only `WindowsApps` volume — rejected by the runtime-only invariant + MSIX semantics), (b) patching
+the app's require guard (deep, fragile, closed-source), or (c) a different injection shape. Until then
+the full-GUI + adapter-injection target for ChatGPT remains gated on this app-specific guard.
 
 **Reliability note:** a relaunch done immediately after force-killing a prior run can exit (observed
 once — likely single-instance/`.codex` lock contention on rapid relaunch). The injection pipeline
