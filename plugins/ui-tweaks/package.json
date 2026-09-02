@@ -1,0 +1,15 @@
+{
+  "name": "tronhawk-plugin-ui-tweaks",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "echo \"no build step yet\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tronhawk/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5"
+  }
+}

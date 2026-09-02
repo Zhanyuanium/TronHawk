@@ -1,0 +1,4 @@
+/* UI Tweaks - sample page theme.
+   Injected as data via the manifest entry.css field; never executed. */
+body { color-scheme: light dark; }
+::selection { background: #5b9fd4; }
