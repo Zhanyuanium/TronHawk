@@ -100,7 +100,10 @@ impl CoreService {
         let control_token_path = config_root.join("control.token");
         std::fs::create_dir_all(&installed_root)
             .map_err(|e| format!("create installed root: {e}"))?;
-        std::fs::create_dir_all(&config_root).map_err(|e| format!("create config root: {e}"))?;
+        // A crash mid-install/remove can leave hidden transaction dirs behind; sweep them
+        // best-effort so they never accumulate into permanent debris.
+        sweep_orphaned_transaction_dirs(&installed_root);
+        create_config_directory(&config_root)?;
 
         let (state, state_needs_write) = read_state(&state_path)?;
         if state_needs_write {
@@ -135,6 +138,13 @@ impl CoreService {
     pub fn handle_request(&self, request: tronhawk_ipc::Request) -> tronhawk_ipc::Response {
         if request.version != tronhawk_ipc::PROTOCOL_VERSION {
             return tronhawk_ipc::Response::err(request.id, -32600, "unsupported protocol version");
+        }
+
+        // Server identity probe (SEC-1): an unauthenticated client proves we hold the control
+        // token before it ever sends the token over the wire. Handled before any control/session
+        // authorization so a port-squatter cannot capture the credential.
+        if request.method == "getServerProof" {
+            return self.server_proof(request);
         }
 
         let mut inner = match self.inner.lock() {
@@ -177,6 +187,26 @@ impl CoreService {
             "appendPluginLogs" => self.append_plugin_logs(request, &mut inner, &application_id),
             _ => rpc_error(request.id, -32003, "forbidden"),
         }
+    }
+
+    /// Answer the SEC-1 server-identity probe. Requires a 64-lowercase-hex `challenge` and
+    /// returns `proof = HMAC-SHA256(key = control_token, "tronhawk-server-proof-v1:" +
+    /// challenge)` as lowercase hex. The response never contains the control token itself.
+    fn server_proof(&self, request: tronhawk_ipc::Request) -> tronhawk_ipc::Response {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            challenge: String,
+        }
+        let params: Params = match parse_params(request.params) {
+            Ok(params) => params,
+            Err(_) => return rpc_error(request.id, -32602, "invalid params"),
+        };
+        if params.challenge.len() != 64 || !is_lowercase_hex(&params.challenge) {
+            return rpc_error(request.id, -32602, "invalid params");
+        }
+        let proof = tronhawk_ipc::compute_server_proof(&self.control_token, &params.challenge);
+        rpc_ok(request.id, serde_json::json!({ "proof": proof }))
     }
 
     fn handle_control(
@@ -838,6 +868,66 @@ fn capabilities_for_support_level(level: u8) -> &'static [&'static str] {
     }
 }
 
+/// Create `config_root` and verify it is a real directory that is not a symlink/reparse
+/// point, mirroring the log directory hardening. `create_dir_all` alone follows symlinks, so
+/// a pre-planted symlink at the config path would otherwise redirect state/token writes.
+fn create_config_directory(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("create config root: {e}"))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| format!("inspect config root: {e}"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err("config root must be a real directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("secure config root: {e}"))?;
+        }
+    }
+    #[cfg(windows)]
+    reject_reparse(&metadata, "config root")?;
+    Ok(())
+}
+
+/// Best-effort removal of orphaned transaction/backup/staging directories under the installed
+/// plugins root. A crash mid-install or mid-remove leaves hidden `.staging-*`, `.backup-*`,
+/// `.remove-*`, or `.tronhawk-*` directories behind; removing them keeps a crashed install
+/// from leaving permanent debris. Errors are ignored and non-transaction entries (including
+/// installed plugin directories) are never touched: only directory names that start with the
+/// documented dot-prefixed transaction patterns qualify.
+fn sweep_orphaned_transaction_dirs(root: &Path) {
+    const TRANSACTION_PREFIXES: [&str; 4] = [".staging-", ".backup-", ".remove-", ".tronhawk-"];
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if TRANSACTION_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reject_reparse(metadata: &std::fs::Metadata, name: &str) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("{name} must not be a reparse point"));
+    }
+    Ok(())
+}
+
 fn remove_directory(path: &Path, operation: &str) -> Result<(), RouterError> {
     if !path.exists() {
         return Ok(());
@@ -987,6 +1077,19 @@ fn read_existing_control_token(path: &Path) -> Result<String, String> {
 
 fn read_state(path: &Path) -> Result<(DaemonState, bool), String> {
     if !path.exists() {
+        // A crash under the previous two-rename scheme could leave the last committed state
+        // only in an orphaned `.tronhawk-daemon-state-backup-*` file. Restore it instead of
+        // silently resetting to defaults; `state_needs_write` makes the caller rewrite the
+        // canonical path, which also clears the leftover artifact.
+        if let Some(backup) = newest_state_backup(path) {
+            if let Ok(contents) = std::fs::read(&backup) {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents) {
+                    if let Some(state) = parse_state_value(value).ok() {
+                        return Ok((state, true));
+                    }
+                }
+            }
+        }
         return Ok((DaemonState::default(), true));
     }
     let value: serde_json::Value = serde_json::from_str(
@@ -996,6 +1099,11 @@ fn read_state(path: &Path) -> Result<(DaemonState, bool), String> {
     if value.get("schemaVersion").is_none() || value.get("enabled").is_some() {
         return Ok((DaemonState::default(), true));
     }
+    let state = parse_state_value(value)?;
+    Ok((state, false))
+}
+
+fn parse_state_value(value: serde_json::Value) -> Result<DaemonState, String> {
     let state: DaemonState =
         serde_json::from_value(value).map_err(|e| format!("invalid daemon state: {e}"))?;
     if state.schema_version != STATE_SCHEMA_VERSION {
@@ -1004,7 +1112,46 @@ fn read_state(path: &Path) -> Result<(DaemonState, bool), String> {
             state.schema_version
         ));
     }
-    Ok((state, false))
+    Ok(state)
+}
+
+/// Newest orphaned `.tronhawk-daemon-state-backup-*` file next to `state_path`, if any.
+fn newest_state_backup(state_path: &Path) -> Option<PathBuf> {
+    let parent = state_path.parent()?;
+    const PREFIX: &str = ".tronhawk-daemon-state-backup-";
+    std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(PREFIX) {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+/// Best-effort removal of leftover `.tronhawk-daemon-state-*` transaction artifacts produced by
+/// interrupted writes (including the backups of the pre-atomic scheme). Errors are ignored.
+fn remove_stale_state_artifacts(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".tronhawk-daemon-state-") && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn write_state(path: &Path, state: &DaemonState) -> Result<(), String> {
@@ -1018,20 +1165,15 @@ fn write_state(path: &Path, state: &DaemonState) -> Result<(), String> {
         .map_err(|e| format!("write state: {e}"))?;
     file.sync_all().map_err(|e| format!("sync state: {e}"))?;
     drop(file);
-    let backup = transaction_file(parent, "daemon-state-backup");
-    if path.exists() {
-        std::fs::rename(path, &backup).map_err(|e| format!("backup state: {e}"))?;
-    }
+
+    // Atomic replace-on-write: `std::fs::rename` is a same-volume replace of the destination
+    // (rename(2) on Unix, MoveFileExW with REPLACE_EXISTING on Windows), so there is never a
+    // moment without `state.json`: a crash leaves either the old or the new file in place.
     if let Err(error) = std::fs::rename(&temp, path) {
-        if backup.exists() {
-            let _ = std::fs::rename(&backup, path);
-        }
         let _ = std::fs::remove_file(&temp);
         return Err(format!("commit state: {error}"));
     }
-    if backup.exists() {
-        let _ = std::fs::remove_file(backup);
-    }
+    remove_stale_state_artifacts(parent);
     Ok(())
 }
 
@@ -1079,6 +1221,12 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
             difference | (left ^ right)
         })
         == 0
+}
+
+fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1936,5 +2084,198 @@ mod tests {
         if symlink_file(&target, config.join("control.token")).is_ok() {
             assert!(CoreService::new(&temp.0).is_err());
         }
+    }
+
+    #[test]
+    fn state_write_replaces_atomically_and_clears_legacy_artifacts() {
+        let temp = TempRoot::new("atomic-state");
+        let state_path = temp.0.join("config/state.json");
+        let mut state = DaemonState::default();
+        state.applications.insert(
+            "winexe-v1:test".into(),
+            ApplicationState {
+                executable_path: "c:/apps/Test.exe".into(),
+                display_name: "Test".into(),
+                support_level: 2,
+                plugins: BTreeMap::new(),
+            },
+        );
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+
+        // Simulate debris left by the previous two-rename scheme: an orphaned backup plus an
+        // interrupted temp file, and a state.json that already exists.
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        std::fs::write(
+            temp.0.join("config/.tronhawk-daemon-state-backup-1-1"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(temp.0.join("config/.tronhawk-daemon-state-1-2"), b"{}").unwrap();
+
+        write_state(&state_path, &state).unwrap();
+
+        // The committed state is intact and there is never a moment without `state.json`.
+        assert!(state_path.exists());
+        let persisted: DaemonState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(persisted, state);
+        let leftovers: Vec<String> = std::fs::read_dir(temp.0.join("config"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tronhawk-daemon-state-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "leftover state artifacts: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn orphaned_state_backup_is_restored_when_state_json_is_missing() {
+        let temp = TempRoot::new("orphan-restore");
+        let mut state = DaemonState::default();
+        state.applications.insert(
+            "winexe-v1:orphan".into(),
+            ApplicationState {
+                executable_path: "c:/apps/Orphan.exe".into(),
+                display_name: "Orphan".into(),
+                support_level: 2,
+                plugins: BTreeMap::new(),
+            },
+        );
+        let config = temp.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        // A crash under the old write scheme left only the backup behind, no `state.json`.
+        let backup = config.join(".tronhawk-daemon-state-backup-1-1");
+        std::fs::write(&backup, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        assert!(!config.join("state.json").exists());
+
+        let core = CoreService::new(&temp.0).unwrap();
+        drop(core);
+
+        let persisted: DaemonState =
+            serde_json::from_slice(&std::fs::read(config.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted, state,
+            "state must be restored, not reset to defaults"
+        );
+        assert!(!backup.exists(), "restored backup should be cleaned up");
+    }
+
+    #[test]
+    fn startup_sweeps_orphaned_transaction_dirs_but_keeps_plugins() {
+        let temp = TempRoot::new("sweep");
+        let installed = temp.0.join("plugins").join("installed");
+        std::fs::create_dir_all(&installed).unwrap();
+        for name in [
+            ".staging-crashed",
+            ".backup-com.example.old-1-1",
+            ".remove-com.example.gone-2-2",
+            ".tronhawk-debris",
+        ] {
+            std::fs::create_dir(installed.join(name)).unwrap();
+        }
+        // Real content must never be touched.
+        std::fs::create_dir(installed.join("com.example.real")).unwrap();
+        std::fs::create_dir(installed.join(".cache-ish")).unwrap();
+        std::fs::write(installed.join("notes.txt"), b"keep").unwrap();
+
+        let core = CoreService::new(&temp.0).unwrap();
+        drop(core);
+
+        for name in [
+            ".staging-crashed",
+            ".backup-com.example.old-1-1",
+            ".remove-com.example.gone-2-2",
+            ".tronhawk-debris",
+        ] {
+            assert!(!installed.join(name).exists(), "{name} should be swept");
+        }
+        assert!(installed.join("com.example.real").is_dir());
+        assert!(installed.join(".cache-ish").is_dir());
+        assert!(installed.join("notes.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_root_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempRoot::new("config-symlink");
+        let target = temp.0.join("config-target");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, temp.0.join("config")).unwrap();
+        assert!(CoreService::new(&temp.0).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_root_rejects_directory_symlink_when_supported() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = TempRoot::new("config-symlink");
+        let target = temp.0.join("config-target");
+        std::fs::create_dir_all(&target).unwrap();
+        if symlink_dir(&target, temp.0.join("config")).is_ok() {
+            assert!(CoreService::new(&temp.0).is_err());
+        }
+    }
+
+    #[test]
+    fn get_server_proof_works_without_a_secret_and_leaks_no_token() {
+        let temp = TempRoot::new("server-proof");
+        let (service, control) = service(&temp);
+        let challenge = "cafe".repeat(16);
+
+        // The probe is answered before any secret-based authorization, so an empty secret is
+        // enough to receive the proof.
+        let response = call(
+            &service,
+            "",
+            "getServerProof",
+            serde_json::json!({ "challenge": challenge }),
+        );
+        let result = ok(response);
+        let proof = result["proof"].as_str().unwrap();
+        assert_eq!(proof.len(), 64);
+        assert!(is_lowercase_hex(proof));
+        assert_eq!(
+            proof,
+            tronhawk_ipc::compute_server_proof(&control, &challenge)
+        );
+        assert_ne!(proof, challenge);
+
+        // The serialized proof response must never contain the control token.
+        let serialized = serde_json::to_string(&call(
+            &service,
+            "",
+            "getServerProof",
+            serde_json::json!({ "challenge": challenge }),
+        ))
+        .unwrap();
+        assert!(
+            !serialized.contains(&control),
+            "proof response leaked the control token"
+        );
+        drop(service);
+    }
+
+    #[test]
+    fn get_server_proof_rejects_invalid_challenges() {
+        let temp = TempRoot::new("server-proof-invalid");
+        let (service, _control) = service(&temp);
+        let invalid = [
+            serde_json::json!({ "challenge": "z".repeat(64) }), // non-hex character
+            serde_json::json!({ "challenge": "a".repeat(63) }), // too short
+            serde_json::json!({ "challenge": "a".repeat(65) }), // too long
+            serde_json::json!({ "challenge": "AB".repeat(32) }), // uppercase hex
+            serde_json::json!({ "challenge": "a".repeat(64), "extra": 1 }), // unknown field
+        ];
+        for params in invalid {
+            let response = call(&service, "", "getServerProof", params.clone());
+            assert_eq!(error_code(response), -32602, "params: {params}");
+        }
+        drop(service);
     }
 }

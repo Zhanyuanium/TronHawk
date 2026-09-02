@@ -90,7 +90,10 @@ impl LogStore {
             } else {
                 directory.join(format!("events.jsonl.{index}"))
             };
-            for record in read_records(&path)? {
+            // Best-effort recovery: a corrupt or partially written archive is quarantined,
+            // and a corrupt active file is truncated at its last valid record, so auxiliary
+            // log data can never brick daemon startup.
+            for record in recover_records(&path, index == 0)? {
                 maximum = maximum.max(record.sequence);
             }
         }
@@ -240,6 +243,101 @@ fn read_records(path: &Path) -> Result<Vec<LogRecord>, String> {
         records.push(record);
     }
     Ok(records)
+}
+
+/// Startup-time best-effort scan of one log file. Parses every valid complete record. On the
+/// first anomaly (an unparseable or oversized record, an invalid record, or a partial tail):
+///
+/// * the active file (`is_active`) is repaired by truncating it after the last valid record;
+/// * an archive is quarantined aside (renamed with a `.corrupt` suffix) and skipped whole.
+///
+/// Access/security problems still surface as errors; content problems never do.
+fn recover_records(path: &Path, is_active: bool) -> Result<Vec<LogRecord>, String> {
+    if !entry_exists(path)? {
+        return Ok(Vec::new());
+    }
+    validate_regular_file(path)?;
+    let mut reader = BufReader::new(secure_read(path)?);
+    let mut records = Vec::new();
+    let mut valid_bytes = 0_u64;
+    loop {
+        let mut line = Vec::new();
+        let bytes = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("read log: {e}"))?;
+        if bytes == 0 {
+            break; // clean EOF
+        }
+        let terminated = line.ends_with(b"\n");
+        let content_len = if terminated {
+            line.len() - 1
+        } else {
+            line.len()
+        };
+        let record = if terminated && content_len <= MAX_RECORD_BYTES {
+            serde_json::from_slice::<LogRecord>(&line[..content_len])
+                .ok()
+                .filter(|record| validate_record(record).is_ok())
+        } else {
+            None
+        };
+        match record {
+            Some(record) => {
+                valid_bytes += bytes as u64;
+                records.push(record);
+            }
+            None => {
+                if is_active {
+                    truncate_log(path, valid_bytes)?;
+                } else {
+                    let _ = quarantine_log(path);
+                    records.clear();
+                }
+                break;
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Truncate a log file to `length` bytes (dropping any content from the first corrupt record
+/// onward) with the same reparse/permission hardening used elsewhere.
+fn truncate_log(path: &Path, length: u64) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("open log for recovery: {e}"))?;
+    validate_open_file(&file)?;
+    file.set_len(length)
+        .map_err(|e| format!("truncate corrupt log: {e}"))?;
+    file.sync_data()
+        .map_err(|e| format!("sync recovered log: {e}"))
+}
+
+/// Move a corrupt archive aside to `<name>.corrupt`. Best-effort: failure to quarantine still
+/// only drops the offending records; it never fails startup.
+fn quarantine_log(path: &Path) -> Result<(), String> {
+    let mut quarantine_name = path.as_os_str().to_os_string();
+    quarantine_name.push(".corrupt");
+    let quarantine_path = PathBuf::from(quarantine_name);
+    if quarantine_path.exists() {
+        let _ = std::fs::remove_file(&quarantine_path);
+    }
+    std::fs::rename(path, &quarantine_path).map_err(|e| format!("quarantine corrupt log: {e}"))
 }
 
 fn create_secure_directory(path: &Path) -> Result<(), String> {
@@ -552,6 +650,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second[0].sequence, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn encoded_record(sequence: u64) -> Vec<u8> {
+        let record = LogRecord {
+            schema_version: SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: 1_000_000 + sequence,
+            stream: LogStream::Runtime,
+            level: LogLevel::Info,
+            code: "runtime.message".into(),
+            application_id: "app".into(),
+            plugin_id: None,
+            message: "message".into(),
+        };
+        let mut encoded = serde_json::to_vec(&record).unwrap();
+        encoded.push(b'\n');
+        encoded
+    }
+
+    #[test]
+    fn garbage_archive_does_not_block_startup_and_is_quarantined() {
+        let root = root("garbage-archive");
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        let archive = root.join("logs/events.jsonl.1");
+        let mut garbage = b"this is not json\n".to_vec();
+        garbage.extend(encoded_record(5));
+        garbage.extend(encoded_record(6));
+        std::fs::write(&archive, garbage).unwrap();
+
+        // Startup must succeed despite the unparseable archive.
+        let mut store = LogStore::new(&root).unwrap();
+        assert!(!archive.exists());
+        assert!(root.join("logs/events.jsonl.1.corrupt").exists());
+        // The corrupt archive's records are dropped, but appending continues cleanly.
+        assert_eq!(store.append(event("after")).unwrap().sequence, 1);
+        // A second startup over the same root is equally unaffected.
+        assert!(LogStore::new(&root).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_partial_tail_is_quarantined_but_does_not_block_startup() {
+        let root = root("archive-partial");
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        let archive = root.join("logs/events.jsonl.1");
+        let mut partial = encoded_record(3);
+        partial.extend_from_slice(b"{interrupted tail");
+        std::fs::write(&archive, partial).unwrap();
+
+        let mut store = LogStore::new(&root).unwrap();
+        assert!(!archive.exists());
+        assert!(root.join("logs/events.jsonl.1.corrupt").exists());
+        assert_eq!(store.append(event("after")).unwrap().sequence, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
