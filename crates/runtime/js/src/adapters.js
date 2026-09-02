@@ -17,10 +17,11 @@ const path = require("path");
 
 const exampleAdapter = require("./adapters/example");
 const obsidianAdapter = require("./adapters/obsidian");
+const chatgptAdapter = require("./adapters/chatgpt");
 
 // Registry order matters: the first adapter whose matches() returns truthy wins. obsidian is
 // registered AFTER example so the test-app's `example` still wins for the TronHawk test app.
-const ADAPTERS = [exampleAdapter, obsidianAdapter];
+const ADAPTERS = [exampleAdapter, obsidianAdapter, chatgptAdapter];
 
 // Host logger, shape log(level, message). Wired by the runtime via init(); defaults to console
 // so any use before wiring (e.g. bun test) still surfaces warnings/errors.
