@@ -1,0 +1,24 @@
+TronHawk
+
+License provenance
+
+- TronHawk's own original source code is licensed under the Apache License,
+  Version 2.0. See the LICENSE file in the repository root. This license covers
+  TronHawk's original code only; it does not cover third-party components
+  listed below and in THIRD_PARTY_NOTICES.md.
+
+- The distributed `tronhawk_injector.dll` binary (built from crates/injector)
+  statically links electron-hook 0.2.2, which is covered by the GNU Lesser
+  General Public License version 3 (LGPL-3.0). Because the link is static, the
+  distributed binary is an LGPL-3.0 Combined Work. The GNU General Public
+  License version 3 text required to accompany it is provided as the
+  LICENSE.GPL-3.0 file in the repository root. Full compliance details,
+  Corresponding Source pointers, and relink instructions are in
+  THIRD_PARTY_NOTICES.md.
+
+- The following third-party components are redistributed with TronHawk. Their
+  notices and license texts are preserved; see THIRD_PARTY_NOTICES.md:
+
+  - electron-hook (LGPL-3.0) - vendored under vendor/electron-hook/
+  - Microsoft Detours (MIT) - vendored under
+    vendor/electron-hook/vendor/detours-sys/ext/detours/
