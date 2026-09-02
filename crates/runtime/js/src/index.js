@@ -1,6 +1,10 @@
 // TronHawk Runtime (main-process side) — executes the plugin execution plan.
 // Provides gated APIs and bridges to Electron (docs/AGENTS.md: Runtime layer).
 //
+// The Runtime also owns plan acquisition from Core: it polls `getExecutionPlan` over a transport
+// handed in by the injector bootstrap (`start(app, { runtimeLog, pluginLog, request })`) and
+// applies revision-diffed plans. The bootstrap is transport-only and never owns orchestration.
+//
 // Phase 2: CSS injection via `webContents.insertCSS` (data, never executed as JS), with a
 // multi-plugin, revision-based state machine supporting hot reload, removal, and revocation.
 // Phase 3: main-process plugin JS runs in an embedded QuickJS sandbox (no DOM/network/Node),
@@ -128,6 +132,38 @@ const pendingRendererPlugins = new Map();
 
 const QUICKJS_CPU_DEADLINE_MS = 1000;
 const quickJSDeadlineStacks = new WeakMap();
+// vm -> number of deadline interrupts fired against this VM since it was created. Each firing
+// means QuickJS raised the "interrupted" exception because a per-operation CPU budget expired.
+const quickJSInterruptCounts = new WeakMap();
+// plugin ids hard-disabled for the current plan generation after exceeding the interrupt limit.
+const abuseDisabledPlugins = new Set();
+
+// Cumulative-CPU policy (audit RT-1/RT-2). Honest statement of the limits:
+//
+// 1. Every operation (eval, activate, callback) gets a *fresh* per-operation wall-clock budget of
+//    QUICKJS_CPU_DEADLINE_MS of main-thread CPU, so a hostile plugin could otherwise spread
+//    unbounded total CPU across many events, each restarting the budget. We do not (and cheaply
+//    cannot) meter actual CPU used below one deadline; instead interrupts are counted per VM and
+//    the plugin is disabled once QUICKJS_CPU_DEADLINE_INTERRUPT_LIMIT expired deadlines have
+//    accumulated. That bounds total CPU to roughly limit * ~1s per loaded VM instance. When the
+//    budget expires during a run, the operation is failed (fail closed) even if the guest code
+//    returned normally afterwards, so a plugin cannot silently "succeed" after overrunning.
+// 2. Enforcement note: deadline enforcement in this QuickJS build can lag past the wall-clock
+//    deadline when a plugin is dense in guest->host calls (interrupt checks happen between
+//    bytecode, not inside host calls), so a single overrunning operation may burn somewhat more
+//    than QUICKJS_CPU_DEADLINE_MS before the interpreter raises "interrupted". Empirical probes
+//    on this build show guest `try { ... } catch (e) {}` does NOT intercept the "interrupted"
+//    abort, and the operation unwinds to a host-visible failure. The counting below is defensive
+//    for the audit-reported shape where a build or nesting path does deliver a catchable
+//    "interrupted" (or where repeated callbacks each exhaust a fresh budget): interrupts are
+//    recorded per VM and the plugin is hard-killed once the limit is exceeded, instead of only
+//    failing the one call.
+// 3. A plugin that, on whatever build, absorbs every interrupt inside a single never-returning
+//    operation cannot be reclaimed from the same synchronous JS stack in the sync QuickJS variant
+//    (disposing the VM from inside its own interrupt callback is unsafe). We still count those
+//    firings so the VM is killed the moment control returns; enforcing that residual case would
+//    require the asyncify/worker variant or an out-of-process watchdog and is out of scope here.
+const QUICKJS_CPU_DEADLINE_INTERRUPT_LIMIT = 3;
 
 function errorMessage(error) {
   if (error && typeof error === "object") {
@@ -140,58 +176,133 @@ function errorMessage(error) {
   return String(error);
 }
 
+// Wraps the stock deadline handler with per-VM interrupt accounting: every time the deadline has
+// passed AND QuickJS asks whether to abort, we record another fired interrupt before answering.
+function makeInterruptHandler(vm, deadline) {
+  const pastDeadline = shouldInterruptAfterDeadline(deadline);
+  return () => {
+    if (!pastDeadline()) return 0;
+    quickJSInterruptCounts.set(vm, (quickJSInterruptCounts.get(vm) || 0) + 1);
+    return 1;
+  };
+}
+
 function runQuickJSOperation(vm, pluginId, label, operation, requireUndefined = false) {
+  if ((quickJSInterruptCounts.get(vm) || 0) > QUICKJS_CPU_DEADLINE_INTERRUPT_LIMIT) {
+    // This VM already exhausted its cumulative CPU budget (RT-1/RT-2). Refuse to run any further
+    // guest code; the crossing operation scheduled the VM's disposal, and callers treat a `false`
+    // return as fail-closed (unregistering the callback or disposing the VM).
+    return false;
+  }
+  const interruptsBefore = quickJSInterruptCounts.get(vm) || 0;
   let result;
   const deadlines = quickJSDeadlineStacks.get(vm) || [];
+  // Depth of the already-active operation stack before this one; 0 means this is the outermost
+  // operation for the VM, so when it returns no guest frame is running and disposal is safe.
+  const outerDepth = deadlines.length;
   const deadline = Date.now() + QUICKJS_CPU_DEADLINE_MS;
   deadlines.push(deadline);
   quickJSDeadlineStacks.set(vm, deadlines);
-  vm.runtime.setInterruptHandler(shouldInterruptAfterDeadline(deadline));
+  vm.runtime.setInterruptHandler(makeInterruptHandler(vm, deadline));
+  let ok = true;
   try {
     result = operation();
   } catch (e) {
     pluginLog(pluginId, "error", label + " failed: " + (e && e.message ? e.message : e));
-    return false;
+    ok = false;
   } finally {
     vm.runtime.removeInterruptHandler();
     deadlines.pop();
     const parentDeadline = deadlines[deadlines.length - 1];
     if (parentDeadline !== undefined) {
-      vm.runtime.setInterruptHandler(shouldInterruptAfterDeadline(parentDeadline));
+      vm.runtime.setInterruptHandler(makeInterruptHandler(vm, parentDeadline));
     } else {
       quickJSDeadlineStacks.delete(vm);
     }
   }
 
-  if (result.error) {
-    let error;
-    try {
-      error = vm.dump(result.error);
-    } catch (e) {
-      error = e && e.message ? e.message : e;
-    } finally {
-      result.error.dispose();
+  if (ok) {
+    if (result.error) {
+      let error;
+      try {
+        error = vm.dump(result.error);
+      } catch (e) {
+        error = e && e.message ? e.message : e;
+      } finally {
+        result.error.dispose();
+      }
+      pluginLog(pluginId, "error", label + " failed: " + errorMessage(error));
+      ok = false;
+    } else if ((quickJSInterruptCounts.get(vm) || 0) > interruptsBefore) {
+      // The per-operation deadline fired at least once while this operation ran, yet the guest
+      // code returned a normal result instead of unwinding (e.g. it swallowed or survived the
+      // "interrupted" exception). A normal-looking return cannot be trusted after an overrun:
+      // fail closed exactly as if the operation had thrown (RT-1/RT-2).
+      result.value.dispose();
+      pluginLog(
+        pluginId,
+        "error",
+        label +
+          " exceeded its CPU deadline (" +
+          QUICKJS_CPU_DEADLINE_MS +
+          "ms) and did not unwind; treating as failure",
+      );
+      ok = false;
+    } else if (requireUndefined && vm.typeof(result.value) !== "undefined") {
+      const resultType = vm.typeof(result.value);
+      result.value.dispose();
+      pluginLog(
+        pluginId,
+        "error",
+        label +
+          " rejected asynchronous/non-void lifecycle result (expected undefined, got " +
+          resultType +
+          ")",
+      );
+      ok = false;
+    } else {
+      result.value.dispose();
     }
-    pluginLog(pluginId, "error", label + " failed: " + errorMessage(error));
-    return false;
   }
 
-  if (requireUndefined && vm.typeof(result.value) !== "undefined") {
-    const resultType = vm.typeof(result.value);
-    result.value.dispose();
-    pluginLog(
-      pluginId,
-      "error",
-      label +
-        " rejected asynchronous/non-void lifecycle result (expected undefined, got " +
-        resultType +
-        ")",
-    );
-    return false;
+  if (!ok && !abuseDisabledPlugins.has(pluginId)) {
+    const interrupts = quickJSInterruptCounts.get(vm) || 0;
+    if (interrupts > QUICKJS_CPU_DEADLINE_INTERRUPT_LIMIT) {
+      // Cumulative-CPU kill: this VM has now exhausted more than the allowed number of per-op
+      // deadlines. Hard-disable the plugin for the rest of this plan generation instead of only
+      // failing the single operation, so repeated callbacks cannot each burn a fresh 1s budget.
+      abuseDisabledPlugins.add(pluginId);
+      pluginLog(
+        pluginId,
+        "error",
+        label +
+          " exceeded the cumulative CPU budget (" +
+          QUICKJS_CPU_DEADLINE_INTERRUPT_LIMIT +
+          " expired deadlines); plugin disabled until the next plan revision",
+      );
+    }
   }
 
-  result.value.dispose();
-  return true;
+  // If this was the outermost operation for a now-disabled main plugin, hard-kill it here: no
+  // guest frame is on the stack, so deregistering is safe. Disposal is deferred to the next tick
+  // so host code that still holds handles of this VM (e.g. the onCreated callback handler, which
+  // disposes its window-id handle right after this operation returns) runs before the VM is freed.
+  // This matters for window.onCreated callback timeouts, whose caller would otherwise only
+  // unregister the single callback and leave the disabled VM able to burn fresh budgets on later
+  // window events. (Eval/activate failures never reach mainPlugins — the caller disposes its VM.)
+  if (outerDepth === 0 && abuseDisabledPlugins.has(pluginId)) {
+    const entry = mainPlugins.get(pluginId);
+    if (entry && entry.vm === vm) {
+      setImmediate(() =>
+        killMainPlugin(
+          pluginId,
+          entry,
+          label + " exhausted the cumulative CPU budget; main plugin disabled",
+        ),
+      );
+    }
+  }
+  return ok;
 }
 
 function pluginFingerprint(plugin) {
@@ -210,11 +321,25 @@ function disposeVM(vm) {
   }
 }
 
+// Hard kill for a main plugin whose cumulative CPU budget was exhausted: deregister it and
+// dispose its VM so no further callback can burn main-thread CPU in this plan generation.
+function killMainPlugin(pluginId, entry, reason) {
+  // Only kill when `entry` is still the registered instance: a plan revision may have cleared the
+  // disabled set and respawned the plugin (new VM) before a deferred kill runs.
+  if (mainPlugins.get(pluginId) === entry) {
+    mainPlugins.delete(pluginId);
+    entry.deactivate();
+    pluginLog(pluginId, "error", reason);
+  }
+}
+
 function buildLogger(vm, pluginId) {
   const logger = vm.newObject();
   for (const level of ["info", "warn", "error"]) {
     const method = vm.newFunction(level, (messageHandle) => {
       if (vm.typeof(messageHandle) === "string") {
+        // RT-3 (informational): coercing this handle can invoke the plugin's own toString/valueOf
+        // if it passes an object; it runs under the enclosing operation's QuickJS deadline.
         pluginLog(pluginId, level, vm.getString(messageHandle));
       }
       return vm.undefined;
@@ -243,6 +368,9 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
       if (!registered) return false;
       const id = vm.newNumber(w.id);
       try {
+        // A callback timeout hard-kills the whole plugin (see runQuickJSOperation): the callback
+        // is just one host event, but repeated over-budget callbacks must not each get a fresh 1s
+        // budget while the plugin stays registered for further window events.
         const succeeded = runQuickJSOperation(vm, pluginId, "window.onCreated callback", () =>
           vm.callFunction(callback, vm.undefined, id),
           true,
@@ -268,6 +396,8 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   onCreated.dispose();
 
   const setOpacity = vm.newFunction("setOpacity", (winHandle, nHandle) => {
+    // RT-3 (informational): vm.getNumber coercion can invoke the plugin's own valueOf/toString;
+    // it runs under the enclosing operation's QuickJS deadline, so there is no CPU escape here.
     const id = vm.getNumber(winHandle);
     const n = vm.getNumber(nHandle);
     const w = BrowserWindow.fromId(id);
@@ -281,6 +411,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   setOpacity.dispose();
 
   const setSize = vm.newFunction("setSize", (winHandle, wHandle, hHandle) => {
+    // RT-3 (informational): see setOpacity — value coercion runs under the op's deadline.
     const id = vm.getNumber(winHandle);
     const w = BrowserWindow.fromId(id);
     if (w) w.setSize(vm.getNumber(wHandle), vm.getNumber(hHandle));
@@ -290,6 +421,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   setSize.dispose();
 
   const setPosition = vm.newFunction("setPosition", (winHandle, xHandle, yHandle) => {
+    // RT-3 (informational): see setOpacity — value coercion runs under the op's deadline.
     const id = vm.getNumber(winHandle);
     const w = BrowserWindow.fromId(id);
     if (w) w.setPosition(vm.getNumber(xHandle), vm.getNumber(yHandle));
@@ -302,6 +434,11 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
 }
 
 function runMainPlugin(plugin, app, generation, fingerprint) {
+  if (abuseDisabledPlugins.has(plugin.id)) {
+    // Killed earlier in this plan generation for exceeding the cumulative CPU budget; do not
+    // respawn it just because a later reconcile still wants it.
+    return;
+  }
   const pending = { generation, fingerprint };
   let vm = null;
   const cleanupCallbacks = [];
@@ -378,6 +515,7 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
           hasPermission(candidate.granted, "electron.window") &&
           pluginFingerprint(candidate) === fingerprint,
       ) &&
+      !abuseDisabledPlugins.has(plugin.id) &&
       !mainPlugins.has(plugin.id);
     if (!stillPending) {
       cleanupAll(cleanupCallbacks);
@@ -407,6 +545,11 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
 // --- Renderer-plugin sandbox (runs per window on did-finish-load) ---
 
 function runRendererPlugin(plugin, w, generation, fingerprint) {
+  if (abuseDisabledPlugins.has(plugin.id)) {
+    // Killed earlier in this plan generation for exceeding the cumulative CPU budget; do not
+    // respawn a new VM for every window in this plan generation.
+    return;
+  }
   const contents = w.contents;
   const key = plugin.id + "@" + contents.id;
   const pending = { generation, windowGeneration: w.rendererGeneration, fingerprint };
@@ -427,6 +570,8 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
     if (hasPermission(plugin.granted, "renderer.script")) {
       const script = vm.newObject();
       const setDocumentTitle = vm.newFunction("setDocumentTitle", (titleHandle) => {
+        // RT-3 (informational): vm.getString coercion can invoke the plugin's own toString/valueOf
+        // on an object handle; it runs under the enclosing operation's QuickJS deadline.
         const title = vm.getString(titleHandle);
         // The assignment is host-owned. Plugin input is only inserted after JSON serialization,
         // so it can never become executable JavaScript source.
@@ -497,6 +642,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
           hasPermission(candidate.granted, "renderer.script") &&
           pluginFingerprint(candidate) === fingerprint,
       ) &&
+      !abuseDisabledPlugins.has(plugin.id) &&
       !rendererPlugins.has(key);
     if (!stillWanted) {
       disposeVM(vm);
@@ -618,6 +764,9 @@ function applyPlan(plan) {
   }
   currentPlan = plan;
   planGeneration += 1;
+  // A new plan revision is an explicit (admin) reconfiguration: plugins disabled by cumulative
+  // CPU abuse get one clean reload under the new plan.
+  abuseDisabledPlugins.clear();
   for (const w of windows.values()) {
     reconcile(w);
     if (w.loaded) reconcileRendererPlugins(w);
@@ -625,9 +774,85 @@ function applyPlan(plan) {
   reconcileMainPlugins(appRef);
 }
 
+// --- plan acquisition and polling ---
+//
+// This loop lives in the Runtime (not the Injector bootstrap) per docs/AGENTS.md layering:
+// Injector only establishes comms, so the bootstrap hands us a `request(method, params, options)`
+// transport built once around connect/send/frame parsing. Everything about the plan contract —
+// the version/id/result/error response-envelope checks, the plan payload shape, the polling
+// cadence, and reconnect logging — is owned here with the loop. The bootstrap keeps the log
+// delivery queue because that is transport.
+
+const IPC_VERSION = "0.1";
+const PLAN_POLL_INTERVAL_MS = 2000;
+const PLAN_POLL_TIMEOUT_MS = 5000;
+
+// `request` transport (injected by the bootstrap). Resolves to `{ id, envelope }` where `id` is
+// the request id the transport sent and `envelope` is the raw parsed JSON-RPC response.
+let planRequest = null;
+let planPollTimer = null;
+let planPolling = false;
+let lastPlanPollError = null;
+
+// Envelope validation (version/id/result/error). Throws on any violation; returns the result.
+function validatePlanEnvelope(envelope, expectedId) {
+  if (!envelope || typeof envelope !== "object") {
+    throw new Error("invalid IPC response");
+  }
+  if (envelope.version !== IPC_VERSION || envelope.id !== expectedId) {
+    throw new Error("invalid IPC response");
+  }
+  if (envelope.error) {
+    throw new Error(JSON.stringify(envelope.error));
+  }
+  return envelope.result;
+}
+
+function pollPlan() {
+  if (planPolling || !planRequest) return;
+  planPolling = true;
+  planRequest("getExecutionPlan", {}, { timeout: PLAN_POLL_TIMEOUT_MS })
+    .then(({ id, envelope }) => {
+      // Envelope contract first: a malformed envelope or a Core error must not count as a
+      // recovery, so reconnect is only reported once a structurally valid plan response arrives.
+      const plan = validatePlanEnvelope(envelope, id);
+      if (lastPlanPollError !== null) {
+        log("Core reconnected");
+        lastPlanPollError = null;
+      }
+      if (!plan || !Array.isArray(plan.plugins)) {
+        log("invalid plan payload from Core; ignoring", "warn");
+        return;
+      }
+      applyPlan(plan);
+    })
+    .catch((e) => {
+      const message = e && e.message ? e.message : String(e);
+      if (lastPlanPollError !== message) {
+        log("poll failed: " + message, "warn");
+        lastPlanPollError = message;
+      }
+    })
+    .then(() => {
+      planPolling = false;
+    });
+}
+
+function startPlanPolling(request) {
+  if (planPollTimer) return;
+  planRequest = request;
+  pollPlan();
+  planPollTimer = setInterval(pollPlan, PLAN_POLL_INTERVAL_MS);
+}
+
 function start(app, sinks = {}) {
   if (typeof sinks.runtimeLog === "function") runtimeLogSink = sinks.runtimeLog;
   if (typeof sinks.pluginLog === "function") pluginLogSink = sinks.pluginLog;
+  if (typeof sinks.request === "function") {
+    startPlanPolling(sinks.request);
+  } else {
+    log("no plan request transport supplied; plan polling disabled", "warn");
+  }
   appRef = app;
   app.on("web-contents-created", (_e, contents) => {
     if (contents.getType() !== "window") {

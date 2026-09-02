@@ -5,9 +5,9 @@
 //!   tronhawk-injector-launcher register <target-exe>           # register IFEO (elevated)
 //!   tronhawk-injector-launcher unregister <target-exe>         # unregister IFEO (elevated)
 //!
-//! The injector DLL and bootstrap are resolved relative to the launcher's own location,
-//! so the three artifacts (`launcher.exe`, `tronhawk_injector.dll`, `bootstrap.js`) are
-//! deployed side by side.
+//! The injector DLL, bootstrap, and runtime are resolved relative to the launcher's own location,
+//! so the four artifacts (`launcher.exe`, `tronhawk_injector.dll`, `bootstrap.js`, `runtime.js`)
+//! are deployed side by side.
 
 use std::path::PathBuf;
 
@@ -15,6 +15,9 @@ use electron_hook::asar::Asar;
 
 const DLL_NAME: &str = "tronhawk_injector.dll";
 const BOOTSTRAP_NAME: &str = "bootstrap.js";
+// bootstrap.js `require(path.join(__dirname, "runtime.js"))` at injection time, so a missing
+// runtime.js must fail fast here rather than deep inside the launched target.
+const RUNTIME_NAME: &str = "runtime.js";
 
 fn launcher_dir() -> PathBuf {
     std::env::current_exe()
@@ -79,12 +82,16 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     let dir = launcher_dir();
     let dll = dir.join(DLL_NAME);
     let bootstrap = dir.join(BOOTSTRAP_NAME);
+    let runtime = dir.join(RUNTIME_NAME);
 
     if !dll.exists() {
         return Err(format!("injector dll not found: {}", dll.display()));
     }
     if !bootstrap.exists() {
         return Err(format!("bootstrap not found: {}", bootstrap.display()));
+    }
+    if !runtime.exists() {
+        return Err(format!("runtime not found: {}", runtime.display()));
     }
 
     let asar = Asar::new()
@@ -99,6 +106,7 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     println!("[launcher] asar: {}", asar.display());
     println!("[launcher] dll: {}", dll.display());
     println!("[launcher] bootstrap: {}", bootstrap.display());
+    println!("[launcher] runtime: {}", runtime.display());
 
     let port = tronhawk_injector::launch_session::ipc_port();
     let control_token = tronhawk_injector::launch_session::read_control_token()?;

@@ -2,7 +2,9 @@
 // Loaded via `require(MODLOADER_MOD_ENTRYPOINT)(originalAsar)` from the remapped app.asar.
 //
 // Injector responsibility (docs/AGENTS.md): enter process, establish comms with Core,
-// and load the trusted Runtime. NO plugin logic lives here.
+// and load the trusted Runtime. NO plugin logic lives here — and the Runtime owns the
+// plan polling/application loop. This file only builds the IPC transport (connect, frame,
+// send) plus the bounded log delivery queue, then hands the transport to the Runtime.
 const path = require("path");
 const net = require("net");
 
@@ -25,10 +27,12 @@ function boundedMessage(value) {
   return message.slice(0, low) + suffix;
 }
 
-let nextId = 1;
-
-function request(port, secret, method, params, timeout = 5000) {
-  const id = nextId++;
+// Raw IPC exchange: open one connection per request, write the framed JSON-RPC request, and
+// resolve with the parsed response envelope. Frame-level validation only (newline frame, size
+// cap, JSON parse). Envelope contract checks (version/id/result/error) belong to each consumer:
+// the Runtime's plan loop owns them; the log delivery queue below treats any bad envelope as a
+// delivery failure.
+function sendIpc(port, secret, id, method, params, timeout = 5000) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(port, "127.0.0.1", () => {
       sock.write(
@@ -48,7 +52,8 @@ function request(port, secret, method, params, timeout = 5000) {
     let buf = "";
     sock.on("data", (d) => {
       buf += d.toString();
-      if (buf.length > 256 * 1024) {
+      // Match the wire frame limit used by the Rust client (crates/ipc MAX_FRAME_SIZE).
+      if (buf.length > 64 * 1024) {
         sock.destroy();
         reject(new Error("ipc response too large"));
         return;
@@ -57,12 +62,7 @@ function request(port, secret, method, params, timeout = 5000) {
       if (nl >= 0) {
         sock.destroy();
         try {
-          const resp = JSON.parse(buf.slice(0, nl));
-          if (!resp || resp.version !== "0.1" || resp.id !== id || resp.error) {
-            reject(new Error(resp && resp.error ? JSON.stringify(resp.error) : "invalid IPC response"));
-            return;
-          }
-          resolve(resp.result);
+          resolve(JSON.parse(buf.slice(0, nl)));
         } catch (e) {
           reject(e);
         }
@@ -72,17 +72,22 @@ function request(port, secret, method, params, timeout = 5000) {
   });
 }
 
-function getExecutionPlan(port, secret) {
-  const id = nextId;
-  return request(port, secret, "getExecutionPlan", {}).then((result) => ({
-    id,
-    resp: { version: "0.1", id, result },
-  }));
+// Transport seam handed to the Runtime. `request(method, params, { timeout })` resolves to
+// `{ id, envelope }` so the Runtime can validate `envelope.id` against the id that was sent.
+function buildTransport(port, secret) {
+  let nextId = 1;
+  const request = (method, params, options = {}) => {
+    const id = nextId++;
+    const timeout = options && options.timeout ? options.timeout : 5000;
+    return sendIpc(port, secret, id, method, params, timeout).then((envelope) => ({ id, envelope }));
+  };
+  return { request };
 }
 
 module.exports = function bootstrap(originalAsar) {
   const port = parseInt(process.env.TRONHAWK_IPC_PORT || "17777", 10);
   const secret = process.env.TRONHAWK_IPC_SECRET || "";
+  const { request } = buildTransport(port, secret);
   const logQueue = [];
   let droppedLogs = 0;
   let deliveringLogs = false;
@@ -129,8 +134,13 @@ module.exports = function bootstrap(originalAsar) {
     const selected = logQueue.filter((item) => item.stream === stream).slice(0, MAX_LOG_BATCH);
     const events = selected.map((item) => item.event);
     const method = stream === "plugin" ? "appendPluginLogs" : "appendRuntimeLogs";
-    request(port, secret, method, { events })
-      .then(() => {
+    request(method, { events })
+      .then(({ id, envelope }) => {
+        // Log delivery is transport; a Core error or malformed envelope means the events were not
+        // durably accepted, so treat it like any other delivery failure and retry.
+        if (!envelope || typeof envelope !== "object" || envelope.version !== "0.1" || envelope.id !== id || envelope.error) {
+          throw new Error(envelope && envelope.error ? JSON.stringify(envelope.error) : "invalid IPC response");
+        }
         for (const item of selected) {
           const index = logQueue.indexOf(item);
           if (index !== -1) logQueue.splice(index, 1);
@@ -162,60 +172,8 @@ module.exports = function bootstrap(originalAsar) {
   const { app } = require("electron");
   const runtime = require(path.join(__dirname, "runtime.js"));
 
-  runtime.start(app, { runtimeLog, pluginLog });
-
-  const apply = ({ id, resp }) => {
-    if (!resp || typeof resp !== "object") {
-      log("invalid IPC response; ignoring", "warn");
-      return;
-    }
-    if (resp.version !== "0.1") {
-      log("IPC response version mismatch; ignoring", "warn");
-      return;
-    }
-    if (resp.id !== id) {
-      log("IPC response id mismatch; ignoring", "warn");
-      return;
-    }
-    if (resp.error) {
-      log("Core error: " + JSON.stringify(resp.error), "error");
-      return;
-    }
-    const plan = resp.result;
-    if (!plan || !Array.isArray(plan.plugins)) {
-      log("invalid plan payload from Core; ignoring", "warn");
-      return;
-    }
-    runtime.applyPlan(plan);
-  };
-
-  let polling = false;
-  let lastError = null;
-  const poll = () => {
-    if (polling) return;
-    polling = true;
-    getExecutionPlan(port, secret)
-      .then((result) => {
-        if (lastError !== null) {
-          log("Core reconnected");
-          lastError = null;
-        }
-        apply(result);
-      })
-      .catch((e) => {
-        const msg = e && e.message ? e.message : String(e);
-        if (lastError !== msg) {
-          log("poll failed: " + msg, "warn");
-          lastError = msg;
-        }
-      })
-      .then(() => {
-        polling = false;
-      });
-  };
-
-  poll();
-  setInterval(poll, 2000);
+  // Runtime owns the plan acquire/poll/apply loop; we only pass it the transport we built above.
+  runtime.start(app, { runtimeLog, pluginLog, request });
 
   // Load the original app (transparent injection).
   try {
