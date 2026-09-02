@@ -10,6 +10,7 @@ $pluginSource = Join-Path $storageRoot "logger-plugin-source"
 $pluginPackage = Join-Path $storageRoot "logger-plugin.thx"
 $fixturePluginId = "com.example.integration-logger"
 $fixtureMarker = "integration plugin logger marker"
+$cssPluginId = "com.example.integration-css"
 $core = $null
 $existingTestAppIds = @()
 $rpcId = 0
@@ -236,6 +237,37 @@ try {
         grants = @("renderer.script")
     } -ControlToken $controlToken -Port $testPort
 
+    # CSS fixture (Path A): a CSS-only plugin whose stylesheet the runtime injects once the renderer
+    # gate fires on the test-app's late-mounted #late-root. Asserts the renderer.css path works
+    # *with* the gate seam (not just renderer.script).
+    $cssSource = Join-Path $storageRoot "css-plugin-source"
+    $cssPackage = Join-Path $storageRoot "css-plugin.thx"
+    New-Item -ItemType Directory -Force -Path $cssSource | Out-Null
+    $cssManifest = @{
+        id = $cssPluginId
+        name = "Integration CSS"
+        version = "1.0.0"
+        author = "Integration Test"
+        tronhawk = "^0.1"
+        css = "#late-root { outline: 3px solid #00ff00; }"
+        permissions = @("renderer.css")
+    } | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText((Join-Path $cssSource "manifest.json"), $cssManifest, $utf8)
+    & cargo run --quiet --package tronhawk-package --bin pack -- $cssSource $cssPackage 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $cssPackage -PathType Leaf)) {
+        throw "css fixture .thx packaging failed with exit code $LASTEXITCODE"
+    }
+    $cssInstalled = Invoke-CoreRpc -Method "installPlugin" -Params @{ path = $cssPackage } -ControlToken $controlToken -Port $testPort
+    if ($cssInstalled.id -ne $cssPluginId) {
+        throw "installPlugin returned an unexpected css plugin id"
+    }
+    $null = Invoke-CoreRpc -Method "setApplicationPluginPolicy" -Params @{
+        applicationId = $registered.applicationId
+        pluginId = $cssPluginId
+        enabled = $true
+        grants = @("renderer.css")
+    } -ControlToken $controlToken -Port $testPort
+
     # 5. Launch through the injector. The parent deliberately has no IPC secret; the launcher
     # obtains a short-lived createLaunchSession credential from Core for the child.
     $existingTestAppIds = @(Get-Process -Name "test-app-packaged" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
@@ -252,6 +284,7 @@ try {
     $coreEvent = $null
     $runtimeEvent = $null
     $pluginEvent = $null
+    $cssEvent = $null
     $lastEvents = @()
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Seconds 1
@@ -284,20 +317,27 @@ try {
             $_.pluginId -eq $fixturePluginId -and
             $_.message -eq $fixtureMarker
         } | Select-Object -First 1
-        if ($null -ne $coreEvent -and $null -ne $runtimeEvent -and $null -ne $pluginEvent) {
+        $cssEvent = $lastEvents | Where-Object {
+            $_.stream -eq "plugin" -and
+            $_.applicationId -eq $registered.applicationId -and
+            $_.pluginId -eq $cssPluginId -and
+            $_.message -eq "CSS injected"
+        } | Select-Object -First 1
+        if ($null -ne $coreEvent -and $null -ne $runtimeEvent -and $null -ne $pluginEvent -and $null -ne $cssEvent) {
             break
         }
     }
-    if ($null -eq $coreEvent -or $null -eq $runtimeEvent -or $null -eq $pluginEvent) {
+    if ($null -eq $coreEvent -or $null -eq $runtimeEvent -or $null -eq $pluginEvent -or $null -eq $cssEvent) {
         $observed = @($lastEvents | ForEach-Object { "$($_.stream):$($_.code)" }) -join ", "
         $missing = @()
         if ($null -eq $coreEvent) { $missing += "core lifecycle" }
         if ($null -eq $runtimeEvent) { $missing += "runtime lifecycle" }
         if ($null -eq $pluginEvent) { $missing += "attributed plugin marker" }
+        if ($null -eq $cssEvent) { $missing += "renderer.css injection event" }
         throw "durable log polling timed out; missing $($missing -join ', '); observed event kinds: $observed"
     }
 
-    Write-Output "[it] PASS: Core, Runtime, and attributed Plugin events persisted through launch-session handoff"
+    Write-Output "[it] PASS: Core, Runtime, plugin marker, and renderer.css injection persisted through launch-session handoff"
 
     # 7. DUR-1 restart-reconnect: kill Core, restart it on the SAME storage root and SAME port,
     # and confirm the still-running target reconnects without being relaunched. Launch tokens are
