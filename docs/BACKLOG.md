@@ -45,3 +45,15 @@ work lands or new gaps are found.
 
 - [ ] PLUGIN-SDK MainContext/RendererContext — document which APIs are implemented vs future
       (the SDK types describe the target contract; the runtime implements a subset).
+
+## Real-target validation (Aug 2026)
+
+- [x] **Obsidian** (Electron 43.3.0) — injection + QuickJS sandbox + main plugin (`setOpacity`)
+      + renderer plugin (`script.execute`) all work. (UI renders shell-only via a custom `app://`
+      protocol — application-profile concern.)
+- [ ] **OpenChamber** (Electron 43.3.0) — original app fails to start: the modded asar
+      `package.json` lacks a `version`, so `app.getVersion()` falls back to the exe's 4-part
+      `1.22.0.0`, which electron-updater rejects. Mitigation: copy the original asar's
+      `version`/`name` into the modded asar (`make_package_json` in vendored electron-hook).
+- [ ] **ChatGPT/Codex** — MSIX + a custom "owl" Electron fork; GUI does not start under raw-exe
+      Detours launch (needs AUMID). Application-profile concern.
