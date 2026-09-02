@@ -112,8 +112,10 @@ Pre-production validation (must PoC → ADR before committing):
    + app load work, but full GUI startup fails under raw-exe launch (needs AUMID; see ADR).
 5. VS Code — ❌ no `resources/app.asar` (unpacked `resources/app/`); the ASAR-remap path cannot
    target it. Obsidian (standard Electron 43.3.0) validated instead — injection + renderer
-   CSS/DOM injection work, but it loads via a custom `app://` protocol so only the shell renders
-   (full UI needs application profiles; see ADR).
+   CSS/DOM injection work, but it loads via a custom `app://` protocol so only the shell renders.
+   Root cause confirmed (ADR 0004): the minimal modded asar broke Obsidian's runtime module
+   resolution (`@electron/remote`); fixed by a merged asar (Path I). Full UI then needs the
+   per-app **compat adapter** injection (ADR 0001/0003).
 
 PoC → ADR: `docs/adr/0001-injection-backend.md`. electron-hook is **vendored** (`vendor/electron-hook/`,
 LGPL-3.0 + MIT Detours) and activates via a **launcher wrapper** (Detours), so IFEO's `Debugger` key
@@ -225,3 +227,8 @@ Scaffolding CLI: `create-tronhawk-plugin`. Full API in `PLUGIN-SDK.md`.
 
 Auto app recognition, application profiles, Explorer mode, plugin store UI, CEF support,
 Linux/macOS injection, advanced native API.
+
+> **Compat adapters** (ADR 0003) are the narrow, *trusted* slice of this concern — per-app
+> compatibility shims bundled into `runtime.js` (e.g. Obsidian's custom `app://` protocol). They
+> are distinct from the deferred **application profiles** (auto app recognition, per-app plugin
+> selection UX, Manager UI), which remain out of MVP.

@@ -21,11 +21,18 @@ boundaries; see `SPEC.md` for requirements/decisions and `PLUGIN-SDK.md` for the
 Support crates: `crates/package` (`.thx` format mechanics) and `crates/ipc` (JSON-RPC transport)
 are owned by the Core layer — they never make permission, install, or registration decisions.
 
+**Adapters (compat).** Trusted app-compatibility shims (ADR 0003), owned by the Runtime layer and
+bundled statically into `runtime.js`. They run in the target's main process and are **NOT** plugins:
+never `.thx`-installable, never disk-discoverable in the target, never permission-gated like an
+untrusted plugin. Kept distinct from the deferred *application profiles* (auto app recognition,
+per-app plugin selection UX, Manager UI).
+
 ## Coding principles
 
 - Prefer abstraction over implementation — expose `window.set_vibrancy()`, never Electron private symbols unless approved.
-- No premature generalization — do NOT build app profiles, marketplace, native-hook framework, or Chromium
-  replacement before MVP.
+- No premature generalization — do NOT build application profiles, marketplace, native-hook framework, or
+  Chromium replacement before MVP. The narrow **compat adapter** slice (ADR 0003, trusted runtime
+  substrate bundled into `runtime.js`) is permitted; the broader application-profile concern stays deferred.
 - Keep public interfaces stable (Plugin SDK, IPC protocol, manifest schema). Changes require doc + migration + version bump.
 
 ## Language rules

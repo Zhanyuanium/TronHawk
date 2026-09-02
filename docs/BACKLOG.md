@@ -16,8 +16,13 @@ completed or superseded are no longer listed.
       plugin's own `deactivate`.
 - [ ] QuickJS pending-job draining — required before lifecycle hooks may return promises; the
       SDK contract currently enforces synchronous `void` (do not broaden until this lands).
-- [ ] Real-target compatibility (application profiles, SPEC §18): Obsidian renders shell-only via a
-      custom `app://` protocol; WorkBuddy not yet validated. All deferred.
+- [ ] Real-target compatibility — generic **compat adapter** interface landed (Phase A,
+      `crates/runtime/js/src/adapters`, ADR 0003); Obsidian's blocker root-caused and fixed at the
+      injection layer (ADR 0004: merged asar, so `app.getAppPath()`/module resolution serve real
+      files). The broader *application profiles* (recognition, per-app plugin UX, Manager UI) remain
+      deferred (SPEC §18). Remaining for Obsidian: confirm the workspace mounts under the merged
+      asar on a real run, then Path A (adapter `renderer.gate` injects once `.workspace` mounts);
+      WorkBuddy not yet validated.
 
 ## Phase 4 — Manager UI (functional; these remain)
 
