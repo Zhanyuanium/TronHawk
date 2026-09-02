@@ -298,6 +298,116 @@ try {
     }
 
     Write-Output "[it] PASS: Core, Runtime, and attributed Plugin events persisted through launch-session handoff"
+
+    # 7. DUR-1 restart-reconnect: kill Core, restart it on the SAME storage root and SAME port,
+    # and confirm the still-running target reconnects without being relaunched. Launch tokens are
+    # self-contained (signed, not an in-memory session), so the ORIGINAL token still verifies after
+    # the restart; the Runtime's plan poll fails while Core is down and logs "Core reconnected"
+    # (runtime stream) once the first valid plan response arrives after Core returns.
+    $preRestart = Invoke-CoreRpc -Method "queryLogs" -Params @{
+        applicationId = $registered.applicationId
+        limit = 20
+    } -ControlToken $controlToken -Port $testPort
+    $preMaxSequence = [long]0
+    foreach ($event in @($preRestart.events)) {
+        if ($event.stream -eq "runtime" -and $null -ne $event.sequence -and [long]$event.sequence -gt $preMaxSequence) {
+            $preMaxSequence = [long]$event.sequence
+        }
+    }
+    Write-Output "[it] stopping Core for restart-reconnect (pre-restart max runtime sequence: $preMaxSequence)"
+    if ($null -ne $core -and -not $core.HasExited) {
+        Stop-Process -Id $core.Id -Force -ErrorAction SilentlyContinue
+        $null = $core.WaitForExit(10000)
+    }
+    # Hold Core down across at least two of the Runtime's 2s plan-poll cycles so the target
+    # observes a poll failure; the Runtime then logs "Core reconnected" once the first valid plan
+    # response arrives after Core returns (it only reports recovery when a poll previously failed).
+    Start-Sleep -Seconds 5
+    Write-Output "[it] restarting Core on the same root and port"
+    $core = Start-Process -FilePath $coreExe -PassThru -WindowStyle Hidden
+
+    $reconnected = $false
+    $reconnectEvidence = $null
+    $newSeen = @{}
+    $stablePolls = 0
+    $restartDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $restartDeadline -and $stablePolls -lt 4) {
+        Start-Sleep -Seconds 1
+        $queried = $null
+        try {
+            $queried = Invoke-CoreRpc -Method "queryLogs" -Params @{
+                applicationId = $registered.applicationId
+                limit = 20
+            } -ControlToken $controlToken -Port $testPort -TimeoutMilliseconds 2000
+        } catch {
+            # Core may still be starting up; keep polling until the deadline.
+            if ($_.Exception.Message -notlike "*could not connect*") {
+                throw
+            }
+            continue
+        }
+        $encodedLogs = $queried | ConvertTo-Json -Compress -Depth 20
+        if ($encodedLogs -match '(?i)"(?:executablePath|secret|token|source|main|renderer|css)"\s*:') {
+            throw "queryLogs (post-restart) exposed a forbidden path, credential, or plugin-source field"
+        }
+        if ($encodedLogs -match '(?i):\s*"[0-9a-f]{64}"') {
+            throw "queryLogs (post-restart) exposed a token-like 64-hex value"
+        }
+
+        # Collect every event recorded strictly after the pre-restart snapshot. Any such event
+        # proves the still-running target produced new ledger entries through the restarted Core.
+        $added = $false
+        foreach ($event in @($queried.events)) {
+            if ($event.applicationId -ne $registered.applicationId) { continue }
+            if ($null -eq $event.sequence) { continue }
+            $sequence = [long]$event.sequence
+            if ($sequence -gt $preMaxSequence -and -not $newSeen.ContainsKey($sequence)) {
+                $newSeen[$sequence] = $event
+                $added = $true
+            }
+        }
+        if ($added) {
+            $stablePolls = 0
+        } else {
+            $stablePolls++
+        }
+    }
+    if ($newSeen.Count -eq 0) {
+        $observed = @($newSeen.Keys | Sort-Object) -join ", "
+        throw "DUR-1 reconnect not observed within 30s after Core restart; no event recorded after pre-restart max sequence $preMaxSequence (new events seen: $observed)"
+    }
+
+    # Prefer the Runtime's explicit "Core reconnected" marker, then a freshly-triggered plugin
+    # marker, then any newer Core/Runtime event for the same application.
+    $ordered = @($newSeen.Keys | Sort-Object)
+    $reconnectMarker = $null
+    $pluginMarker = $null
+    $anyNewer = $null
+    foreach ($sequence in $ordered) {
+        $event = $newSeen[$sequence]
+        if ($event.stream -eq "runtime" -and $event.message -like "Core reconnected*") {
+            $reconnectMarker = $event
+        } elseif ($event.stream -eq "plugin" -and
+            $event.pluginId -eq $fixturePluginId -and $event.message -eq $fixtureMarker) {
+            $pluginMarker = $event
+        }
+        if ($null -eq $anyNewer) { $anyNewer = $event }
+    }
+    if ($null -ne $reconnectMarker) {
+        $reconnectEvidence = "runtime 'Core reconnected' marker (seq $($reconnectMarker.sequence))"
+    } elseif ($null -ne $pluginMarker) {
+        $reconnectEvidence = "fresh plugin marker (seq $($pluginMarker.sequence))"
+    } else {
+        $reconnectEvidence = "newer $($anyNewer.stream) event (seq $($anyNewer.sequence), code $($anyNewer.code), message '$($anyNewer.message)')"
+    }
+    $summary = @($ordered | ForEach-Object {
+        $event = $newSeen[$_]
+        "$($_):$($event.stream)/$($event.level)/$($event.code) '$($event.message)'"
+    }) -join " | "
+    Write-Output "[it] post-restart new events: $summary"
+    Write-Output "[it] DUR-1 reconnect observed: $reconnectEvidence (pre-restart max sequence $preMaxSequence)"
+
+    Write-Output "[it] PASS: DUR-1 Core restart-reconnect — target re-authenticated and resumed without relaunch"
 } finally {
     Get-Process -Name "test-app-packaged" -ErrorAction SilentlyContinue |
         Where-Object { $existingTestAppIds -notcontains $_.Id } |
