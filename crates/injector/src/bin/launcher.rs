@@ -56,7 +56,12 @@ fn main() {
             }
             println!("[launcher] unregistered IFEO for {target}");
         }
-        target => launch(target, &args[1..]),
+        target => {
+            if let Err(error) = launch(target, &args[1..]) {
+                eprintln!("[launcher] launch failed: {error}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -70,18 +75,16 @@ fn require_arg<'a>(args: &'a [String], idx: usize, usage: &str) -> &'a str {
     }
 }
 
-fn launch(target_exe: &str, target_args: &[String]) {
+fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     let dir = launcher_dir();
     let dll = dir.join(DLL_NAME);
     let bootstrap = dir.join(BOOTSTRAP_NAME);
 
     if !dll.exists() {
-        eprintln!("[launcher] injector dll not found: {}", dll.display());
-        std::process::exit(1);
+        return Err(format!("injector dll not found: {}", dll.display()));
     }
     if !bootstrap.exists() {
-        eprintln!("[launcher] bootstrap not found: {}", bootstrap.display());
-        std::process::exit(1);
+        return Err(format!("bootstrap not found: {}", bootstrap.display()));
     }
 
     let asar = Asar::new()
@@ -91,20 +94,30 @@ fn launch(target_exe: &str, target_args: &[String]) {
         )
         .with_mod_entrypoint(bootstrap.to_str().unwrap())
         .create()
-        .expect("failed to create modded asar");
+        .map_err(|error| format!("failed to create modded asar: {error:?}"))?;
 
     println!("[launcher] asar: {}", asar.display());
     println!("[launcher] dll: {}", dll.display());
     println!("[launcher] bootstrap: {}", bootstrap.display());
 
-    electron_hook::launch(
+    let port = tronhawk_injector::launch_session::ipc_port();
+    let control_token = tronhawk_injector::launch_session::read_control_token()?;
+    tronhawk_injector::launch_session::with_launch_session(
+        port,
         target_exe,
-        dll.to_str().unwrap(),
-        asar.to_str().unwrap(),
-        target_args.to_vec(),
-        true,
-    )
-    .expect("electron_hook::launch failed");
+        &control_token,
+        || {
+            electron_hook::launch(
+                target_exe,
+                dll.to_str().unwrap(),
+                asar.to_str().unwrap(),
+                target_args.to_vec(),
+                true,
+            )
+        },
+    )?
+    .map_err(|error| format!("electron_hook::launch failed: {error:?}"))?;
 
     println!("[launcher] launched {target_exe}");
+    Ok(())
 }

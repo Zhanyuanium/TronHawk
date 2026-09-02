@@ -7,5 +7,7 @@
 
 pub use electron_hook::*;
 
+pub mod launch_session;
+
 #[cfg(windows)]
 pub mod registry;

@@ -15,6 +15,9 @@ path = "src/bin/launcher.rs"
 # upstream ships a submodule + its own [workspace] + under-declares winapi features, which
 # cannot be consumed as a plain crates.io/git dependency.
 electron-hook = { path = "../../vendor/electron-hook" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tronhawk-ipc = { path = "../ipc" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
