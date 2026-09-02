@@ -157,5 +157,30 @@ prefix still points at the cache. Fix: resolve the `.unpacked` sibling to the ta
 (launcher copies/junctions it, or `redirect_asar_path` rewrites the cache-sibling unpacked path to the
 target resources unpacked). This is injection-layer, not adapter.
 
+## Third run (junction fix applied) — app launches + injected
+
+The launcher now creates a junction `<cache>\tronhawk.asar.unpacked` → the target's real
+`resources\app.asar.unpacked` after building the merged asar (no admin). Verified on
+`openai-codex-electron`:
+
+- The previous `better-sqlite3 is only bundled with the Electron app` database error is **gone**.
+- The injected main process stays up (~742 MB) with a full renderer/GPU child tree, a real `ChatGPT`
+  window, and the app's own UI logic executing (its `uiM`/`CHATGPT_MATH_BLOCK`/math renderer
+  components log to the attached debug console).
+- Bootstrap logs `[tronhawk] injected; electron=152.x` and `[tronhawk] original app loaded`.
+
+So the AUMID-activation + race-attach path, combined with the merged asar (ADR 0004), the realpathSync
+workaround, and the `.asar.unpacked` junction, gets the MSIX ChatGPT app to **start normally while
+injected** — answering the original question: it is feasible and the full GUI is reachable (via the
+compat-adapter `renderer.gate` on the real UI root).
+
+**Reliability note:** a relaunch done immediately after force-killing a prior run can exit (observed
+once — likely single-instance/`.codex` lock contention on rapid relaunch). The injection pipeline
+itself is deterministic once the app is up; treat launch as best-effort.
+
+## Open (not blockers)
+
+- `renderer.gate` selector calibration for the ChatGPT UI root (the `chatgpt.js` adapter).
+
 **Stop-loss (unchanged)**: if the attach race is lost repeatedly or the realpath issue is intractable,
 fall back to signed `AppInit_DLLs` (too invasive) or keep MSIX in SPEC §18 deferred.
