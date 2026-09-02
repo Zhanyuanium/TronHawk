@@ -12,11 +12,12 @@ use widestring::U16CString;
 use winapi::{
     shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID},
     um::{
-        libloaderapi::{GetModuleHandleA, GetProcAddress},
+        libloaderapi::{GetModuleFileNameW, GetModuleHandleA, GetProcAddress},
         minwinbase::LPSECURITY_ATTRIBUTES,
         processthreadsapi::{
             GetCurrentThread, ResumeThread, LPPROCESS_INFORMATION, LPSTARTUPINFOW,
         },
+        processenv::SetEnvironmentVariableW,
         winnt::{DLL_PROCESS_ATTACH, HANDLE, LPCWSTR, LPWSTR},
         winuser::MessageBoxA,
     },
@@ -73,9 +74,65 @@ macro_rules! error_hooking_msg {
     };
 }
 
+/// Reads `<dll dir>/tronhawk-sidecar.json` and applies every key/value to the current process
+/// environment via `SetEnvironmentVariableW`.
+///
+/// On the AUMID-activation path the packaged app does NOT inherit the launcher's environment
+/// (activation bypasses our `CreateProcess`), so `DllMain` must re-establish the `MODLOADER_*`
+/// / `TRONHAWK_IPC_*` values itself before the `mod env` statics are first read. The sidecar
+/// sits next to the injector DLL, i.e. next to the launcher that wrote it.
+///
+/// Guarded to be a strict no-op on any failure: the normal Detours launch path never writes a
+/// sidecar (it inherits the env from the parent), so a missing/unreadable/unparseable sidecar
+/// must not change that path's behavior.
+fn load_sidecar_env(hinst_dll: HINSTANCE) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut buffer = [0u16; 4096];
+    let len = unsafe {
+        GetModuleFileNameW(
+            hinst_dll,
+            buffer.as_mut_ptr(),
+            buffer.len() as DWORD,
+        )
+    };
+    if len == 0 || len as usize >= buffer.len() {
+        return; // Resolve failed or was truncated — nothing sensible to do.
+    }
+
+    let Some(dll_dir) = std::path::Path::new(&String::from_utf16_lossy(&buffer[..len as usize]))
+        .parent()
+        .map(|dir| dir.to_path_buf())
+    else {
+        return;
+    };
+    let sidecar_path = dll_dir.join("tronhawk-sidecar.json");
+    let Ok(contents) = std::fs::read_to_string(&sidecar_path) else {
+        return; // No sidecar: normal Detours launch path.
+    };
+    let Ok(serde_json::Value::Object(entries)) =
+        serde_json::from_str::<serde_json::Value>(&contents)
+    else {
+        return; // Unparseable sidecar: ignore rather than break the launch.
+    };
+
+    for (key, value) in entries {
+        let Some(value) = value.as_str() else {
+            continue; // Only string values are environment variables.
+        };
+        let key_wide: Vec<u16> =
+            std::ffi::OsStr::new(&key).encode_wide().chain(std::iter::once(0)).collect();
+        let value_wide: Vec<u16> =
+            std::ffi::OsStr::new(value).encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            SetEnvironmentVariableW(key_wide.as_ptr(), value_wide.as_ptr());
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
-    _hinst_dll: HINSTANCE,
+    hinst_dll: HINSTANCE,
     fwd_reason: DWORD,
     _lpv_reserved: LPVOID,
 ) -> i32 {
@@ -86,6 +143,12 @@ pub unsafe extern "system" fn DllMain(
     if fwd_reason != DLL_PROCESS_ATTACH {
         return 1;
     }
+
+    // Sidecar env first: on the AUMID race-attach path the process has no inherited
+    // MODLOADER_* / TRONHAWK_IPC_* variables, and the `mod env` LazyLock statics below (and the
+    // runtime, later) read them. Must run before the Detour transaction so every hook callback
+    // observes the values.
+    load_sidecar_env(hinst_dll);
 
     DetourRestoreAfterWith();
 

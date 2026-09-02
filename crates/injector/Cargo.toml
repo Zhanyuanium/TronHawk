@@ -24,3 +24,19 @@ tronhawk-ipc = { path = "../ipc" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# Raw Win32 for the AUMID race-attach probe (ADR 0005): toolhelp enumeration, remote-thread
+# injection, and shell:AppsFolder activation. Feature list mirrors electron-hook's plus the
+# modules this probe touches; winapi's build script enables the transitive shared modules.
+winapi = { version = "0.3.9", features = [
+    "errhandlingapi",
+    "handleapi",
+    "libloaderapi",
+    "memoryapi",
+    "minwinbase",
+    "processthreadsapi",
+    "shellapi",
+    "synchapi",
+    "tlhelp32",
+    "winnt",
+    "winuser",
+] }

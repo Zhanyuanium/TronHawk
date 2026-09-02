@@ -33,7 +33,7 @@ optional = true
 
 [target.'cfg(windows)'.dependencies]
 widestring = "1.2.0"
-winapi = { version = "0.3.9", features = ["handleapi", "winuser", "fileapi", "processthreadsapi", "winbase", "libloaderapi", "minwinbase", "winnt"] }
+winapi = { version = "0.3.9", features = ["handleapi", "winuser", "fileapi", "processthreadsapi", "winbase", "libloaderapi", "minwinbase", "winnt", "processenv"] }
 detours-sys = { path = "vendor/detours-sys", package = "electron-hook-detours-sys", version = "0.1.0" }
 
 [target.'cfg(unix)'.dependencies]

@@ -54,6 +54,13 @@ pub(crate) fn redirect_asar_path(
     custom_asar: &str,
     app_folder: Option<&str>,
 ) -> Option<String> {
+    // Native modules under `app.asar.unpacked/` live on real disk next to the asar; the
+    // substring checks below would otherwise also match `...\app.asar.unpacked\...` and remap
+    // them to `<merged-asar>.unpacked`, which does not exist (ENOENT). Pass them through.
+    if path.contains("app.asar.unpacked") {
+        return None;
+    }
+
     for sep in ['/', '\\'] {
         let original = format!("resources{sep}_app.asar");
         if path.contains(&original) {
@@ -183,6 +190,27 @@ mod tests {
                 None
             ),
             Some("/opt/Discord/resources/app.asar".to_string())
+        );
+    }
+
+    #[test]
+    fn unpacked_native_modules_pass_through_to_real_disk() {
+        // `app.asar.unpacked` must never be remapped to the merged-asar cache + `.unpacked`.
+        assert_eq!(
+            redirect_asar_path(
+                "C:\\Program Files\\WindowsApps\\OpenAI.Codex_2p2nqsd0c76g0\\app\\resources\\app.asar.unpacked\\node_modules\\better-sqlite3\\build\\Release\\better_sqlite3.node",
+                "C:\\Users\\me\\AppData\\Local\\electron-hook\\asar\\tronhawk.asar",
+                Some("app")
+            ),
+            None
+        );
+        assert_eq!(
+            redirect_asar_path(
+                "/opt/Discord/resources/app.asar.unpacked/node_modules/x/index.node",
+                "/tmp/mod.asar",
+                None
+            ),
+            None
         );
     }
 }

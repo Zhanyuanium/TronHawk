@@ -11,4 +11,7 @@ pub mod asar_merge;
 pub mod launch_session;
 
 #[cfg(windows)]
+pub mod attach;
+
+#[cfg(windows)]
 pub mod registry;

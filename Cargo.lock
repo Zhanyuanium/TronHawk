@@ -4469,6 +4469,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tronhawk-ipc",
+ "winapi",
  "winreg 0.52.0",
 ]
 

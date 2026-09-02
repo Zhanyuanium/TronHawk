@@ -311,6 +311,22 @@ module.exports = function bootstrap(originalAsar) {
   runtime.start(app, { runtimeLog, pluginLog, request });
 
   // Load the original app (transparent injection).
+  //
+  // realpathSync workaround (ADR 0001 / ADR 0005): under an MSIX/WindowsApps reparse point,
+  // fs.realpathSync resolves the synthetic `_app.asar` alias to a physical path the asar-remap
+  // hooks can't substring-match, ENOENT-ing before the original app loads. Return the logical
+  // `_app.asar` path unchanged so the hooked lstat/CreateFileW remap it to the real app.asar.
+  const NodeFs = require("fs");
+  const realpathSyncOrig = NodeFs.realpathSync;
+  const realpathNativeOrig = NodeFs.realpathSync.native || realpathSyncOrig;
+  const keepLogicalRealpath = function (p) {
+    const sp = typeof p === "string" ? p : String(p);
+    if (sp.includes("_app.asar")) return sp;
+    return realpathNativeOrig.call(this, p);
+  };
+  NodeFs.realpathSync = keepLogicalRealpath;
+  NodeFs.realpathSync.native = keepLogicalRealpath;
+
   try {
     const pkg = require(path.join(originalAsar, "package.json"));
     require(path.join(originalAsar, pkg.main || "index.js"));
