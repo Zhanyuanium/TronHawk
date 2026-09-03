@@ -15,8 +15,9 @@ completed or superseded are no longer listed.
       developer-mode interim, not the target surface.
 - [ ] MainContext `setVibrancy` / `setMica` (true glass effect) — not wired; only
       `setOpacity` / `setSize` / `setPosition` are implemented.
-- [ ] Plugin `deactivate(ctx)` lifecycle — runtime disposes the QuickJS VM but does not call the
-      plugin's own `deactivate`.
+- [x] Plugin `deactivate(ctx)` lifecycle — resolved: the runtime now invokes the plugin's exported
+      `deactivate` (synchronously, returning `undefined` enforced, double-revoke guarded) before
+      disposing the VM, for both main and renderer plugins.
 - [ ] QuickJS pending-job draining — required before lifecycle hooks may return promises; the
       SDK contract currently enforces synchronous `void` (do not broaden until this lands).
 - [ ] Real-target compatibility — generic **compat adapter** interface landed (Phase A,
@@ -53,16 +54,22 @@ completed or superseded are no longer listed.
 
 ## Package / install hardening
 
-- [ ] `tronhawk` host-version compatibility check — `VersionReq::matches` against the runtime
-      protocol version (currently only syntax-validated).
-- [ ] Archive hardening — duplicate entry names, case-fold collisions, ADS / reserved names,
-      trailing dot/space.
-- [ ] Compression-ratio limit (defend against zip bombs beyond the uncompressed-size cap).
+- [x] `tronhawk` host-version compatibility check — resolved: `validate_tronhawk_protocol` matches
+      the plugin's `tronhawk` `VersionReq` against the host runtime protocol version
+      (`HOST_PROTOCOL_VERSION` const + `_for_host` variants); incompatible plugins are rejected
+      before any write.
+- [x] Archive hardening — resolved: reject duplicate entry names, case-fold collisions, Windows
+      reserved names, trailing dot/space segments, and NTFS ADS syntax, all fail-at-start before any
+      write; `safe_join` applied to every entry.
+- [x] Compression-ratio limit — resolved: per-entry and cumulative ratio guard rejects zip bombs
+      that stay under the existing byte caps.
 - [ ] Error enum (`Result<T, PackageError>` / `CoreError`) replacing `String` errors.
 
 ## Runtime correctness
 
-- [ ] Runtime remove-failure retry (don't swallow `removeInsertedCSS` errors).
+- [x] Runtime remove-failure retry — resolved: `removeInsertedCSS` gets a bounded 3-attempt retry;
+      final failure logs an error and re-registers the key so a later reconcile retries instead of
+      silently dropping stale CSS (window destroyed mid-removal short-circuits cleanly).
 - [ ] CPU-deadline residual: a single never-returning synchronous op in a plugin can still not be
       forcibly reclaimed mid-stack; the interrupt-count anti-catch mitigation covers loops that
       unwind the interrupt but not an op that truly never yields. Honest limitation; watch for a
@@ -93,6 +100,15 @@ completed or superseded are no longer listed.
 
 ## Newly tracked / observations
 
+- [ ] **`tests/integration.ps1` end-to-end gate fails in this environment — injection not reaching
+      the target.** Core events arrive (launch_session/policy/registered) and the target process
+      spawns, but the injected `bootstrap.js` never runs (a module-entry marker file is never
+      written) and no Runtime/Plugin events are recorded. This is an **environment-level
+      `electron-hook`/Detours injection failure**, NOT a regression from the Tier0/DevMode work: a
+      `git stash` to the pre-change baseline reproduces the identical failure. Investigate
+      separately (e.g. Detours/Exploit Protection / antivirus interference, or the vendored
+      electron-hook build against Electron 43.4.1) before relying on this test as a gate. Unit +
+      SDK + CLI + plugin typecheck suites all pass.
 - [ ] **SEC-1 relay residual (accepted-in-threat-model).** `getServerProof` is unauthenticated, so
       a process that can reach an already-running real daemon could obtain proofs. The primary
       port-squat scenario (impostor binds before Core starts) has no daemon to relay to, so the
