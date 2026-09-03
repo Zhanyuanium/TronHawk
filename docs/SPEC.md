@@ -136,7 +136,9 @@ Execution contexts:
   (ADR 0002); `renderer.dom` query/observe is future; localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
   Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
-- **Developer mode** (`runtime.unsafe`): raw Electron/Node, off by default.
+- **Developer mode** (`runtime.unsafe`): raw Electron/Node — opt-in via the Manager Settings view
+  and off by default; a granted plugin executes with the real Node/Electron environment of the
+  injected app (arbitrary code execution, outside the QuickJS sandbox).
 
 Lifecycle: install → enable → load → app start → runtime hooks → unload → disable.
 Events (MVP): `onLoad`, `onUnload`, `onRendererReady`, `onWindowCreated`;
@@ -167,7 +169,7 @@ privileged API verifies permission first.
 | `electron.ipc` | observe / intercept IPC | high |
 | `network.access` | internet access (domain whitelist) | — |
 | `network.proxy` | modify requests | high |
-| `runtime.unsafe` | raw Node / Electron (developer mode) | off by default |
+| `runtime.unsafe` | raw Node / Electron (developer mode) | critical (opt-in, developer mode) |
 
 Install UX: show requested vs not-requested capabilities (accept / reject / details).
 
@@ -179,7 +181,9 @@ MVP UI: Applications (with supported level), Plugins (enable / disable / remove)
 
 Storage root `%LOCALAPPDATA%\TronHawk\` (overridable via `TRONHAWK_STORAGE_ROOT`) → `config/`,
 `plugins/{installed, cache}`, `logs/`, `profiles/`, `runtime/`.
-Config tiers: global (`language`, `developerMode`), application (`enabledPlugins`), plugin (per-plugin settings).
+Config tiers: global (`language`, `developerMode` — set by the Manager Settings view, off by
+default; disabling developer mode purges every `runtime.unsafe` grant), application
+(`enabledPlugins`), plugin (per-plugin settings).
 Logging: three durable streams — Core, Runtime, Plugin. Core owns a bounded JSONL ledger under
 `logs/` with strict Core-generated sequence and attribution; Control may query, a launch session
 may only append its own attributed Runtime/Plugin events, and the Manager displays it read-only.

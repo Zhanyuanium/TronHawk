@@ -25,7 +25,7 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | both | `ctx.ipc.*` | Future |
 | both | `ctx.network.request` (`network.access`) | Future — typed, but Core permission + domain-whitelist enforcement is not wired yet |
 | both | `ctx.config.get` / `ctx.config.set` | Future — config persistence is not wired to a settings store yet |
-| both | `ctx.raw` (`runtime.unsafe`, developer mode) | Future — nothing enables developer mode today |
+| both | `ctx.raw` (`runtime.unsafe`, developer mode) | Implemented — raw host execution while developer mode is on + `runtime.unsafe` granted |
 
 **Lifecycle contract (binding):** `activate`, `deactivate`, and window callbacks must complete
 **synchronously** and return JavaScript `undefined`. The runtime rejects any other result,
@@ -76,7 +76,7 @@ NOT the SDK npm version.
 | `electron.ipc` | observe / intercept IPC (future) | high |
 | `network.access` | `ctx.network.request()` (domain whitelist) | — |
 | `network.proxy` | request interception / modification | high |
-| `runtime.unsafe` | `ctx.raw` (Electron / Node) | dev only |
+| `runtime.unsafe` | `ctx.raw` (Electron / Node) | critical (dev only) |
 
 ## Lifecycle
 
@@ -149,7 +149,24 @@ Forbidden in MVP (future: service API).
 
 ## Developer mode
 
-`ctx.raw.electron` / `ctx.raw.node` only with `runtime.unsafe` permission + developer mode enabled.
+Developer mode is a **deliberate, off-by-default exception** to the sandbox, for plugins you write
+and trust on apps you control. A plugin whose `granted` includes `runtime.unsafe` — possible only
+while developer mode is on (Manager Settings toggle) and the target app is support level 2 — bypasses
+QuickJS entirely: its `main`/`renderer` source runs directly in the **host main process** via
+`new Function`, and `ctx.raw` exposes the real host surfaces:
+
+- `ctx.raw.electron` — the **real Electron module** of the injected app (`require("electron")`).
+- `ctx.raw.node.require` / `ctx.raw.node.process` — the **real Node.js `require` and `process`** of
+  the injected app's main process.
+
+The sandbox limits do **NOT** apply to a raw plugin: no QuickJS VM, **no one-second CPU deadline**,
+and **no memory or stack limits**. Execution is **synchronous in the host main process**, so a raw
+plugin can block the target app indefinitely, hang it, or even call `process.exit()` on it. Side
+effects (files written, processes spawned, network connections opened, app data read) **persist after
+developer mode is turned off** — the runtime cannot undo what raw code already did.
+
+Raw execution is only for plugins you write and trust. A sandboxed plugin never sees `ctx.raw`; it is
+present only with the `runtime.unsafe` grant while developer mode is on.
 
 ## Build
 

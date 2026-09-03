@@ -44,6 +44,9 @@ per-app plugin selection UX, Manager UI).
 ## Security (binding)
 
 - Assume plugin code is untrusted. Verify permission before execution.
+- Developer mode (`runtime.unsafe`) is a deliberate, user-opted exception that executes plugin code
+  with the full Node/Electron environment of the injected app. It must remain off by default, require
+  an explicit Manager toggle plus a per-application grant, and must never be described as sandboxed.
 - Never expose raw filesystem, process execution, or raw Electron/Node without `runtime.unsafe`.
 - Never execute arbitrary package code during install; never trust unvalidated metadata.
 

@@ -66,7 +66,7 @@ shape:
 | `source` | string | ✗ | Source-code URL for review (http/https). Registry-only. |
 | `apps` | AppSupport[] | ✗ | Target-app support matrix. Registry-only. |
 | `thx` | object | ✓ (publishable) | `{ "url": string, "sha256": string }` — download URL and SHA-256 digest. Registry-only. A draft entry may omit it, but is not installable. |
-| `risk` | string | derived | `low` / `medium` / `high`, computed from `permissions`. **Never** declared or manually set. |
+| `risk` | string | derived | `low` / `medium` / `high` / `critical`, computed from `permissions`. **Never** declared or manually set. |
 
 ### `entry` surface
 
@@ -109,7 +109,7 @@ is `low`.
 | `electron.ipc` | high |
 | `network.access` | medium |
 | `network.proxy` | high |
-| `runtime.unsafe` | high (dev only) |
+| `runtime.unsafe` | critical (dev only) |
 
 ### App support matrix (`apps[]`)
 
@@ -212,8 +212,8 @@ The Manager should validate **twice**: at listing time (index browse) and again 
    `version`, `author`, `tronhawk`, `entry`, `permissions`, `config` to the registry entry. **Any**
    difference is a tamper rejection (install aborted). Then follow the normal install flow
    (receive → validate manifest → check permissions → extract → register).
-9. **Permission policy** — block unknown permission ids; `runtime.unsafe` is refused unless the entry
-   is on a dev-verified publisher channel or explicitly approved by the user.
+9. **Permission policy** — block unknown permission ids; `runtime.unsafe` is refused unless developer
+   mode is on AND the user explicitly approves the grant.
 10. **Version gate** — apply the repo SemVer convention (major = breaking) to warn the user before an
     install that changes behavior; a downgrade or identical `id`+`version` re-listing is rejected.
 

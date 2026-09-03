@@ -183,7 +183,7 @@ cross-check are future work and not yet wired into the Manager.
 - **Plugins are untrusted.** They run in an embedded QuickJS sandbox — no
   `document`, `fetch`, `require`, or `process`; raw filesystem, process
   execution, and raw Electron/Node are never exposed without `runtime.unsafe`
-  (developer mode, off by default).
+  (developer mode — an opt-in, per-application exception; see `SECURITY.md`).
 - **Permission gate.** Every privileged API checks the plugin's declared
   permissions first (see the table in `docs/PLUGIN-SDK.md`). Install never
   executes package code; the `.thx` manifest is validated and its extraction is

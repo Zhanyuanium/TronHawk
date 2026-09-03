@@ -10,6 +10,9 @@ completed or superseded are no longer listed.
       sync QuickJS variant cannot drain pending jobs nor host async APIs. Exits: switch to the
       `asyncify` variant (single in-flight async per WASM module, size/speed cost) or run the sync
       VM on a `worker_thread`/`utilityProcess` and bridge over IPC. No decision yet.
+- [ ] Once async host APIs land (`ctx.dom`, `ctx.network`, …), guide normal plugins back to the
+      sandboxed APIs — raw host execution (`ctx.raw`, `runtime.unsafe`, ADR 0007) is the
+      developer-mode interim, not the target surface.
 - [ ] MainContext `setVibrancy` / `setMica` (true glass effect) — not wired; only
       `setOpacity` / `setSize` / `setPosition` are implemented.
 - [ ] Plugin `deactivate(ctx)` lifecycle — runtime disposes the QuickJS VM but does not call the
@@ -64,6 +67,10 @@ completed or superseded are no longer listed.
       forcibly reclaimed mid-stack; the interrupt-count anti-catch mitigation covers loops that
       unwind the interrupt but not an op that truly never yields. Honest limitation; watch for a
       worker/watchdog path later.
+- [ ] Raw-plugin (`runtime.unsafe`) unbounded synchronous loop — developer-mode execution has **no
+      CPU deadline**, so a never-returning synchronous loop can hang the target main process
+      indefinitely. Accepted residual of developer mode (ADR 0007); a `test-app` raw integration
+      test is needed to load a raw plugin end-to-end and lock in the expected behavior.
 
 ## Distribution / compliance
 
@@ -94,9 +101,13 @@ completed or superseded are no longer listed.
 - [ ] **SEC-2 — launch token inherited by target child processes** via `TRONHAWK_IPC_SECRET`
       env. Acceptable today (plugins sandboxed, target trusted); long-term hand off via a dedicated
       FD/socketpair rather than env.
-- [ ] **developerMode / `runtime.unsafe`** — parsed but permanently unreachable (nothing enables
-      developer mode, no capability list includes `runtime.unsafe`). Decide whether to wire a
-      developer-mode toggle for real (feature signal) or remove the dead spec surface.
+- [x] **developerMode / `runtime.unsafe`** — resolved (ADR 0007): developer mode is real. Off by
+      default, it is toggled in the Manager Settings view (`core.developerMode.updated` is logged);
+      `runtime.unsafe` becomes grantable only while developer mode is on AND the app is support level
+      2, and disabling developer mode purges every `runtime.unsafe` grant. A granted plugin runs its
+      `main`/`renderer` source in the host main process via `new Function`, receiving the real
+      Node/Electron environment (`ctx.raw.electron` / `ctx.raw.node`) — no QuickJS sandbox, no CPU
+      deadline, no memory/stack limits.
 - [ ] Workspace `cargo fmt --all --check` drift (pre-existing, out of scope for this batch):
       `apps/manager/src-tauri/src/lib.rs:171`, `crates/injector/src/registry.rs`,
       `crates/package/src/lib.rs`, `vendor/electron-hook/**`. Needs a format-only pass by owners.

@@ -32,8 +32,8 @@ Defense in depth, top to bottom:
   only after JSON serialization — it can never become executable source.
 - **Permission gate.** Every privileged API checks the plugin's declared
   permissions (`docs/PLUGIN-SDK.md`). Nothing is reachable without the matching
-  grant; `runtime.unsafe` (raw Electron/Node, developer mode) is off by default
-  and currently unreachable in practice.
+  grant; `runtime.unsafe` (raw Electron/Node, developer mode) is reachable only
+  in Developer Mode (opt-in).
 - **CPU and memory bounds.** Every evaluation and host-invoked callback runs
   under a one-second CPU deadline with memory and stack limits. Plugins that
   exceed a cumulative interrupt budget are hard-disabled for the current plan
@@ -48,6 +48,23 @@ Defense in depth, top to bottom:
   local socket protected by a control token and HMAC-signed, expiring launch
   tokens; plugin activity is attributed and recorded in Core-owned log
   streams.
+
+### Developer mode (`runtime.unsafe`) is a deliberate exception
+
+Developer mode is the one **user-opted exception** where the security model above
+intentionally does not hold. A plugin granted `runtime.unsafe` while developer
+mode is on executes with the **full Node/Electron environment of the injected
+app's main process** — arbitrary code execution: it can read and write the
+user's files, access the network, read the app's own data (cookies, tokens,
+credentials), spawn child processes, and even call `process.exit()` on the
+target app.
+
+It is **off by default**. Reaching it requires **both** an explicit toggle in
+the Manager's Settings view **and** a per-application grant of `runtime.unsafe`
+(possible only for Level 2 apps); disabling developer mode purges every
+`runtime.unsafe` grant. It is **NEVER sandboxed** — no QuickJS context, no CPU
+deadline, no memory or stack limits. Treat a `runtime.unsafe` grant like
+installing the plugin's code as part of the target app itself.
 
 ## Supported-app boundary
 
@@ -65,9 +82,9 @@ Security properties are claimed only for the **supported configuration**:
 Even at a supported level, the extension layer protects the *system and the
 user's other apps* from a plugin; a plugin the user deliberately grants
 `electron.window` can still restyle or resize windows of the app it targets. A
-plugin with granted high-risk permissions (`electron.ipc`, `network.proxy`,
-`runtime.unsafe`) is equivalent to granting that software elevated reach —
-review permission prompts accordingly.
+plugin with granted high-risk permissions (`electron.ipc`, `network.proxy`) — or
+a `runtime.unsafe` grant (critical; see "Developer mode" above) — is equivalent
+to granting that software elevated reach; review permission prompts accordingly.
 
 ## Reporting a vulnerability
 
