@@ -4,6 +4,7 @@ const permissionDetails = {
   "renderer.css": ["Allows the plugin's renderer CSS to be applied.", "low"],
   "renderer.script": ["Allows the plugin's renderer script to run.", "medium"],
   "electron.window": ["Allows the plugin to work with managed application windows.", "high"],
+  "runtime.unsafe": ["Grants raw Node.js + Electron in the target app — arbitrary code execution. Developer mode only.", "high"],
 };
 
 function presentSnapshot(snapshot) {
@@ -59,6 +60,9 @@ export function createManagerService() {
     },
     async registerApplication(supportLevel) {
       return invoke("register_application", { supportLevel });
+    },
+    async setDeveloperMode(enabled) {
+      return invoke("set_developer_mode", { enabled });
     },
     async queryLogs({ applicationId, stream, beforeSequence, limit }) {
       const params = { limit };

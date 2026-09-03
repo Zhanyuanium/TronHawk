@@ -171,6 +171,13 @@ fn remove_plugin(state: State<'_, ManagerState>, plugin_id: String) -> Result<Va
 }
 
 #[tauri::command]
+fn set_developer_mode(state: State<'_, ManagerState>, enabled: bool) -> Result<Value, String> {
+    state
+        .core
+        .call("setDeveloperMode", json!({ "enabled": enabled }))
+}
+
+#[tauri::command]
 fn install_plugin(
     app: AppHandle,
     state: State<'_, ManagerState>,
@@ -208,7 +215,8 @@ pub fn run() {
             register_application,
             set_application_plugin_policy,
             remove_plugin,
-            install_plugin
+            install_plugin,
+            set_developer_mode
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

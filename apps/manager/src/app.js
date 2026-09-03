@@ -11,17 +11,22 @@ const supportLevelInput = document.querySelector("#support-level");
 const state = {
   view: "applications", status: "loading", applications: [], plugins: [], filter: "all",
   selectedPluginId: undefined, selectedApplicationId: undefined, removePluginId: null,
+  developerMode: false,
   error: "", operationError: "", notice: "", busy: false,
   logs: { events: [], nextBeforeSequence: null, scope: "all", stream: "all", loaded: false, loading: false, loadingOlder: false, error: "" },
 };
-const navItems = [{ id: "applications", symbol: "⌂", label: "Applications" }, { id: "plugins", symbol: "◈", label: "Plugins" }, { id: "permissions", symbol: "◇", label: "Permissions" }, { id: "logs", symbol: "≡", label: "Logs" }];
+const navItems = [{ id: "applications", symbol: "⌂", label: "Applications" }, { id: "plugins", symbol: "◈", label: "Plugins" }, { id: "permissions", symbol: "◇", label: "Permissions" }, { id: "logs", symbol: "≡", label: "Logs" }, { id: "settings", symbol: "⚙︎", label: "Settings" }];
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
 const levelLabel = (level) => level === 2 ? "Level 2 · Electron" : level === 1 ? "Level 1 · Renderer" : "Level 0 · Unsupported";
 const initials = (name) => (name || "?").split(/\s+/).map((word) => word[0]).join("").slice(0, 2).toUpperCase();
 const selectedApplication = () => state.applications.find((application) => application.id === state.selectedApplicationId) || state.applications[0];
 const policyFor = (plugin, applicationId = state.selectedApplicationId) => plugin.applicationPolicies.find((policy) => policy.applicationId === applicationId) || { applicationId, enabled: false, grants: [] };
-const grantsAvailableFor = (application) => application?.supportLevel === 2 ? ["renderer.css", "renderer.script", "electron.window"] : application?.supportLevel === 1 ? ["renderer.css", "renderer.script"] : [];
+const grantsAvailableFor = (application) => {
+  if (application?.supportLevel === 2) return ["renderer.css", "renderer.script", "electron.window", ...(state.developerMode ? ["runtime.unsafe"] : [])];
+  if (application?.supportLevel === 1) return ["renderer.css", "renderer.script"];
+  return [];
+};
 const errorMessage = (error) => error instanceof Error ? error.message : typeof error === "string" ? error : "Core did not complete the request.";
 const validLogLevel = (level) => ["info", "warn", "error"].includes(level) ? level : "info";
 const validLogStream = (stream) => ["core", "runtime", "plugin"].includes(stream) ? stream : "core";
@@ -75,6 +80,14 @@ function renderPermissions() {
 }
 function permissionRow(permission, granted, pluginId, available) { const [description, risk] = service.getPermissionDetails(permission); const label = available ? (granted ? "Granted" : "Withheld") : "Unavailable here"; return `<div class="permission-row"><div><code>${escapeHtml(permission)}</code><span>${escapeHtml(description)} <i class="risk-badge risk-${risk}">${escapeHtml(risk)} risk</i></span></div><label class="permission-control"><input type="checkbox" data-toggle-grant="${escapeHtml(permission)}" data-plugin-id="${escapeHtml(pluginId)}" ${granted ? "checked" : ""} ${state.busy || !available ? "disabled" : ""} aria-label="${granted ? "Revoke" : "Grant"} ${escapeHtml(permission)} for the selected application"><span>${label}</span></label></div>`; }
 
+function renderSettings() {
+  const developerMode = Boolean(state.developerMode);
+  const toggle = `<label class="switch" title="${developerMode ? "Developer mode is on. Click to turn it off." : "Developer mode is off. Click to turn it on."}"><input type="checkbox" data-toggle-developer-mode ${developerMode ? "checked" : ""} ${state.busy ? "disabled" : ""} aria-label="${developerMode ? "Disable" : "Enable"} developer mode"><span class="slider"></span></label>`;
+  const warning = developerMode ? `<div class="error-banner" role="alert" style="margin:0;"><span>Plugins granted runtime.unsafe run with full Node/Electron access in the target app — they can read files, access the network, read app data, and even terminate the app. Only enable for plugins you wrote or fully trust.</span></div>` : "";
+  const guide = `<div class="stream-guide" style="margin:0;"><div><strong>Node.js + Electron</strong><span>runtime.unsafe is the SDK’s strongest capability: a granted plugin runs with full process access inside the target app.</span></div><div><strong>Level 2 applications</strong><span>While developer mode is on, the Permissions view lists runtime.unsafe as grantable for applications registered at Level 2.</span></div><div><strong>Reversible</strong><span>Turning developer mode off takes runtime.unsafe out of the grantable set. Existing application policies are left untouched.</span></div></div>`;
+  return `${pageHeader("Manager settings", "Settings", "Control-plane options that decide which capabilities Core can grant to installed plugins.")}<section style="display:grid;gap:18px;max-width:900px;"><article class="panel"><header class="panel-header"><div><h2>Developer mode</h2><p class="muted" style="margin:3px 0 0;font-size:12px;">Unlock capabilities Core withholds from normal plugin policies.</p></div>${toggle}</header><div style="padding:22px;display:grid;gap:15px;">${warning}<p class="muted" style="margin:0;">Developer mode gates the most powerful plugin permissions behind an explicit choice. Leave it off unless you need to grant runtime.unsafe to a plugin you wrote or fully trust.</p>${guide}<p class="permission-note" style="margin:0;">While developer mode is off, runtime.unsafe is not part of any application’s grantable capabilities, so Core will not apply new grants for it.</p></div></article></section>`;
+}
+
 function renderLogs() {
   const application = selectedApplication();
   const logs = state.logs;
@@ -105,7 +118,7 @@ function logRow(event) {
 }
 
 function render() {
-  const body = state.status === "loading" ? loading() : state.status === "error" ? failure() : state.view === "applications" ? renderApplications() : state.view === "plugins" ? renderPlugins() : state.view === "permissions" ? renderPermissions() : renderLogs();
+  const body = state.status === "loading" ? loading() : state.status === "error" ? failure() : state.view === "applications" ? renderApplications() : state.view === "plugins" ? renderPlugins() : state.view === "permissions" ? renderPermissions() : state.view === "settings" ? renderSettings() : renderLogs();
   appRoot.innerHTML = state.status === "ready" ? layout(body) : `<main class="content"><div class="page">${body}</div></main>`;
 }
 
@@ -114,6 +127,7 @@ async function refreshSnapshot(initial = false) {
   const snapshot = await service.getSnapshot();
   state.applications = snapshot.applications;
   state.plugins = snapshot.plugins;
+  state.developerMode = Boolean(snapshot.developerMode);
   if (!state.applications.some((application) => application.id === state.selectedApplicationId)) state.selectedApplicationId = state.applications[0]?.id;
   if (!state.plugins.some((plugin) => plugin.id === state.selectedPluginId)) state.selectedPluginId = state.plugins[0]?.id;
   state.status = "ready";
@@ -206,6 +220,11 @@ appRoot.addEventListener("change", async (event) => {
   }
   if (event.target.matches("[data-log-scope]")) { state.logs.scope = event.target.value; queryLogs(); return; }
   if (event.target.matches("[data-log-stream]")) { state.logs.stream = event.target.value; queryLogs(); return; }
+  if (event.target.matches("[data-toggle-developer-mode]")) {
+    const enabled = event.target.checked;
+    await perform(() => service.setDeveloperMode(enabled), enabled ? "Developer mode enabled." : "Developer mode disabled.");
+    return;
+  }
   if (event.target.matches("[data-toggle-policy]")) {
     const plugin = state.plugins.find((entry) => entry.id === event.target.dataset.togglePolicy);
     const policy = plugin && policyFor(plugin);
