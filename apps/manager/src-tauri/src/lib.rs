@@ -62,6 +62,18 @@ fn get_manager_snapshot(state: State<'_, ManagerState>) -> Result<Value, String>
         .and_then(redact_manager_snapshot)
 }
 
+/// Launches a registered application with extensions. Unlike `get_manager_snapshot`, this
+/// command does NOT redact the snapshot it reads: the executable path is resolved in Rust and
+/// handed straight to the co-located injector launcher, and only a fixed `{ "launched": true }`
+/// acknowledgment (or a fixed, path-free error) ever crosses the WebView boundary.
+#[tauri::command]
+fn launch_application(
+    state: State<'_, ManagerState>,
+    application_id: String,
+) -> Result<Value, String> {
+    state.core.launch(&application_id)
+}
+
 #[tauri::command]
 fn query_logs(
     state: State<'_, ManagerState>,
@@ -163,6 +175,48 @@ fn set_application_plugin_policy(
     )
 }
 
+/// Reads the stored per-plugin config (schema defaults merged with stored values) for one
+/// application. A thin passthrough to Core's `getPluginConfig` control RPC; the returned object
+/// holds only schema-declared scalar values, never paths or credentials.
+#[tauri::command]
+fn get_plugin_config(
+    state: State<'_, ManagerState>,
+    application_id: String,
+    plugin_id: String,
+) -> Result<Value, String> {
+    state.core.call(
+        "getPluginConfig",
+        json!({
+            "applicationId": application_id,
+            "pluginId": plugin_id,
+        }),
+    )
+}
+
+/// Replaces the whole stored config object for one application + plugin. A thin passthrough to
+/// Core's `setPluginConfig` control RPC; Core validates every key against the plugin's manifest
+/// schema and rejects unknown keys or type mismatches, so the config field is validated to be a
+/// JSON object here before it is ever forwarded.
+#[tauri::command]
+fn set_plugin_config(
+    state: State<'_, ManagerState>,
+    application_id: String,
+    plugin_id: String,
+    config: Value,
+) -> Result<Value, String> {
+    if !config.is_object() {
+        return Err("plugin config must be a JSON object".to_owned());
+    }
+    state.core.call(
+        "setPluginConfig",
+        json!({
+            "applicationId": application_id,
+            "pluginId": plugin_id,
+            "config": config,
+        }),
+    )
+}
+
 #[tauri::command]
 fn remove_plugin(state: State<'_, ManagerState>, plugin_id: String) -> Result<Value, String> {
     state
@@ -211,9 +265,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_manager_snapshot,
+            launch_application,
             query_logs,
             register_application,
             set_application_plugin_policy,
+            get_plugin_config,
+            set_plugin_config,
             remove_plugin,
             install_plugin,
             set_developer_mode

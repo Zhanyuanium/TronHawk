@@ -1,5 +1,27 @@
 $ErrorActionPreference = "Stop"
 
+# Stages the Manager's co-located Tauri sidecars/resources:
+#   - tronhawk-core (externalBin) for CoreClient::ensure_core_available
+#   - the injector unit (tronhawk-injector-launcher externalBin + tronhawk_injector.dll,
+#     bootstrap.js, runtime.js resources) for CoreClient::launch
+#
+# Deploy layout (Windows):
+#   src-tauri/binaries/
+#     tronhawk-core-<host-triple>.exe               -> externalBin sidecar; Tauri strips the
+#                                                     triple so the dev/bundled layout has
+#                                                     tronhawk-core.exe next to the Manager exe
+#     tronhawk-injector-launcher-<host-triple>.exe  -> externalBin sidecar; stripped to
+#                                                     tronhawk-injector-launcher.exe next to the
+#                                                     Manager exe (launcher_executable() lookup)
+#     tronhawk_injector.dll                         -> bundle.resources (target "")
+#     bootstrap.js                                  -> bundle.resources (target "")
+#     runtime.js                                    -> bundle.resources (target "")
+#
+# tauri-build copies externalBin sidecars and the empty-target resources into the build profile
+# dir next to the Manager binary, so dev runs find every artifact beside the Manager exe. The
+# injector launcher resolves tronhawk_injector.dll/bootstrap.js/runtime.js relative to its own
+# executable, so all four must stay co-located in any packaged layout as well.
+
 $managerRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $repoRoot = (Resolve-Path (Join-Path $managerRoot "..\..")).Path
 $manifest = Join-Path $repoRoot "Cargo.toml"
@@ -14,24 +36,71 @@ if ($null -eq $hostLine -or $hostLine -notmatch '^host:\s+([^\s]+)\s*$') {
 }
 $hostTriple = $Matches[1]
 
+$extension = if ($IsWindows) { ".exe" } else { "" }
+$releaseDir = Join-Path $repoRoot "target\release"
+$binaries = Join-Path $managerRoot "src-tauri\binaries"
+New-Item -ItemType Directory -Force -Path $binaries | Out-Null
+
+# --- Core sidecar (unchanged behavior) ---
 Write-Output "[manager] building tronhawk-core for $hostTriple"
 & cargo build --manifest-path $manifest --package tronhawk-core --release
 if ($LASTEXITCODE -ne 0) {
     throw "tronhawk-core release build failed with exit code $LASTEXITCODE"
 }
 
-$extension = if ($IsWindows) { ".exe" } else { "" }
-$source = Join-Path $repoRoot ("target\release\tronhawk-core" + $extension)
-if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+$coreSource = Join-Path $releaseDir ("tronhawk-core" + $extension)
+if (-not (Test-Path -LiteralPath $coreSource -PathType Leaf)) {
     throw "tronhawk-core release build did not produce the expected host executable"
 }
 
-$binaries = Join-Path $managerRoot "src-tauri\binaries"
-New-Item -ItemType Directory -Force -Path $binaries | Out-Null
-$destination = Join-Path $binaries ("tronhawk-core-" + $hostTriple + $extension)
-Copy-Item -LiteralPath $source -Destination $destination -Force
+$coreDestination = Join-Path $binaries ("tronhawk-core-" + $hostTriple + $extension)
+Copy-Item -LiteralPath $coreSource -Destination $coreDestination -Force
 
-if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+if (-not (Test-Path -LiteralPath $coreDestination -PathType Leaf)) {
     throw "failed to stage the tronhawk-core sidecar"
 }
 Write-Output "[manager] staged tronhawk-core sidecar for Tauri"
+
+# --- Injector unit (launcher + dll + bootstrap/runtime) ---
+Write-Output "[manager] building tronhawk-injector for $hostTriple"
+& cargo build --manifest-path $manifest --package tronhawk-injector --release
+if ($LASTEXITCODE -ne 0) {
+    throw "tronhawk-injector release build failed with exit code $LASTEXITCODE"
+}
+
+$launcherSource = Join-Path $releaseDir ("tronhawk-injector-launcher" + $extension)
+if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) {
+    throw "tronhawk-injector release build did not produce tronhawk-injector-launcher"
+}
+
+$launcherDestination = Join-Path $binaries ("tronhawk-injector-launcher-" + $hostTriple + $extension)
+Copy-Item -LiteralPath $launcherSource -Destination $launcherDestination -Force
+
+# The injector dll name is platform-specific (Windows: tronhawk_injector.dll).
+$dllName = if ($IsWindows) {
+    "tronhawk_injector.dll"
+} elseif ($IsLinux) {
+    "libtronhawk_injector.so"
+} else {
+    "libtronhawk_injector.dylib"
+}
+$dllSource = Join-Path $releaseDir $dllName
+if (-not (Test-Path -LiteralPath $dllSource -PathType Leaf)) {
+    throw "tronhawk-injector release build did not produce $dllName"
+}
+Copy-Item -LiteralPath $dllSource -Destination (Join-Path $binaries $dllName) -Force
+
+foreach ($pair in @(
+        @((Join-Path $repoRoot "crates\injector\assets\bootstrap.js"), "bootstrap.js"),
+        @((Join-Path $repoRoot "crates\runtime\assets\runtime.js"), "runtime.js")
+    )) {
+    if (-not (Test-Path -LiteralPath $pair[0] -PathType Leaf)) {
+        throw "missing injector asset $($pair[1]) at $($pair[0]) (runtime.js is generated by 'bun run build' in crates/runtime/js)"
+    }
+    Copy-Item -LiteralPath $pair[0] -Destination (Join-Path $binaries $pair[1]) -Force
+}
+
+if (-not (Test-Path -LiteralPath $launcherDestination -PathType Leaf)) {
+    throw "failed to stage the tronhawk-injector-launcher sidecar"
+}
+Write-Output "[manager] staged injector launcher, $dllName, bootstrap.js, and runtime.js for Tauri"

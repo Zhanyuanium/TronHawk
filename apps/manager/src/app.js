@@ -12,6 +12,9 @@ const state = {
   view: "applications", status: "loading", applications: [], plugins: [], filter: "all",
   selectedPluginId: undefined, selectedApplicationId: undefined, removePluginId: null,
   developerMode: false,
+  // Effective per-plugin config values for the selected application × plugin ("applicationId|pluginId").
+  // `configValues` is null until the scope's stored values have been read (or the scope declares none).
+  configScope: "", configValues: null, configGeneration: 0,
   error: "", operationError: "", notice: "", busy: false,
   logs: { events: [], nextBeforeSequence: null, scope: "all", stream: "all", loaded: false, loading: false, loadingOlder: false, error: "" },
 };
@@ -59,7 +62,13 @@ function renderApplications() {
   return `${pageHeader("Overview", "Your extension workspace", "Manage installed plugins and application-scoped Core policies.", addApplicationAction())}${applicationContext()}<section class="summary-grid"><article class="summary-card featured"><span class="summary-label">Connection state</span><span class="summary-value">Core connected</span><span class="summary-detail">${application ? `Policies shown for ${escapeHtml(application.name)}.` : "Add an application to begin setting plugin policies."}</span></article><article class="summary-card"><span class="summary-label">Applications</span><strong class="summary-value">${state.applications.length}</strong><span class="summary-detail">Registered with Core</span></article><article class="summary-card"><span class="summary-label">Enabled here</span><strong class="summary-value">${active}</strong><span class="summary-detail">${application ? "Policies for this application" : "Choose an application to review policies"}</span></article></section><section class="dashboard-grid"><article class="panel"><header class="panel-header"><h2>Applications</h2><span class="summary-detail">${state.applications.length ? "Choose a policy scope" : "Start with a registered executable"}</span></header><div class="application-list">${state.applications.length ? state.applications.map(appCard).join("") : emptyApplications()}</div></article><aside class="panel"><header class="panel-header"><h2>Core activity</h2><button class="text-link" data-view="logs">View log status</button></header><div class="activity-pending"><i class="activity-dot"></i><div><strong>Awaiting Core ingestion</strong><span>Activity is not included in the Manager snapshot.</span></div></div></aside></section>`;
 }
 function emptyApplications() { return `<section class="empty-application-state"><div class="state-icon">＋</div><h3>Add your first application</h3><p>Choose a support level, then select an executable in the native picker. Core will register it as a policy scope.</p><button class="button button-primary" data-add-application ${state.busy ? "disabled" : ""}>Add application</button></section>`; }
-function appCard(application) { return `<button class="app-card ${application.id === state.selectedApplicationId ? "is-selected" : ""}" data-select-application="${escapeHtml(application.id)}" aria-pressed="${application.id === state.selectedApplicationId}"><span class="app-icon" data-tone="${applicationTone(application.id)}">${initials(application.name)}</span><div><h3>${escapeHtml(application.name)}</h3><span class="app-meta">Registered local executable</span><span class="support-badge level-${application.supportLevel}">${levelLabel(application.supportLevel)}</span></div><span class="app-plugin-count">${application.enabledPluginCount} enabled</span></button>`; }
+function appCard(application) {
+  const selected = application.id === state.selectedApplicationId;
+  const canLaunch = application.supportLevel > 0;
+  const launchLabel = `Launch ${application.name} with extensions`;
+  const launchHelp = canLaunch ? launchLabel : "Level 0 applications cannot be launched with extensions";
+  return `<article class="app-card ${selected ? "is-selected" : ""}" data-select-application="${escapeHtml(application.id)}" role="button" tabindex="0" aria-pressed="${selected}" aria-label="Select ${escapeHtml(application.name)} as the policy scope" style="cursor:pointer;"><span class="app-icon" data-tone="${applicationTone(application.id)}">${initials(application.name)}</span><div><h3>${escapeHtml(application.name)}</h3><span class="app-meta">Registered local executable</span><span class="support-badge level-${application.supportLevel}">${levelLabel(application.supportLevel)}</span></div><div style="display:flex;align-items:center;gap:16px;"><span class="app-plugin-count">${application.enabledPluginCount} enabled</span><button type="button" class="button button-quiet" style="min-height:32px;padding:6px 12px;font-size:12px;" data-launch="${escapeHtml(application.id)}" ${!canLaunch || state.busy ? "disabled" : ""} title="${escapeHtml(launchHelp)}" aria-label="${escapeHtml(launchHelp)}">Launch</button></div></article>`;
+}
 
 function renderPlugins() {
   const application = selectedApplication();
@@ -70,15 +79,72 @@ function renderPlugins() {
 function pluginCard(plugin) { const policy = policyFor(plugin); const scopedCount = plugin.applicationPolicies.length; const canEnable = selectedApplication()?.supportLevel > 0; return `<article class="plugin-card"><div class="plugin-top"><div class="plugin-icon">${initials(plugin.name)}</div><div class="plugin-title"><h3>${escapeHtml(plugin.name)}</h3><span class="version">v${escapeHtml(plugin.version)}</span></div><label class="switch" title="${canEnable ? `${policy.enabled ? "Disable" : "Enable"} ${escapeHtml(plugin.name)} for the selected application` : "Level 0 applications cannot enable plugins"}"><input type="checkbox" data-toggle-policy="${escapeHtml(plugin.id)}" ${policy.enabled ? "checked" : ""} ${state.busy || !canEnable ? "disabled" : ""} aria-label="${policy.enabled ? "Disable" : "Enable"} ${escapeHtml(plugin.name)} for the selected application"><span class="slider"></span></label></div><p class="plugin-description">Author: ${escapeHtml(plugin.author)} · Requires TronHawk ${escapeHtml(plugin.tronhawk)}</p><footer class="plugin-footer"><span class="plugin-target">${scopedCount} app ${scopedCount === 1 ? "policy" : "policies"}</span><div class="plugin-actions"><button class="detail-link" data-permissions="${escapeHtml(plugin.id)}">Permissions</button><button class="button button-icon" data-remove="${escapeHtml(plugin.id)}" ${state.busy ? "disabled" : ""} aria-label="Remove ${escapeHtml(plugin.name)}">×</button></div></footer></article>`; }
 
 function renderPermissions() {
+  syncPluginConfig();
   const selected = state.plugins.find((plugin) => plugin.id === state.selectedPluginId) || state.plugins[0];
   const application = selectedApplication();
   if (!application) return `${pageHeader("Safety review", "Permissions", "Add an application before reviewing application-scoped grants.", addApplicationAction())}<section class="state"><div><div class="state-icon">＋</div><h2>Add an application first</h2><p class="muted">The native picker will register an executable in Core and create a policy scope for its plugin grants.</p><button class="button button-primary" data-add-application ${state.busy ? "disabled" : ""}>Add application</button></div></section>`;
   if (!selected) return `${pageHeader("Safety review", "Permissions", "Review the capabilities requested by each installed package.")}${applicationContext()}<section class="state"><div><div class="state-icon">◇</div><h2>No plugins to review</h2><p class="muted">Installed packages will appear here.</p></div></section>`;
   const policy = policyFor(selected);
   const requested = selected.requested.map((permission) => permissionRow(permission, policy.grants.includes(permission), selected.id, grantsAvailableFor(application).includes(permission))).join("");
-  return `${pageHeader("Safety review", "Permissions", "Grants belong to the selected application policy and are saved through Core.")}${applicationContext()}<section class="permission-layout"><aside class="plugin-picker"><span class="picker-label">Installed plugins</span>${state.plugins.map((plugin) => `<button class="picker-button ${plugin.id === selected.id ? "is-selected" : ""}" data-select-plugin="${escapeHtml(plugin.id)}">${escapeHtml(plugin.name)}<small>${policyFor(plugin).enabled ? "Enabled" : "Disabled"} for ${escapeHtml(application.name)}</small></button>`).join("")}</aside><article class="panel permission-panel"><header class="permission-plugin-head"><div class="plugin-icon">${initials(selected.name)}</div><div><h2>${escapeHtml(selected.name)}</h2><span class="version">${escapeHtml(application.name)} policy · v${escapeHtml(selected.version)}</span></div></header><section class="permission-section"><div class="section-title">Requested capabilities <span class="section-count">${selected.requested.length}</span></div><div class="permission-list">${requested || '<p class="empty-inline">This package did not request any capabilities.</p>'}</div></section><p class="permission-note">Only capabilities available at ${escapeHtml(levelLabel(application.supportLevel))} can be granted. Grant changes preserve the rest of this plugin’s policy.</p></article></section>`;
+  const settings = configSettingsSection(selected, application);
+  return `${pageHeader("Safety review", "Permissions", "Grants belong to the selected application policy and are saved through Core.")}${applicationContext()}<section class="permission-layout"><aside class="plugin-picker"><span class="picker-label">Installed plugins</span>${state.plugins.map((plugin) => `<button class="picker-button ${plugin.id === selected.id ? "is-selected" : ""}" data-select-plugin="${escapeHtml(plugin.id)}">${escapeHtml(plugin.name)}<small>${policyFor(plugin).enabled ? "Enabled" : "Disabled"} for ${escapeHtml(application.name)}</small></button>`).join("")}</aside><article class="panel permission-panel"><header class="permission-plugin-head"><div class="plugin-icon">${initials(selected.name)}</div><div><h2>${escapeHtml(selected.name)}</h2><span class="version">${escapeHtml(application.name)} policy · v${escapeHtml(selected.version)}</span></div></header><section class="permission-section"><div class="section-title">Requested capabilities <span class="section-count">${selected.requested.length}</span></div><div class="permission-list">${requested || '<p class="empty-inline">This package did not request any capabilities.</p>'}</div></section>${settings}<p class="permission-note">Only capabilities available at ${escapeHtml(levelLabel(application.supportLevel))} can be granted. Grant changes preserve the rest of this plugin’s policy.</p></article></section>`;
 }
 function permissionRow(permission, granted, pluginId, available) { const [description, risk] = service.getPermissionDetails(permission); const label = available ? (granted ? "Granted" : "Withheld") : "Unavailable here"; return `<div class="permission-row"><div><code>${escapeHtml(permission)}</code><span>${escapeHtml(description)} <i class="risk-badge risk-${risk}">${escapeHtml(risk)} risk</i></span></div><label class="permission-control"><input type="checkbox" data-toggle-grant="${escapeHtml(permission)}" data-plugin-id="${escapeHtml(pluginId)}" ${granted ? "checked" : ""} ${state.busy || !available ? "disabled" : ""} aria-label="${granted ? "Revoke" : "Grant"} ${escapeHtml(permission)} for the selected application"><span>${label}</span></label></div>`; }
+const configFieldType = (field) => { const type = field && field.type; return type === "number" || type === "boolean" ? type : "string"; };
+function configFieldValue(key, field) {
+  const values = state.configValues && typeof state.configValues === "object" ? state.configValues : {};
+  if (Object.prototype.hasOwnProperty.call(values, key)) return values[key];
+  if (field && field.default !== undefined && field.default !== null) return field.default;
+  return undefined;
+}
+function configSettingsSection(selected, application) {
+  const schema = selected.configSchema && typeof selected.configSchema === "object" ? selected.configSchema : {};
+  const keys = Object.keys(schema);
+  if (!keys.length) return "";
+  return `<section class="permission-section"><div class="section-title">Plugin settings <span class="section-count">${keys.length}</span></div><div class="permission-list">${keys.map((key) => configFieldRow(selected.id, key, schema[key])).join("")}</div><p class="muted" style="margin:11px 2px 0;font-size:12px;">Settings are stored per application and included in ${escapeHtml(application.name)}’s launch plan. A change updates the running plugin within a couple of seconds (the runtime reloads it with the new plan).</p></section>`;
+}
+function configFieldRow(pluginId, key, field) {
+  const type = configFieldType(field);
+  const label = field && field.label ? String(field.label) : key;
+  const fieldId = `th-config-${[pluginId, key].map((part) => encodeURIComponent(part)).join("-")}`;
+  const shared = `data-config-field="${escapeHtml(key)}" data-config-type="${type}" data-plugin-id="${escapeHtml(pluginId)}"`;
+  const heading = `<strong style="display:block;color:#e2f3ee;font:600 13px/1.25 'Bahnschrift','Segoe UI Variable Display','Segoe UI',sans-serif;">${escapeHtml(label)}</strong><span>${escapeHtml(label === key ? `${type} field` : `${key} · ${type}`)}</span>`;
+  if (type === "boolean") {
+    const checked = configFieldValue(key, field) === true;
+    const aria = escapeHtml(`${checked ? "Turn off" : "Turn on"} ${label} for the selected application`);
+    return `<div class="permission-row"><div>${heading}</div><label class="permission-control"><input type="checkbox" id="${fieldId}" ${shared} ${checked ? "checked" : ""} ${state.busy ? "disabled" : ""} aria-label="${aria}"><span>${checked ? "On" : "Off"}</span></label></div>`;
+  }
+  const value = configFieldValue(key, field);
+  const text = value === undefined ? "" : String(value);
+  const inputStyle = "width:100%;min-width:0;padding:8px 10px;color:#e2f3ee;border:1px solid rgba(206,239,229,.18);border-radius:8px;background:#172c3a;font:500 12px/1.2 'Cascadia Mono','Consolas',monospace;";
+  const aria = escapeHtml(`${label} (${type}) for the selected application`);
+  const input = `<input type="${type === "number" ? "number" : "text"}" id="${fieldId}" ${shared} value="${escapeHtml(text)}" style="${inputStyle}" ${state.busy ? "disabled" : ""} aria-label="${aria}">`;
+  return `<div class="permission-row" style="grid-template-columns:minmax(0,1fr) minmax(150px,240px);"><label for="${fieldId}" style="display:block;min-width:0;cursor:pointer;">${heading}</label>${input}</div>`;
+}
+async function syncPluginConfig() {
+  const application = selectedApplication();
+  const selected = state.plugins.find((plugin) => plugin.id === state.selectedPluginId) || state.plugins[0];
+  const schema = selected && selected.configSchema && typeof selected.configSchema === "object" ? selected.configSchema : {};
+  if (!application || !selected || !Object.keys(schema).length) { state.configScope = ""; state.configValues = null; return; }
+  const scope = `${application.id}|${selected.id}`;
+  if (state.configScope === scope) return;
+  state.configScope = scope;
+  state.configValues = null;
+  const applicationId = application.id;
+  const pluginId = selected.id;
+  const generation = state.configGeneration;
+  try {
+    const result = await service.getPluginConfig(applicationId, pluginId);
+    const values = result && typeof result === "object" && result.config && typeof result.config === "object" ? result.config : {};
+    if (generation !== state.configGeneration) return;
+    if (applicationId !== state.selectedApplicationId || pluginId !== state.selectedPluginId) return;
+    state.configValues = values;
+    if (state.view === "permissions") render();
+  } catch {
+    // A failed read keeps the schema defaults visible; the scope marker stays set so a failing
+    // read is not retried on every render while this plugin/application remains selected.
+  }
+}
 
 function renderSettings() {
   const developerMode = Boolean(state.developerMode);
@@ -196,11 +262,20 @@ async function perform(action, successMessage, canceledMessage = null) {
 }
 
 appRoot.addEventListener("click", async (event) => {
-  const button = event.target.closest("button"); if (!button || button.disabled) return;
+  const launchButton = event.target.closest("button[data-launch]");
+  const selectCard = event.target.closest("[data-select-application]");
+  const button = event.target.closest("button");
+  if (button && button.disabled) return;
+  if (launchButton) {
+    if (launchButton.disabled) return;
+    await perform(() => service.launchApplication(launchButton.dataset.launch), "Launched with extensions.");
+    return;
+  }
+  if (selectCard) { state.selectedApplicationId = selectCard.dataset.selectApplication; render(); return; }
+  if (!button || button.disabled) return;
   if (button.dataset.dismissFeedback !== undefined) { state.notice = ""; state.operationError = ""; render(); return; }
   if (button.dataset.view) { state.view = button.dataset.view; render(); if (state.view === "logs") queryLogs(); return; }
   if (button.dataset.filter) { state.filter = button.dataset.filter; render(); return; }
-  if (button.dataset.selectApplication) { state.selectedApplicationId = button.dataset.selectApplication; render(); return; }
   if (button.dataset.permissions) { state.selectedPluginId = button.dataset.permissions; state.view = "permissions"; render(); return; }
   if (button.dataset.selectPlugin) { state.selectedPluginId = button.dataset.selectPlugin; render(); return; }
   if (button.dataset.refreshLogs !== undefined) { queryLogs(); return; }
@@ -209,6 +284,17 @@ appRoot.addEventListener("click", async (event) => {
   if (button.dataset.install !== undefined) { if (await perform(() => service.installPlugin(), "Plugin installed. Review its requested capabilities before enabling it.", "No plugin was selected. Installation was canceled.")) state.view = "plugins"; render(); return; }
   if (button.dataset.remove) { const plugin = state.plugins.find((entry) => entry.id === button.dataset.remove); state.removePluginId = plugin?.id ?? null; document.querySelector("#remove-title").textContent = `Remove ${plugin?.name ?? "plugin"}?`; removeDialog.showModal(); return; }
   if (button.dataset.retry !== undefined) load();
+});
+
+// The selectable application card is an element with `role="button"`, so Enter/Space on the
+// focused card selects it exactly like the previous native-button card did.
+appRoot.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const card = event.target instanceof Element ? event.target.closest("[data-select-application]") : null;
+  if (!card || card !== event.target) return;
+  event.preventDefault();
+  state.selectedApplicationId = card.dataset.selectApplication;
+  render();
 });
 
 appRoot.addEventListener("change", async (event) => {
@@ -238,6 +324,33 @@ appRoot.addEventListener("change", async (event) => {
       const grants = event.target.checked ? [...new Set([...policy.grants, grant])] : policy.grants.filter((entry) => entry !== grant);
       await perform(() => service.setApplicationPluginPolicy(state.selectedApplicationId, plugin.id, { enabled: policy.enabled, grants }), "Plugin policy updated.");
     }
+  }
+  if (event.target.matches("[data-config-field]")) {
+    const plugin = state.plugins.find((entry) => entry.id === event.target.dataset.pluginId);
+    const applicationId = state.selectedApplicationId;
+    const key = event.target.dataset.configField;
+    const type = event.target.dataset.configType;
+    const schema = plugin && plugin.configSchema && typeof plugin.configSchema === "object" ? plugin.configSchema : {};
+    if (!plugin || !applicationId || !key || !type || !schema[key]) return;
+    state.configGeneration += 1;
+    const checked = event.target.checked;
+    const raw = event.target.value;
+    const hasValue = raw !== "";
+    const number = event.target.valueAsNumber;
+    await perform(async () => {
+      // setPluginConfig REPLACES the whole stored object, so re-read the stored config first and
+      // write back the full desired state — otherwise the untouched keys would be dropped.
+      const current = await service.getPluginConfig(applicationId, plugin.id);
+      const base = current && typeof current === "object" && current.config && typeof current.config === "object" ? { ...current.config } : {};
+      if (type === "boolean") base[key] = checked;
+      else if (type === "number") { if (hasValue && Number.isFinite(number)) base[key] = number; else delete base[key]; }
+      else base[key] = raw;
+      const result = await service.setPluginConfig(applicationId, plugin.id, base);
+      if (result && typeof result === "object" && result.config && typeof result.config === "object") state.configValues = result.config;
+      else state.configValues = base;
+      return result;
+    }, "Plugin settings updated.");
+    return;
   }
 });
 

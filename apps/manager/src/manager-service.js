@@ -22,6 +22,7 @@ function presentSnapshot(snapshot) {
     author: plugin.author,
     tronhawk: plugin.tronhawk,
     requested: plugin.requestedPermissions ?? [],
+    configSchema: plugin.config ?? {},
     applicationPolicies: applications.flatMap((application) => {
       const policy = application.policies[plugin.id];
       return policy ? [{ applicationId: application.id, enabled: policy.enabled, grants: policy.grants ?? [] }] : [];
@@ -44,6 +45,9 @@ export function createManagerService() {
     async getSnapshot() {
       return presentSnapshot(await invoke("get_manager_snapshot"));
     },
+    async launchApplication(applicationId) {
+      return invoke("launch_application", { applicationId });
+    },
     async setApplicationPluginPolicy(applicationId, pluginId, policy) {
       return invoke("set_application_plugin_policy", {
         applicationId,
@@ -51,6 +55,12 @@ export function createManagerService() {
         enabled: policy.enabled,
         grants: policy.grants,
       });
+    },
+    async getPluginConfig(applicationId, pluginId) {
+      return invoke("get_plugin_config", { applicationId, pluginId });
+    },
+    async setPluginConfig(applicationId, pluginId, config) {
+      return invoke("set_plugin_config", { applicationId, pluginId, config });
     },
     async removePlugin(pluginId) {
       return invoke("remove_plugin", { pluginId });
