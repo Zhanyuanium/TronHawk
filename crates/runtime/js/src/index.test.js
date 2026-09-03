@@ -439,3 +439,153 @@ describe("CSS removal retry", () => {
     10000,
   );
 });
+
+// ===========================================================================
+// Plugin ctx.config (per-plugin config snapshot from the execution plan)
+// ===========================================================================
+
+const CONFIG_MAIN_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.logger.info("cfg-main-activate-opacity=" + ctx.config.get("opacity"));
+    ctx.logger.info("cfg-main-mode=" + ctx.config.get("mode"));
+    ctx.logger.info("cfg-main-debug=" + ctx.config.get("debug"));
+    ctx.logger.info("cfg-main-missing=" + ctx.config.get("nope"));
+    ctx.logger.info("cfg-main-nonstring-key=" + String(ctx.config.get(123)));
+    ctx.logger.info("cfg-main-set-returns=" + String(ctx.config.set("opacity", 0.99)));
+    ctx.logger.info("cfg-main-after-set=" + ctx.config.get("opacity"));
+    ctx.logger.info("cfg-main-activate-ran");
+  },
+  deactivate(ctx) {
+    ctx.logger.info("cfg-main-deactivate-opacity=" + ctx.config.get("opacity"));
+  }
+};
+`;
+
+const CONFIG_RENDERER_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.logger.info("cfg-rr-activate-opacity=" + ctx.config.get("opacity"));
+    ctx.logger.info("cfg-rr-mode=" + ctx.config.get("mode"));
+    ctx.logger.info("cfg-rr-debug=" + ctx.config.get("debug"));
+    ctx.logger.info("cfg-rr-missing=" + ctx.config.get("nope"));
+    ctx.config.set("opacity", 0.01);
+    ctx.logger.info("cfg-rr-after-set=" + ctx.config.get("opacity"));
+    ctx.logger.info("cfg-rr-activate-ran");
+  },
+  deactivate(ctx) {
+    ctx.logger.info("cfg-rr-deactivate-opacity=" + ctx.config.get("opacity"));
+  }
+};
+`;
+
+describe("plugin ctx.config", () => {
+  test(
+    "main plugin: ctx.config.get reads the merged snapshot; missing/non-string keys are undefined; set is a no-op",
+    async () => {
+      const id = "cfg-main";
+      applyPlan(planFor("cfg-m1", [
+        {
+          id,
+          main: CONFIG_MAIN_FIXTURE,
+          granted: ["electron.window"],
+          config: { opacity: 0.8, mode: "auto", debug: false },
+        },
+      ]));
+      await waitFor(() => testing.mainPlugins().has(id), "main config plugin loaded");
+
+      // Schema-default values are readable (0.8 / "auto" / false).
+      expect(pluginMessages(id, "info", "cfg-main-activate-opacity=0.8")).toHaveLength(1);
+      expect(pluginMessages(id, "info", "cfg-main-mode=auto")).toHaveLength(1);
+      expect(pluginMessages(id, "info", "cfg-main-debug=false")).toHaveLength(1);
+      // Missing and non-string keys return undefined.
+      expect(pluginMessages(id, "info", "cfg-main-missing=undefined")).toHaveLength(1);
+      expect(pluginMessages(id, "info", "cfg-main-nonstring-key=undefined")).toHaveLength(1);
+      // set returns undefined and does NOT change what get returns (runtime never persists config).
+      expect(pluginMessages(id, "info", "cfg-main-set-returns=undefined")).toHaveLength(1);
+      expect(pluginMessages(id, "info", "cfg-main-after-set=0.8")).toHaveLength(1);
+    },
+    20000,
+  );
+
+  test(
+    "renderer plugin: ctx.config.get reads overridden values; missing key is undefined; set is a no-op",
+    async () => {
+      const pid = "cfg-renderer";
+      const contents = makeContents();
+      applyPlan(planFor("cfg-r1", [
+        {
+          id: pid,
+          renderer: CONFIG_RENDERER_FIXTURE,
+          granted: ["renderer.script"],
+          config: { opacity: 0.5, mode: "fast", debug: true },
+        },
+      ]));
+      createWindow(contents);
+      loadWindow(contents);
+
+      const key = pid + "@" + contents.id;
+      await waitFor(() => testing.rendererPlugins().has(key), "renderer config plugin loaded");
+
+      // Stored overrides (not the schema defaults) are what the runtime sees.
+      expect(pluginMessages(pid, "info", "cfg-rr-activate-opacity=0.5")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "cfg-rr-mode=fast")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "cfg-rr-debug=true")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "cfg-rr-missing=undefined")).toHaveLength(1);
+      // set is a no-op: get is unchanged.
+      expect(pluginMessages(pid, "info", "cfg-rr-after-set=0.5")).toHaveLength(1);
+    },
+    20000,
+  );
+
+  test(
+    "a config change across plan revisions deactivates the old VM and activates a new VM carrying the new config",
+    async () => {
+      const id = "cfg-reload";
+      // v1: plugin loaded with config A.
+      applyPlan(planFor("cfg-rv1", [
+        {
+          id,
+          main: CONFIG_MAIN_FIXTURE,
+          granted: ["electron.window"],
+          config: { opacity: 0.25, mode: "old", debug: false },
+        },
+      ]));
+      await waitFor(() => testing.mainPlugins().has(id), "config plugin v1 loaded");
+      expect(pluginMessages(id, "info", "cfg-main-activate-opacity=0.25")).toHaveLength(1);
+
+      // v2: same plugin, new config (Core bumps the plan revision + grant fingerprint). The old VM
+      // must run its deactivate against its own (old) config, then a fresh VM activates with the
+      // new config.
+      applyPlan(planFor("cfg-rv2", [
+        {
+          id,
+          main: CONFIG_MAIN_FIXTURE,
+          granted: ["electron.window"],
+          config: { opacity: 0.9, mode: "new", debug: true },
+        },
+      ]));
+      await waitFor(
+        () => pluginMessages(id, "info", "cfg-main-activate-opacity=0.9").length === 1,
+        "config plugin v2 activated",
+      );
+
+      // The superseded VM deactivated with the OLD config snapshot…
+      expect(pluginMessages(id, "info", "cfg-main-deactivate-opacity=0.25")).toHaveLength(1);
+      // …and exactly two activates happened (old + new VM), the newest with the new config.
+      expect(pluginMessages(id, "info", "cfg-main-activate-ran")).toHaveLength(2);
+      expect(pluginMessages(id, "info", "cfg-main-activate-opacity=0.25")).toHaveLength(1);
+      expect(pluginMessages(id, "info", "cfg-main-activate-opacity=0.9")).toHaveLength(1);
+      // The running instance's deactivate (this test's teardown) sees the NEW config.
+      const entry = testing.mainPlugins().get(id);
+      entry.deactivate();
+      await waitFor(
+        () => pluginMessages(id, "info", "cfg-main-deactivate-opacity=0.9").length === 1,
+        "v2 deactivate used the new config",
+      );
+      // set on the new VM is still a no-op (the new default 0.9 is not changed by the guest).
+      expect(pluginMessages(id, "info", "cfg-main-after-set=0.9")).toHaveLength(1);
+    },
+    20000,
+  );
+});

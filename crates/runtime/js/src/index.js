@@ -518,6 +518,59 @@ function buildLogger(vm, pluginId) {
   return logger;
 }
 
+// Per-plugin config API (ctx.config), read synchronously from the merged config snapshot the Core
+// execution plan carries for this plugin (schema defaults overlaid with stored values). configObj
+// is a plain host-side object of scalar values; it is captured per-VM when the plugin loads, so a
+// newer plan revision respawns the VM (via the fingerprint) with the new config.
+//
+// `set` is a NO-OP for sandboxed plugins: config is only persisted via the Manager control-plane
+// RPCs (setPluginConfig); the runtime never writes config itself.
+function buildConfigApi(vm, pluginId, configObj) {
+  const config = vm.newObject();
+
+  const get = vm.newFunction("get", (keyHandle) => {
+    if (vm.typeof(keyHandle) !== "string") {
+      // Non-string keys are rejected without coercing the handle (no guest code runs).
+      return vm.undefined;
+    }
+    const key = vm.getString(keyHandle);
+    if (!Object.prototype.hasOwnProperty.call(configObj, key)) {
+      return vm.undefined;
+    }
+    const value = configObj[key];
+    const valueType = typeof value;
+    switch (valueType) {
+      case "string":
+        return vm.newString(value);
+      case "number":
+        return vm.newNumber(value);
+      case "boolean":
+        return value ? vm.true : vm.false;
+      case "object":
+        if (value === null) return vm.null;
+        break;
+      default:
+        break;
+    }
+    // Defensive: merged config only ever contains schema-typed scalars, so a container/other value
+    // would indicate a Core-side or state mismatch. Surface it instead of leaking host objects.
+    pluginLog(
+      pluginId,
+      "warn",
+      "config.get(" + key + "): unsupported value type (" + valueType + "); returning undefined",
+    );
+    return vm.undefined;
+  });
+  vm.setProp(config, "get", get);
+  get.dispose();
+
+  const set = vm.newFunction("set", () => vm.undefined);
+  vm.setProp(config, "set", set);
+  set.dispose();
+
+  return config;
+}
+
 function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   const win = vm.newObject();
 
@@ -863,6 +916,12 @@ function runRawPlugin(plugin, generation, fingerprint, windowRecord) {
   }
   const ctx = {
     logger,
+    // Plain-object config read for dev-mode raw plugins (same NO-OP set contract as the sandboxed
+    // ctx.config host object: config is persisted only via the Manager control plane).
+    config: {
+      get: (key) => (typeof key === "string" ? (plugin.config || {})[key] : undefined),
+      set: () => {},
+    },
     raw: {
       electron: require("electron"),
       node: { require, process },
@@ -975,6 +1034,12 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
       vm.setProp(ctx, "window", win);
       win.dispose();
     }
+    // ctx.config is a read-only view of this plan snapshot's merged config for the plugin. The host
+    // object is mounted before ctx becomes reachable and lives as a ctx property (no extra handles
+    // to double-dispose later).
+    const config = buildConfigApi(vm, plugin.id, plugin.config || {});
+    vm.setProp(ctx, "config", config);
+    config.dispose();
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 
@@ -1112,6 +1177,10 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       script.dispose();
     }
     // (ctx.dom.query / ctx.dom.observe need async host functions — future.)
+    // ctx.config: read-only merged config for this plan snapshot (same surface as the main ctx).
+    const config = buildConfigApi(vm, plugin.id, plugin.config || {});
+    vm.setProp(ctx, "config", config);
+    config.dispose();
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 

@@ -88,9 +88,9 @@ export interface WindowAPI {
   setOpacity(window: WindowHandle, opacity: number): void;
   setSize(window: WindowHandle, width: number, height: number): void;
   setPosition(window: WindowHandle, x: number, y: number): void;
-  /** macOS only; returns a structured error on unsupported platforms. */
+  /** macOS only; structured-log no-op on other platforms or when the Electron API is absent. */
   setVibrancy(window: WindowHandle, material: string): void;
-  /** Windows 11 only; returns a structured error on unsupported platforms. */
+  /** Windows 11 only; structured-log no-op on other platforms or when the Electron API is absent. */
   setMica(window: WindowHandle, enabled: boolean): void;
 }
 
@@ -99,9 +99,28 @@ export interface WebContentsAPI {
   reload(window: WindowHandle): void;
 }
 
+// Main-plugin lifecycle events (SPEC §9 MVP). These attach at the MAIN context ROOT — NOT under
+// `ctx.window` — because they announce the host lifecycle (app loaded, renderer loaded, window
+// unloaded) rather than mutate a window. They are main-context only; the renderer context does not
+// expose them. Each registers a synchronous, `undefined`-returning callback that is invoked under
+// the CPU-deadline contract and fails closed (a throwing, over-deadline, or non-void callback is
+// unregistered by the runtime and never re-invoked). Each subscription is revoked when the plugin
+// is deactivated or its plan revision is removed.
+
 export interface MainContext extends PluginContext {
   window: WindowAPI;
   webContents: WebContentsAPI;
+  /** Fires exactly once per subscription — when the target app's main process has finished loading
+   *  its original app (app ready). A subscription made after the app already loaded fires
+   *  immediately, exactly once. No window argument. */
+  onLoad(cb: () => undefined): void;
+  /** Fires per window per renderer load (did-finish-load, i.e. per navigation), carrying the
+   *  window's id. A subscription made after a window already loaded is replayed once for each such
+   *  window. */
+  onRendererReady(cb: (window: WindowHandle) => undefined): void;
+  /** Fires when a window's webContents is destroyed (a quitting app destroys its windows, so this
+   *  also covers app shutdown), carrying the destroyed window's id. */
+  onUnload(cb: (window: WindowHandle) => undefined): void;
 }
 
 // --- Plugin module lifecycle ---
@@ -167,6 +186,9 @@ export function createMockMainContext(
       openDevTools: () => {},
       reload: () => {},
     },
+    onLoad: () => {},
+    onRendererReady: () => {},
+    onUnload: () => {},
     ...overrides,
   };
 }
