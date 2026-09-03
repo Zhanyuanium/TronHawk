@@ -51,3 +51,18 @@ test("mock main context exposes main APIs with window handle params", () => {
   expect(typeof ctx.webContents.openDevTools).toBe("function");
   expect("executeJavaScript" in ctx.webContents).toBe(false);
 });
+
+test("plugin_context_raw_is_optional", () => {
+  const renderer = createMockRendererContext();
+  const main = createMockMainContext();
+  expect(renderer.raw).toBeUndefined();
+  expect(main.raw).toBeUndefined();
+
+  const raw = { electron: {}, node: { require: () => {}, process: {} } };
+  const rendererWithRaw = createMockRendererContext({ raw });
+  const mainWithRaw = createMockMainContext({ raw });
+  expect(rendererWithRaw.raw).toBe(raw);
+  expect(mainWithRaw.raw).toBe(raw);
+  expect(rendererWithRaw.raw?.electron).toBe(raw.electron);
+  expect(mainWithRaw.raw?.node.process).toBe(raw.node.process);
+});

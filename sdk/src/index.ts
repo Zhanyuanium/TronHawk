@@ -4,6 +4,16 @@
 /** Opaque window handle assigned by the runtime. Plugins must treat it as opaque. */
 export type WindowHandle = string;
 
+/** Present ONLY when `runtime.unsafe` is granted AND developer mode is enabled by the user.
+ *  Deliberate exception: plugin code runs with the full Node/Electron environment of the
+ *  injected app's main process (arbitrary code execution). Never exposed to a sandboxed plugin. */
+export interface RawAPI {
+  /** The real Electron module of the injected application. */
+  electron: unknown;
+  /** The real Node.js runtime of the injected app's main process. */
+  node: { require(moduleName: string): unknown; process: unknown };
+}
+
 // --- Base context (cross-cutting services available in every execution context) ---
 
 export interface Logger {
@@ -42,6 +52,8 @@ export interface PluginContext {
   logger: Logger;
   network: NetworkAPI;
   config: ConfigAPI;
+  /** Present only when `runtime.unsafe` is granted AND developer mode is enabled. See `RawAPI`. */
+  raw?: RawAPI;
 }
 
 // --- Renderer context (MVP) ---
