@@ -61,6 +61,55 @@ function hasPermission(granted, perm) {
 
 // --- CSS injection ---
 
+const CSS_REMOVE_MAX_ATTEMPTS = 3;
+// Short backoff between removal attempts (indexed attempt-1). Kept tiny: reconcile is per-window
+// and per-plan-revision, so at most a handful of removals race at once.
+const CSS_REMOVE_BACKOFF_MS = [20, 80];
+
+function errorText(error) {
+  return error && error.message ? error.message : error;
+}
+
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function contentsDestroyed(w) {
+  const contents = w && w.contents;
+  return !contents || (typeof contents.isDestroyed === "function" && contents.isDestroyed());
+}
+
+// Remove an inserted-CSS key with bounded retries, replacing the old wholesale `.catch(() => {})`
+// that silently swallowed failures and left stale CSS applied while the code logged success.
+// Resolves true when removal succeeded OR the owning window/contents is already gone (nothing can
+// display the stale CSS anymore); resolves false after the final attempt so the caller can mark
+// the removal as failed (the reconcile loop then keeps the entry for a later retry).
+async function removeCssKey(w, pid, key) {
+  const contents = w.contents;
+  for (let attempt = 1; attempt <= CSS_REMOVE_MAX_ATTEMPTS; attempt++) {
+    try {
+      await contents.removeInsertedCSS(key);
+      return true;
+    } catch (e) {
+      if (contentsDestroyed(w)) {
+        // Window destroyed mid-removal (Electron rejects with "Object has been destroyed"): there
+        // is nothing left to retry and no live window can show the stale CSS. Not an error.
+        return true;
+      }
+      if (attempt === CSS_REMOVE_MAX_ATTEMPTS) {
+        pluginLog(
+          pid,
+          "error",
+          "CSS removal failed after " + CSS_REMOVE_MAX_ATTEMPTS + " attempts: " + errorText(e),
+        );
+        return false;
+      }
+      await delayMs(CSS_REMOVE_BACKOFF_MS[attempt - 1] || 100);
+    }
+  }
+  return false;
+}
+
 function inject(w, pid, css) {
   const gen = (w.gens.get(pid) || 0) + 1;
   w.gens.set(pid, gen);
@@ -68,20 +117,28 @@ function inject(w, pid, css) {
   const old = w.keys.get(pid);
   w.keys.delete(pid);
   const removeOld = old
-    ? w.contents.removeInsertedCSS(old.key).catch(() => {})
-    : Promise.resolve();
+    ? removeCssKey(w, pid, old.key)
+    : Promise.resolve(true);
 
   removeOld
-    .then(() => w.contents.insertCSS(css))
+    .then((removed) => {
+      if (old && !removed) {
+        // Old CSS could not be revoked even after retries; still inject the new CSS but surface
+        // the stale-sheet risk instead of pretending the revoke succeeded.
+        pluginLog(pid, "warn", "CSS supersede removal failed; stale CSS may remain applied");
+      }
+      return w.contents.insertCSS(css);
+    })
     .then((key) => {
       if (w.gens.get(pid) !== gen) {
-        w.contents.removeInsertedCSS(key).catch(() => {});
+        // A newer generation superseded this one before insertion completed; remove it.
+        removeCssKey(w, pid, key);
         return;
       }
       w.keys.set(pid, { css, key });
       pluginLog(pid, "info", "CSS injected");
     })
-    .catch((e) => pluginLog(pid, "error", "CSS injection failed: " + (e && e.message ? e.message : e)));
+    .catch((e) => pluginLog(pid, "error", "CSS injection failed: " + errorText(e)));
 }
 
 function reconcile(w) {
@@ -102,12 +159,24 @@ function reconcile(w) {
   const allIds = new Set([...w.keys.keys(), ...w.gens.keys()]);
   for (const pid of allIds) {
     if (!wanted.has(pid)) {
-      w.gens.set(pid, (w.gens.get(pid) || 0) + 1);
+      const removalGen = (w.gens.get(pid) || 0) + 1;
+      w.gens.set(pid, removalGen);
       const entry = w.keys.get(pid);
       if (entry) {
         w.keys.delete(pid);
-        w.contents.removeInsertedCSS(entry.key).catch(() => {});
-        pluginLog(pid, "info", "CSS removed");
+        removeCssKey(w, pid, entry.key).then((removed) => {
+          if (removed) {
+            pluginLog(pid, "info", "CSS removed");
+          } else if (
+            windows.get(w.contents.id) === w &&
+            w.gens.get(pid) === removalGen &&
+            !w.keys.has(pid)
+          ) {
+            // Removal ultimately failed while the window is still alive. Re-register the entry so
+            // the next reconcile retries the removal instead of silently dropping the stale CSS.
+            w.keys.set(pid, entry);
+          }
+        });
       }
     }
   }
@@ -123,7 +192,11 @@ const variantModule = require("@jitl/quickjs-singlefile-cjs-release-sync");
 const RELEASE_SYNC = variantModule.default || variantModule;
 
 let QuickJSPromise = null;
+// Test seam: number of getQuickJS() calls (exposed via __testing). A raw (runtime.unsafe) plugin
+// load must never touch the QuickJS module, so this stays 0 across raw-only reconciles.
+let quickJSGetCount = 0;
 function getQuickJS() {
+  quickJSGetCount += 1;
   if (!QuickJSPromise) {
     QuickJSPromise = newQuickJSWASMModuleFromVariant(RELEASE_SYNC);
   }
@@ -322,12 +395,74 @@ function cleanupAll(cleanups) {
   for (const cleanup of [...cleanups]) cleanup();
 }
 
+// Test seam: number of VM disposals attempted (exposed via __testing for the bun harness).
+let vmDisposeCount = 0;
+
 function disposeVM(vm) {
   try {
     vm.dispose();
   } catch (_e) {
     // Best effort: a failed/interrupted VM must never remain registered.
   }
+  vmDisposeCount += 1;
+}
+
+// Read the plugin's exported `deactivate` from a live VM, retaining the owned handles needed to
+// call it later with the same receiver/ctx shape as activate (this === module.exports). When the
+// plugin exports no deactivate, returns empty handles (nothing retained). The caller must dispose
+// the returned handles exactly once — in the plugin's deactivate path, while the VM is still alive.
+function capturePluginDeactivate(vm) {
+  const moduleHandle = vm.getProp(vm.global, "module");
+  const exportsHandle = vm.getProp(moduleHandle, "exports");
+  moduleHandle.dispose();
+  const candidate = vm.getProp(exportsHandle, "deactivate");
+  if (vm.typeof(candidate) !== "function") {
+    candidate.dispose();
+    exportsHandle.dispose();
+    return { deactivateExport: null, ctx: null, moduleExports: null };
+  }
+  return {
+    deactivateExport: candidate,
+    ctx: vm.getProp(vm.global, "ctx"),
+    moduleExports: exportsHandle,
+  };
+}
+
+// Run the plugin's own module.exports.deactivate(ctx) synchronously — the same undefined-void
+// contract as activate (a throwing or non-undefined/Promise result is a failed cleanup, logged,
+// and never blocks disposal) — while the VM is still alive. Then run host cleanup and dispose the
+// VM. `cleanups` is the main-plugin host-cleanup array (null for renderer plugins).
+function deactivatePluginVM(vm, pluginId, label, lifecycle, cleanups) {
+  if (lifecycle.deactivateExport) {
+    const ok = runQuickJSOperation(vm, pluginId, label + " deactivate", () =>
+      vm.callFunction(lifecycle.deactivateExport, lifecycle.moduleExports, lifecycle.ctx),
+      true,
+    );
+    if (!ok) {
+      pluginLog(
+        pluginId,
+        "error",
+        label + " deactivate failed or returned a non-undefined result; continuing with disposal",
+      );
+    }
+  }
+  for (const handle of [lifecycle.deactivateExport, lifecycle.ctx, lifecycle.moduleExports]) {
+    if (handle) {
+      try {
+        handle.dispose();
+      } catch (_e) {
+        // Best effort.
+      }
+    }
+  }
+  if (cleanups) {
+    try {
+      cleanupAll(cleanups);
+    } catch (_e) {
+      // A throwing host cleanup must not prevent VM disposal.
+    }
+  }
+  disposeVM(vm);
 }
 
 // Hard kill for a main plugin whose cumulative CPU budget was exhausted: deregister it and
@@ -442,7 +577,108 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   return win;
 }
 
+// --- Developer-mode raw plugins (runtime.unsafe) ---
+//
+// Deliberate, documented exception (docs/PLUGIN-SDK.md, docs/SPEC.md): a plugin whose `granted`
+// includes `runtime.unsafe` bypasses the QuickJS sandbox entirely and runs its `main`/`renderer`
+// source in this host (main) process via `new Function`. It receives the real Electron and Node
+// surfaces (`ctx.raw.electron` / `ctx.raw.node`) with full Node/Electron parity — no QuickJS VM,
+// no CPU deadline, no memory/stack limits, and no VM disposal (there is no VM to dispose).
+function runRawPlugin(plugin, generation, fingerprint, windowRecord) {
+  const renderer = !!windowRecord;
+  const key = renderer ? plugin.id + "@" + windowRecord.contents.id : plugin.id;
+  const map = renderer ? rendererPlugins : mainPlugins;
+  const windowGeneration = renderer ? windowRecord.rendererGeneration : 0;
+
+  const moduleObj = { exports: {} };
+  const logger = {};
+  for (const level of ["info", "warn", "error"]) {
+    logger[level] = (message) => pluginLog(plugin.id, level, message);
+  }
+  const ctx = {
+    logger,
+    raw: {
+      electron: require("electron"),
+      node: { require, process },
+    },
+  };
+
+  // Full parity: the source sees the host require/process/electron bound as its own frame
+  // parameters, plus `ctx` and CommonJS `module`/`exports`.
+  try {
+    new Function("require", "process", "electron", "ctx", "module", "exports", plugin.main ?? plugin.renderer)(
+      require,
+      process,
+      ctx.raw.electron,
+      ctx,
+      moduleObj,
+      moduleObj.exports,
+    );
+  } catch (e) {
+    // A throwing module body is a failed load: log and do NOT register an active plugin.
+    pluginLog(plugin.id, "error", "raw plugin activate failed: " + errorText(e));
+    return;
+  }
+
+  if (typeof moduleObj.exports.activate === "function") {
+    try {
+      moduleObj.exports.activate(ctx);
+    } catch (e) {
+      pluginLog(plugin.id, "error", "raw plugin activate failed: " + errorText(e));
+      return;
+    }
+  }
+
+  // Same plan-generation / abuse-disabled / window guards as the async QuickJS loaders: register
+  // only while this plan generation still wants exactly this fingerprint and the key is free.
+  // Registration is synchronous, so a newer plan cannot interleave mid-load; the check keeps the
+  // contract explicit (a superseded raw load must never become an active plugin).
+  const stillWanted =
+    generation === planGeneration &&
+    !abuseDisabledPlugins.has(plugin.id) &&
+    !map.has(key) &&
+    currentPlan.plugins.some(
+      (candidate) =>
+        candidate.id === plugin.id &&
+        (renderer ? candidate.renderer : candidate.main) &&
+        (hasPermission(candidate.granted, renderer ? "renderer.script" : "electron.window") ||
+          hasPermission(candidate.granted, "runtime.unsafe")) &&
+        pluginFingerprint(candidate) === fingerprint,
+    ) &&
+    (!renderer ||
+      (windowRecord.rendererGeneration === windowGeneration &&
+        windows.get(windowRecord.contents.id) === windowRecord));
+  if (!stillWanted) {
+    return;
+  }
+
+  // Same lifecycle contract as QuickJS plugins: deactivation runs the plugin's own
+  // module.exports.deactivate(ctx) synchronously, guarded so a stale double revoke never calls it
+  // twice, then drops the entry. No VM exists for raw plugins, so there is nothing to dispose.
+  const lifecycleDeactivate =
+    typeof moduleObj.exports.deactivate === "function" ? moduleObj.exports.deactivate : null;
+  let deactivated = false;
+  const deactivate = () => {
+    if (deactivated) return;
+    deactivated = true;
+    if (lifecycleDeactivate) {
+      try {
+        lifecycleDeactivate(ctx);
+      } catch (e) {
+        pluginLog(plugin.id, "error", "raw plugin deactivate failed: " + errorText(e));
+      }
+    }
+    map.delete(key);
+  };
+  map.set(key, { deactivate, fingerprint });
+  pluginLog(plugin.id, "info", "Raw plugin loaded (developer mode)");
+}
+
 function runMainPlugin(plugin, app, generation, fingerprint) {
+  // Developer-mode raw plugin: bypass the QuickJS sandbox entirely (see runRawPlugin).
+  if (hasPermission(plugin.granted, "runtime.unsafe")) {
+    return runRawPlugin(plugin, generation, fingerprint);
+  }
   if (abuseDisabledPlugins.has(plugin.id)) {
     // Killed earlier in this plan generation for exceeding the cumulative CPU budget; do not
     // respawn it just because a later reconcile still wants it.
@@ -532,14 +768,15 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
       return;
     }
 
-    // Store the vm for later deactivate/disposal.
+    // Store the vm for later deactivate/disposal. First deactivation runs the plugin's own
+    // module.exports.deactivate(ctx) synchronously while the VM is still alive, then host cleanup,
+    // then VM disposal. The guard ensures a stale double revoke never calls guest deactivate twice.
+    const lifecycle = capturePluginDeactivate(vm);
+    let deactivated = false;
     const deactivate = () => {
-      try {
-        cleanupAll(cleanupCallbacks);
-        disposeVM(vm);
-      } catch (e) {
-        /* ignore */
-      }
+      if (deactivated) return;
+      deactivated = true;
+      deactivatePluginVM(vm, plugin.id, "main plugin", lifecycle, cleanupCallbacks);
     };
     mainPlugins.set(plugin.id, { vm, deactivate, fingerprint });
     pluginLog(plugin.id, "info", "Main plugin loaded");
@@ -554,6 +791,12 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
 // --- Renderer-plugin sandbox (runs per window on did-finish-load) ---
 
 function runRendererPlugin(plugin, w, generation, fingerprint) {
+  // Developer-mode raw plugin: bypass the QuickJS sandbox entirely (see runRawPlugin). The window
+  // record is passed along so the plugin registers under its per-window key and respects the
+  // rendererGeneration guard, exactly like the QuickJS renderer loaders.
+  if (hasPermission(plugin.granted, "runtime.unsafe")) {
+    return runRawPlugin(plugin, generation, fingerprint, w);
+  }
   if (abuseDisabledPlugins.has(plugin.id)) {
     // Killed earlier in this plan generation for exceeding the cumulative CPU budget; do not
     // respawn a new VM for every window in this plan generation.
@@ -658,13 +901,17 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       return;
     }
 
-    rendererPlugins.set(key, {
-      vm,
-      fingerprint,
-      deactivate: () => {
-        disposeVM(vm);
-      },
-    });
+    // Same lifecycle contract as main plugins: deactivation first runs the plugin's own
+    // module.exports.deactivate(ctx) synchronously while the VM is still alive, then disposes the
+    // VM. Guarded so a stale double revoke never calls guest deactivate twice.
+    const lifecycle = capturePluginDeactivate(vm);
+    let deactivated = false;
+    const deactivate = () => {
+      if (deactivated) return;
+      deactivated = true;
+      deactivatePluginVM(vm, plugin.id, "renderer plugin", lifecycle, null);
+    };
+    rendererPlugins.set(key, { vm, fingerprint, deactivate });
     pluginLog(plugin.id, "info", "Renderer plugin loaded");
   }).catch((e) => {
     if (pendingRendererPlugins.get(key) === pending) pendingRendererPlugins.delete(key);
@@ -677,7 +924,7 @@ function reconcileRendererPlugins(w) {
   const contents = w.contents;
   const wanted = new Map();
   for (const p of currentPlan.plugins) {
-    if (p.renderer && hasPermission(p.granted, "renderer.script")) {
+    if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe"))) {
       wanted.set(p.id, { plugin: p, fingerprint: pluginFingerprint(p) });
     }
   }
@@ -733,7 +980,7 @@ function cleanupRendererPlugins(contentsId) {
 function reconcileMainPlugins(app) {
   const wanted = new Map();
   for (const p of currentPlan.plugins) {
-    if (p.main && hasPermission(p.granted, "electron.window")) {
+    if (p.main && (hasPermission(p.granted, "electron.window") || hasPermission(p.granted, "runtime.unsafe"))) {
       const fingerprint = pluginFingerprint(p);
       wanted.set(p.id, { plugin: p, fingerprint });
       const active = mainPlugins.get(p.id);
@@ -940,4 +1187,42 @@ function start(app, sinks = {}) {
   });
 }
 
-module.exports = { start, applyPlan };
+// --- test seams ---
+//
+// The public contract is `module.exports = { start, applyPlan }`; the extra keys below exist only
+// for the repeatable bun harness (src/index.test.js) and are inert in the bundled runtime.
+
+function reset() {
+  if (planPollTimer) {
+    clearInterval(planPollTimer);
+    planPollTimer = null;
+  }
+  planRequest = null;
+  planPolling = false;
+  lastPlanPollError = null;
+  currentPlan = { revision: "", plugins: [] };
+  planGeneration = 0;
+  windows.clear();
+  appRef = null;
+  activeAdapter = null;
+  mainPlugins.clear();
+  pendingMainPlugins.clear();
+  rendererPlugins.clear();
+  pendingRendererPlugins.clear();
+  abuseDisabledPlugins.clear();
+  vmDisposeCount = 0;
+  quickJSGetCount = 0;
+}
+
+module.exports = {
+  start,
+  applyPlan,
+  __testing: {
+    reset,
+    mainPlugins: () => mainPlugins,
+    rendererPlugins: () => rendererPlugins,
+    windows: () => windows,
+    vmDisposeCount: () => vmDisposeCount,
+    quickJSGetCount: () => quickJSGetCount,
+  },
+};
