@@ -12,7 +12,8 @@ completed or superseded are no longer listed.
       VM on a `worker_thread`/`utilityProcess` and bridge over IPC. No decision yet.
 - [ ] Once async host APIs land (`ctx.dom`, `ctx.network`, …), guide normal plugins back to the
       sandboxed APIs — raw host execution (`ctx.raw`, `runtime.unsafe`, ADR 0007) is the
-      developer-mode interim, not the target surface.
+      developer-mode interim, not the target surface. `ctx.config` is now available in the sandbox;
+      only async host APIs (dom/network) remain.
 - [ ] MainContext `setVibrancy` / `setMica` (true glass effect) — not wired; only
       `setOpacity` / `setSize` / `setPosition` are implemented.
 - [x] Plugin `deactivate(ctx)` lifecycle — resolved: the runtime now invokes the plugin's exported
@@ -30,8 +31,12 @@ completed or superseded are no longer listed.
 
 ## Phase 4 — Manager UI (functional; these remain)
 
-- [ ] `manifest.json` `config{}` settings UI — schema-driven auto-generated Manager form; config
-      state exists in Core but no UI.
+- [x] `manifest.json` `config{}` settings UI — resolved: manifest `config{}` schemas (fields with
+      `type` string/number/boolean, optional `default`/`label`, ≤32 keys) are validated at
+      pack/install; per-application × per-plugin values are stored in Core, merged into the
+      per-plugin plan snapshot, and edited via the Manager's schema-driven settings form. Editing
+      config bumps the plan revision so the runtime reloads the plugin with the new values. See
+      SPEC §9/§12 and PLUGIN-SDK.md §Config.
 - [ ] Real-time log push/streaming (current Logs view is manual refresh, read-only pagination).
 - [ ] Structured log export/full-text search; per-plugin log credentials for stronger attribution.
 

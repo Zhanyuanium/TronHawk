@@ -99,7 +99,9 @@ tests/
 ## 8. Injection (Windows MVP)
 
 Activation path: launch `Target.exe` → **IFEO** → TronHawk Injector → **electron-hook** → `bootstrap.js`.
-Fallback: user launches via Manager ("Launch with extensions").
+Fallback: user launches via Manager ("Launch with extensions") — implemented: the Manager spawns
+the co-located injector launcher (it does not inject into or touch the target itself), and the
+launcher acquires the launch session.
 
 Approach: **Windows + IFEO + electron-hook + launcher fallback.** Do NOT do binary patch,
 Chromium replacement, or V8 hook.
@@ -136,6 +138,9 @@ Execution contexts:
   (ADR 0002); `renderer.dom` query/observe is future; localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
   Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
+- **`ctx.config`** (main + renderer): per-application × per-plugin config carried into the plan
+  snapshot; `get(key)` reads synchronously from that snapshot, `set(key, value)` is a no-op for
+  sandboxed plugins — config is persisted only via the Manager settings form.
 - **Developer mode** (`runtime.unsafe`): raw Electron/Node — opt-in via the Manager Settings view
   and off by default; a granted plugin executes with the real Node/Electron environment of the
   injected app (arbitrary code execution, outside the QuickJS sandbox).
@@ -175,7 +180,8 @@ Install UX: show requested vs not-requested capabilities (accept / reject / deta
 
 ## 11. Manager (Tauri)
 
-MVP UI: Applications (with supported level), Plugins (enable / disable / remove), Permissions view, Logs.
+MVP UI: Applications (with supported level), Plugins (enable / disable / remove), Permissions view,
+plugin settings UI (schema-driven from the manifest `config{}`), launch-with-extensions button, Logs.
 
 ## 12. Data & Config
 
@@ -183,7 +189,9 @@ Storage root `%LOCALAPPDATA%\TronHawk\` (overridable via `TRONHAWK_STORAGE_ROOT`
 `plugins/{installed, cache}`, `logs/`, `profiles/`, `runtime/`.
 Config tiers: global (`language`, `developerMode` — set by the Manager Settings view, off by
 default; disabling developer mode purges every `runtime.unsafe` grant), application
-(`enabledPlugins`), plugin (per-plugin settings).
+(`enabledPlugins`), plugin — now wired: a manifest `config{}` schema (≤32 typed fields) is validated
+at pack/install, per-application × per-plugin values are stored in Core policy, and edited via the
+Manager's schema-driven settings form.
 Logging: three durable streams — Core, Runtime, Plugin. Core owns a bounded JSONL ledger under
 `logs/` with strict Core-generated sequence and attribution; Control may query, a launch session
 may only append its own attributed Runtime/Plugin events, and the Manager displays it read-only.

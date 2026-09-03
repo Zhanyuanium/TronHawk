@@ -18,17 +18,19 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | renderer | `ctx.css.insert` / `ctx.css.remove` | Future — the `CssAPI` host functions are typed in the SDK but not yet exposed to the renderer QuickJS context; CSS-injection today is data-only from the manifest, not a runtime-callable host function |
 | renderer | `ctx.script.setDocumentTitle` (`renderer.script`) | Implemented — host-owned fixed assignment; input is data, never JS source |
 | main | `ctx.window.onCreated` / `setOpacity` / `setSize` / `setPosition` (`electron.window`) | Implemented |
+| main | `ctx.onLoad` / `ctx.onRendererReady` / `ctx.onUnload` (`electron.window`) | Implemented — main-context lifecycle events: `onLoad` fires once at app ready (a late subscription fires immediately), `onRendererReady` per window per load/navigation (a late subscription replays already-loaded windows), `onUnload` per window webContents destroy; synchronous `undefined` callbacks invoked under the CPU-deadline contract, fail-closed unregister on throw/timeout/non-void |
 | renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Future — needs async host functions (the sync QuickJS variant cannot drain pending jobs) |
-| main | `ctx.window.setVibrancy` / `setMica` | Future — true glass not wired; only opacity/size/position exist today |
+| main | `ctx.window.setVibrancy` / `setMica` (`electron.window`) | Implemented — macOS vibrancy via `setVibrancy`, Windows 11 Mica via `setBackgroundMaterial`; structured-log no-op on other platforms or when the Electron API is absent |
 | main | `ctx.webContents.*` | Future |
 | both | `ctx.session.*` | Future |
 | both | `ctx.ipc.*` | Future |
 | both | `ctx.network.request` (`network.access`) | Future — typed, but Core permission + domain-whitelist enforcement is not wired yet |
-| both | `ctx.config.get` / `ctx.config.set` | Future — config persistence is not wired to a settings store yet |
+| both | `ctx.config.get` / `ctx.config.set` | Implemented — get reads the per-app-per-plugin config snapshot (schema defaults overlaid with stored values); set is a no-op for sandboxed plugins (config is persisted only through the Manager settings form) |
 | both | `ctx.raw` (`runtime.unsafe`, developer mode) | Implemented — raw host execution while developer mode is on + `runtime.unsafe` granted |
 
-**Lifecycle contract (binding):** `activate`, `deactivate`, and window callbacks must complete
-**synchronously** and return JavaScript `undefined`. The runtime rejects any other result,
+**Lifecycle contract (binding):** `activate`, `deactivate`, the main-context lifecycle-event
+callbacks (`ctx.onLoad` / `ctx.onRendererReady` / `ctx.onUnload`), and window callbacks must
+complete **synchronously** and return JavaScript `undefined`. The runtime rejects any other result,
 including a Promise/thenable. Async (Promise-returning) lifecycle is future — it requires
 QuickJS pending-job draining and a `deactivate(ctx)` call that is not yet invoked.
 
@@ -110,18 +112,48 @@ interface RendererContext extends PluginContext { css; dom; script; }
 ## Main API (`MainContext`)
 
 ```ts
-interface MainContext extends PluginContext { window; webContents; }
+interface MainContext extends PluginContext { window; webContents; onLoad; onRendererReady; onUnload; }
 ```
 
 - `ctx.window.onCreated(cb)` — `cb` receives an opaque `WindowHandle`; every window mutation takes
   that handle, so multi-window apps are unambiguous. The callback must complete synchronously and
   return `undefined`; otherwise the runtime unregisters it.
 - `ctx.window.setOpacity(win, n)` / `setSize(win, w, h)` / `setPosition(win, x, y)` — cross-platform.
-- `ctx.window.setVibrancy(win, material)` (macOS) / `setMica(win, enabled)` (Windows 11) — return a
-  structured error on unsupported platforms.
+- `ctx.window.setVibrancy(win, material)` (macOS) / `setMica(win, enabled)` (Windows 11) — macOS
+  vibrancy (`BrowserWindow#setVibrancy`) and Windows 11 Mica (`BrowserWindow#setBackgroundMaterial`);
+  on other platforms, or when the Electron API is absent, each is a no-op that emits a structured
+  log instead of throwing.
 - `ctx.webContents.openDevTools(win)` / `reload(win)`.
 - (future) `ctx.session.modify()` (User-Agent, proxy, request interception).
 - (future) `ctx.ipc.on()/send()/intercept()` — high privilege.
+
+### Main lifecycle events
+
+`ctx.onLoad(cb)` / `ctx.onRendererReady(cb)` / `ctx.onUnload(cb)` attach at the main context **root**
+— next to the module-level `activate`/`deactivate` lifecycle, not under `ctx.window` (which is the
+window *mutation* surface). They announce the plugin host lifecycle and are available only in the
+main context; the renderer context does not expose them. They are reachable whenever a sandboxed
+main plugin runs (the `electron.window` grant).
+
+Each registers a **synchronous, `undefined`-returning callback** (a normal function with no
+`return` statement does this). Every invocation runs under the runtime's per-operation **CPU
+deadline** contract, and the callback must return JavaScript `undefined` — a Promise/thenable is
+rejected. A callback that **throws, exceeds its CPU deadline, or returns a non-`undefined` value
+fails closed**: the runtime logs the failure and **unregisters that one subscription**, so it is
+never re-invoked on later host events (the plugin itself stays loaded). Subscriptions are revoked
+when the plugin is deactivated or its plan revision is removed.
+
+Emit semantics:
+
+- `ctx.onLoad(cb)` — fires **exactly once per subscription**, when the target app's main process has
+  finished loading its original app (app ready). No window argument: it is the app-process boot
+  event. A subscription made after the app already loaded fires immediately, exactly once.
+- `ctx.onRendererReady(cb)` — fires **per window per renderer load** (`did-finish-load`, i.e. per
+  navigation), carrying the window's `WindowHandle`. A subscription made after a window already
+  loaded is replayed once for each such window, mirroring `onCreated`'s existing-window replay.
+- `ctx.onUnload(cb)` — fires **per window when its `webContents` is destroyed**, carrying the
+  destroyed window's `WindowHandle`. A quitting app always destroys its windows, so app shutdown is
+  covered by the same path.
 
 ## Logging & network
 
@@ -135,13 +167,23 @@ interface MainContext extends PluginContext { window; webContents; }
 
 ## Config
 
-Declare a schema in `manifest.json`; the Manager auto-generates a settings UI:
+Declare a schema in `manifest.json`; the Manager auto-generates a settings form from it:
 
 ```json
-{ "config": { "opacity": { "type": "number", "default": 0.8 } } }
+{ "config": { "opacity": { "type": "number", "default": 0.8, "label": "Opacity" } } }
 ```
 
-`ctx.config.get(key)` returns `unknown` until per-plugin schema typing lands; `ctx.config.set(key, value)`.
+Each field is `{ "type": "string" | "number" | "boolean", "default"?, "label"? }`; the schema is
+limited to 32 keys, and `object`/`array` field types are reserved for a future release. The schema
+is validated when the plugin is packed/installed.
+
+Config is stored per-application × per-plugin in Core and carried into the per-plugin plan grant as
+a merged snapshot (schema defaults overlaid with stored values). `ctx.config.get(key)` reads
+synchronously from that snapshot in the QuickJS main and renderer contexts. `ctx.config.set(key, value)`
+is a no-op for sandboxed plugins — plugins read config but never persist it; config is persisted only
+through the Manager settings form. Editing config in the Manager changes the plan revision, so the
+runtime reloads the plugin with the new values. Developer-mode (`runtime.unsafe`) plugins receive a
+plain-object `config` instead of the `ctx.config` facade.
 
 ## Plugin-to-plugin communication
 
