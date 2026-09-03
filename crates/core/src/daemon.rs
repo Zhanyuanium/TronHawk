@@ -24,6 +24,14 @@ const TOKEN_FUTURE_TOLERANCE_SECS: u64 = 5;
 const IMPLEMENTED_RENDERER_CAPABILITIES: &[&str] = &["renderer.css", "renderer.script"];
 const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] =
     &["renderer.css", "renderer.script", "electron.window"];
+/// Level-2 capability set while Developer mode is enabled: the normal Level-2 set plus
+/// `runtime.unsafe`. Developer mode never bypasses the support level — Level 0/1 are unchanged.
+const IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES: &[&str] = &[
+    "renderer.css",
+    "renderer.script",
+    "electron.window",
+    "runtime.unsafe",
+];
 const APPLICATION_ID_PREFIX: &str = "winexe-v1:";
 /// Rolling rate-limit window and budget shared by every launch token of an application.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -305,6 +313,7 @@ impl CoreService {
             }
             "installPlugin" => self.install_plugin(inner, request.params),
             "setApplicationPluginPolicy" => self.set_policy(inner, request.params),
+            "setDeveloperMode" => self.set_developer_mode(inner, request.params),
             "removePlugin" => self.remove_plugin(inner, request.params),
             "createLaunchSession" => self.create_launch_session(request.params),
             "queryLogs" => self.query_logs(request.params),
@@ -571,6 +580,44 @@ impl CoreService {
         self.session_json(&application_id)
     }
 
+    /// Toggle Developer mode (control-token only). Enabling only flips the persisted flag;
+    /// disabling additionally purges `runtime.unsafe` from every application's plugin policy
+    /// grants so revoking Developer mode also revokes previously granted unsafe capability.
+    /// No-op when the requested state equals the current one (idempotent: no write, no event).
+    fn set_developer_mode(
+        &self,
+        inner: &mut ServiceInner,
+        params: serde_json::Value,
+    ) -> RouterResult {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            enabled: bool,
+        }
+        let params: Params = parse_params(params)?;
+        if inner.state.global.developer_mode == params.enabled {
+            return Ok(serde_json::json!({ "developerMode": params.enabled }));
+        }
+        let mut next = inner.state.clone();
+        if !params.enabled {
+            for application in next.applications.values_mut() {
+                for policy in application.plugins.values_mut() {
+                    policy.grants.retain(|grant| grant != "runtime.unsafe");
+                }
+            }
+        }
+        next.global.developer_mode = params.enabled;
+        write_state(&self.state_path, &next).map_err(RouterError::Internal)?;
+        inner.state = next;
+        let message = if params.enabled {
+            "Developer mode enabled"
+        } else {
+            "Developer mode disabled; runtime.unsafe grants revoked"
+        };
+        self.append_core_event("global", None, "core.developerMode.updated", message);
+        Ok(serde_json::json!({ "developerMode": params.enabled }))
+    }
+
     fn set_policy(&self, inner: &mut ServiceInner, params: serde_json::Value) -> RouterResult {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -612,7 +659,10 @@ impl CoreService {
                 "grants must be requested by the plugin".into(),
             ));
         }
-        let supported = capabilities_for_support_level(application.support_level);
+        let supported = capabilities_for_support_level(
+            application.support_level,
+            inner.state.global.developer_mode,
+        );
         if params
             .grants
             .iter()
@@ -898,7 +948,10 @@ impl CoreService {
         if application.support_level == 0 {
             return Ok(empty_plan());
         }
-        let supported = capabilities_for_support_level(application.support_level);
+        let supported = capabilities_for_support_level(
+            application.support_level,
+            inner.state.global.developer_mode,
+        );
         let mut grants = Vec::new();
         for mut plugin in self.installed_plugins(inner)? {
             let Some(policy) = application.plugins.get(&plugin.id) else {
@@ -911,9 +964,7 @@ impl CoreService {
                 .grants
                 .iter()
                 .filter(|grant| {
-                    plugin.permissions.contains(grant)
-                        && supported.contains(&grant.as_str())
-                        && grant.as_str() != "runtime.unsafe"
+                    plugin.permissions.contains(grant) && supported.contains(&grant.as_str())
                 })
                 .cloned()
                 .collect();
@@ -931,14 +982,14 @@ impl CoreService {
             if !plugin
                 .permissions
                 .iter()
-                .any(|grant| grant == "renderer.script")
+                .any(|grant| grant == "renderer.script" || grant == "runtime.unsafe")
             {
                 plugin.renderer = None;
             }
             if !plugin
                 .permissions
                 .iter()
-                .any(|grant| grant == "electron.window")
+                .any(|grant| grant == "electron.window" || grant == "runtime.unsafe")
             {
                 plugin.main = None;
             }
@@ -1012,9 +1063,10 @@ fn validate_support_level(level: u8) -> Result<(), RouterError> {
     }
 }
 
-fn capabilities_for_support_level(level: u8) -> &'static [&'static str] {
+fn capabilities_for_support_level(level: u8, developer_mode: bool) -> &'static [&'static str] {
     match level {
         1 => IMPLEMENTED_RENDERER_CAPABILITIES,
+        2 if developer_mode => IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES,
         2 => IMPLEMENTED_LEVEL_TWO_CAPABILITIES,
         _ => &[],
     }
@@ -1591,6 +1643,43 @@ mod tests {
         }
 
         fn package(&self, directory: &str, id: &str, version: &str) -> PathBuf {
+            self.package_with_permissions(
+                directory,
+                id,
+                version,
+                &[
+                    "renderer.css",
+                    "renderer.script",
+                    "renderer.dom",
+                    "electron.window",
+                    "runtime.unsafe",
+                ],
+            )
+        }
+
+        /// A fixture identical to [`package`] except it does NOT declare `runtime.unsafe`, for
+        /// tests that assert grants must still be requested by the plugin manifest.
+        fn package_without_unsafe(&self, directory: &str, id: &str, version: &str) -> PathBuf {
+            self.package_with_permissions(
+                directory,
+                id,
+                version,
+                &[
+                    "renderer.css",
+                    "renderer.script",
+                    "renderer.dom",
+                    "electron.window",
+                ],
+            )
+        }
+
+        fn package_with_permissions(
+            &self,
+            directory: &str,
+            id: &str,
+            version: &str,
+            permissions: &[&str],
+        ) -> PathBuf {
             let source = self.0.join(directory);
             std::fs::create_dir_all(&source).unwrap();
             std::fs::write(source.join("renderer.js"), "renderer source").unwrap();
@@ -1601,13 +1690,7 @@ mod tests {
                 "version": version,
                 "author": "Test",
                 "tronhawk": "^0.1",
-                "permissions": [
-                    "renderer.css",
-                    "renderer.script",
-                    "renderer.dom",
-                    "electron.window",
-                    "runtime.unsafe"
-                ],
+                "permissions": permissions,
                 "css": "body{}",
                 "entry": {
                     "renderer": "renderer.js",
@@ -2943,5 +3026,327 @@ mod tests {
             assert_eq!(error_code(response), -32602, "params: {params}");
         }
         drop(service);
+    }
+
+    #[test]
+    fn set_developer_mode_control_auth_and_idempotence() {
+        let temp = TempRoot::new("dev-mode-control");
+        let executable = temp.executable("Dev.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+
+        // setDeveloperMode is a control-token-only RPC: a launch token is forbidden.
+        let token = launch_token(&service, &control, &executable);
+        assert_eq!(
+            error_code(call(
+                &service,
+                &token,
+                "setDeveloperMode",
+                serde_json::json!({ "enabled": true }),
+            )),
+            -32003
+        );
+
+        // Malformed params: missing field, unknown field, and wrong type all fail validation.
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "enabled": true, "extra": false }),
+            serde_json::json!({ "enabled": "yes" }),
+            serde_json::json!({ "enabled": null }),
+        ] {
+            assert_eq!(
+                error_code(call(&service, &control, "setDeveloperMode", params)),
+                -32602
+            );
+        }
+
+        // Enable returns the new state; a repeated identical call is idempotent.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setDeveloperMode",
+                serde_json::json!({ "enabled": true }),
+            )),
+            serde_json::json!({ "developerMode": true })
+        );
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setDeveloperMode",
+                serde_json::json!({ "enabled": true }),
+            )),
+            serde_json::json!({ "developerMode": true })
+        );
+        // The manager snapshot exposes the flag...
+        let snapshot = ok(call(
+            &service,
+            &control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert_eq!(snapshot["global"]["developerMode"], true);
+        // ...and exactly one core event records the enable (the idempotent repeat emits none,
+        // and the code round-trips through the log store's Core allowlist).
+        let logs = query_logs(&service, &control);
+        let updates = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["code"] == "core.developerMode.updated")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["message"], "Developer mode enabled");
+        assert_eq!(updates[0]["stream"], "core");
+        assert_eq!(updates[0]["applicationId"], "global");
+
+        // Developer mode is durable across a CoreService rebuild.
+        drop(service);
+        let rebuilt = CoreService::new(&temp.0).unwrap();
+        let rebuilt_control = std::fs::read_to_string(rebuilt.control_token_path()).unwrap();
+        let snapshot = ok(call(
+            &rebuilt,
+            &rebuilt_control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert_eq!(snapshot["global"]["developerMode"], true);
+
+        // While enabled runtime.unsafe can be granted; disabling then purges it from the policy
+        // and persists the purge.
+        ok(set_policy(
+            &rebuilt,
+            &rebuilt_control,
+            &application_id,
+            true,
+            &["runtime.unsafe"],
+        ));
+        assert_eq!(
+            ok(call(
+                &rebuilt,
+                &rebuilt_control,
+                "setDeveloperMode",
+                serde_json::json!({ "enabled": false }),
+            )),
+            serde_json::json!({ "developerMode": false })
+        );
+        let logs = query_logs(&rebuilt, &rebuilt_control);
+        let disabled = logs["events"].as_array().unwrap().iter().any(|event| {
+            event["code"] == "core.developerMode.updated"
+                && event["message"] == "Developer mode disabled; runtime.unsafe grants revoked"
+        });
+        assert!(disabled);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.0.join("config/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["global"]["developerMode"], false);
+        let policy = &persisted["applications"][&application_id]["plugins"]["com.example.daemon"];
+        assert_eq!(policy["enabled"], true);
+        assert!(policy["grants"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_unsafe_requires_developer_mode_end_to_end() {
+        let temp = TempRoot::new("dev-mode-grant-flow");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+
+        // Developer mode off: runtime.unsafe cannot be granted.
+        assert_eq!(
+            error_code(set_policy(
+                &service,
+                &control,
+                &application_id,
+                true,
+                &["runtime.unsafe"],
+            )),
+            -32602
+        );
+
+        // Developer mode on (Level 2 app): the same grant is accepted.
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": true }),
+        ));
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["runtime.unsafe"],
+        ));
+
+        // The execution plan ships the plugin with runtime.unsafe granted and its source intact
+        // (runtime.unsafe unlocks main/renderer payloads instead of filtering the plugin out).
+        let token = launch_token(&service, &control, &executable);
+        let dev_on = plan(&service, &token);
+        assert_eq!(dev_on["plugins"][0]["id"], "com.example.daemon");
+        assert_eq!(
+            dev_on["plugins"][0]["granted"],
+            serde_json::json!(["runtime.unsafe"])
+        );
+        assert_eq!(dev_on["plugins"][0]["main"], "main source");
+        assert_eq!(dev_on["plugins"][0]["renderer"], "renderer source");
+
+        // Developer mode off again: the grant is filtered out of the plan AND purged from the
+        // persisted policy; re-granting afterwards fails.
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": false }),
+        ));
+        let dev_off = plan(&service, &token);
+        assert!(dev_off["plugins"].as_array().unwrap().is_empty());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.0.join("config/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["global"]["developerMode"], false);
+        assert!(
+            persisted["applications"][&application_id]["plugins"]["com.example.daemon"]["grants"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            error_code(set_policy(
+                &service,
+                &control,
+                &application_id,
+                true,
+                &["runtime.unsafe"],
+            )),
+            -32602
+        );
+    }
+
+    #[test]
+    fn developer_mode_does_not_bypass_support_levels() {
+        let temp = TempRoot::new("dev-mode-no-bypass");
+        let executable = temp.executable("One.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 1);
+        install_package(&service, &control, &package);
+
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": true }),
+        ));
+        // Level 1 never gets runtime.unsafe, even with Developer mode on.
+        assert_eq!(
+            error_code(set_policy(
+                &service,
+                &control,
+                &application_id,
+                true,
+                &["runtime.unsafe"],
+            )),
+            -32602
+        );
+        // Level-2-only capabilities remain gated for a Level 1 app under Developer mode.
+        assert_eq!(
+            error_code(set_policy(
+                &service,
+                &control,
+                &application_id,
+                true,
+                &["electron.window"],
+            )),
+            -32602
+        );
+        // Normal Level 1 grants still work while Developer mode is on.
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+    }
+
+    #[test]
+    fn developer_mode_keeps_must_be_requested() {
+        let temp = TempRoot::new("dev-mode-must-request");
+        let executable = temp.executable("App.exe");
+        // This fixture does NOT declare runtime.unsafe in its manifest.
+        let package = temp.package_without_unsafe("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": true }),
+        ));
+        // Even with Developer mode on, an undeclared capability cannot be granted.
+        assert_eq!(
+            error_code(set_policy(
+                &service,
+                &control,
+                &application_id,
+                true,
+                &["runtime.unsafe"],
+            )),
+            -32602
+        );
+    }
+
+    #[test]
+    fn developer_mode_toggle_changes_plan_revision() {
+        let temp = TempRoot::new("dev-mode-revision");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+
+        // Developer mode on, plugin granted both a normal and the unsafe capability.
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": true }),
+        ));
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css", "runtime.unsafe"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        let dev_on = plan(&service, &token);
+        assert_eq!(
+            dev_on["plugins"][0]["granted"],
+            serde_json::json!(["renderer.css", "runtime.unsafe"])
+        );
+
+        // The same app + plugin yields a different revision once Developer mode is off, so a
+        // Runtime polling on its token sees the change and revokes/re-syncs its plugin set.
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": false }),
+        ));
+        let dev_off = plan(&service, &token);
+        assert_eq!(
+            dev_off["plugins"][0]["granted"],
+            serde_json::json!(["renderer.css"])
+        );
+        assert_ne!(dev_off["revision"], dev_on["revision"]);
     }
 }

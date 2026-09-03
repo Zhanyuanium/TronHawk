@@ -403,6 +403,7 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
                     | "core.plugin.removed"
                     | "core.plugin.scan_failed"
                     | "core.policy.updated"
+                    | "core.developerMode.updated"
                     | "core.launch_session.created"
             )
         }
