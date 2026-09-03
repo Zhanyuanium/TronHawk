@@ -55,6 +55,30 @@ let appRef = null;
 // optional `renderer.gate(win, ready)` timing seam (Path A). No gate -> default timing.
 let activeAdapter = null;
 
+// Platform the runtime executes on. Defaults to the real host platform; the bun harness overrides
+// it through the __testing seam (setPlatform) to exercise the macOS/Windows-only host functions on
+// any host. In the bundled runtime this is always process.platform.
+let hostPlatform = process.platform;
+
+// Window-handle resolution for the window host functions. The real runtime resolves through
+// Electron's BrowserWindow.fromId. The bun harness replaces this via __testing because `bun test`
+// shares one module registry across files: index.js captures whichever test file's "electron" stub
+// required it first, so a later file cannot rely on its own stub identity. The seam keeps the
+// feature tests hermetic without changing production behavior.
+let windowResolver = (id) => BrowserWindow.fromId(id);
+
+// Main-plugin lifecycle events (SPEC §9 MVP: onLoad / onRendererReady / onUnload). onWindowCreated
+// already exists as ctx.window.onCreated. Subscriptions are module-level because their host events
+// (app ready, per-window did-finish-load / webContents destroyed) are process-wide, not per-plugin;
+// each entry below belongs to exactly one plugin VM and is removed through that plugin's
+// cleanupCallbacks array (revoke/deactivate) or when it fails closed.
+const loadCallbacks = new Set(); // ctx.onLoad — one-shot per subscription
+const rendererReadyCallbacks = new Set(); // ctx.onRendererReady — fires per did-finish-load
+const unloadCallbacks = new Set(); // ctx.onUnload — fires per webContents destroyed
+// True once the target app's own main process finished loading its original app (app ready).
+// ctx.onLoad subscriptions made after this point fire immediately (the event already passed).
+let appLoaded = false;
+
 function hasPermission(granted, perm) {
   return Array.isArray(granted) && granted.includes(perm);
 }
@@ -574,7 +598,249 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   vm.setProp(win, "setPosition", setPosition);
   setPosition.dispose();
 
+  const setVibrancy = vm.newFunction("setVibrancy", (winHandle, materialHandle) => {
+    // RT-3 (informational): vm.getString coercion can invoke the plugin's own toString/valueOf on
+    // an object handle; it runs under the enclosing operation's QuickJS deadline.
+    const id = vm.getNumber(winHandle);
+    const material = vm.getString(materialHandle);
+    const w = windowResolver(id);
+    if (!w) {
+      // Invalid window handle: structured error, never a synchronous throw across the bridge.
+      pluginLog(pluginId, "error", "window.setVibrancy: unknown window id " + id);
+      return vm.undefined;
+    }
+    if (hostPlatform !== "darwin") {
+      // macOS-only (SPEC §10 / docs/PLUGIN-SDK.md): a structured, logged no-op elsewhere.
+      pluginLog(
+        pluginId,
+        "warn",
+        "window.setVibrancy: requires macOS (host platform=" + hostPlatform + "); no-op",
+      );
+      return vm.undefined;
+    }
+    if (typeof w.setVibrancy !== "function") {
+      pluginLog(
+        pluginId,
+        "error",
+        "window.setVibrancy: BrowserWindow#setVibrancy is unavailable in this Electron build; no-op",
+      );
+      return vm.undefined;
+    }
+    try {
+      w.setVibrancy(material);
+      pluginLog(pluginId, "info", "window.setVibrancy: window=" + id + " material=" + material);
+    } catch (e) {
+      pluginLog(pluginId, "error", "window.setVibrancy failed: " + errorText(e));
+    }
+    return vm.undefined;
+  });
+  vm.setProp(win, "setVibrancy", setVibrancy);
+  setVibrancy.dispose();
+
+  const setMica = vm.newFunction("setMica", (winHandle, enabledHandle) => {
+    // RT-3 (informational): see setVibrancy — coercion runs under the op's deadline.
+    const id = vm.getNumber(winHandle);
+    const enabled = enabledFromHandle(vm, enabledHandle);
+    const w = windowResolver(id);
+    if (!w) {
+      pluginLog(pluginId, "error", "window.setMica: unknown window id " + id);
+      return vm.undefined;
+    }
+    if (hostPlatform !== "win32") {
+      // Windows 11 DWM backdrop only (SPEC §10 / docs/PLUGIN-SDK.md): logged no-op elsewhere.
+      pluginLog(
+        pluginId,
+        "warn",
+        "window.setMica: requires Windows (host platform=" + hostPlatform + "); no-op",
+      );
+      return vm.undefined;
+    }
+    if (typeof w.setBackgroundMaterial !== "function") {
+      pluginLog(
+        pluginId,
+        "error",
+        "window.setMica: BrowserWindow#setBackgroundMaterial is unavailable in this Electron build; no-op",
+      );
+      return vm.undefined;
+    }
+    const material = enabled ? "mica" : "none";
+    try {
+      w.setBackgroundMaterial(material);
+      pluginLog(pluginId, "info", "window.setMica: window=" + id + " material=" + material);
+    } catch (e) {
+      pluginLog(pluginId, "error", "window.setMica failed: " + errorText(e));
+    }
+    return vm.undefined;
+  });
+  vm.setProp(win, "setMica", setMica);
+  setMica.dispose();
+
   return win;
+}
+
+// setMica's enabled flag is typed boolean in the SDK. QuickJS booleans do not convert through
+// getNumber reliably, so read primitives via dump (QTS_Dump of a boolean is a plain "true"/"false"
+// — no guest code runs); any other type falls back to numeric coercion and is treated truthy on
+// non-zero (same lenient coercion family as the other host functions, bounded by the op deadline).
+function enabledFromHandle(vm, handle) {
+  if (vm.typeof(handle) === "boolean") return !!vm.dump(handle);
+  return vm.getNumber(handle) !== 0;
+}
+
+// --- Main-plugin lifecycle events (SPEC §9 MVP) ---
+//
+// ctx.onLoad(cb) / ctx.onRendererReady(cb) / ctx.onUnload(cb) attach at the MAIN context ROOT
+// (not under ctx.window) deliberately. ctx.window is the window *mutation* surface — every member
+// consumes a window handle to change a window. These three events announce the plugin host
+// lifecycle (the app loaded, a renderer finished loading, a window unloaded) and are not mutations,
+// so they live next to the module-level activate/deactivate lifecycle a plugin already implements
+// (docs/PLUGIN-SDK.md: Lifecycle), where SPEC §9 lists them. onWindowCreated stays in ctx.window
+// because it is the creation counterpart of the mutation handles there.
+//
+// Contracts are identical to ctx.window.onCreated (docs/PLUGIN-SDK.md "Lifecycle contract"):
+//   * callbacks are synchronous, run under runQuickJSOperation with a fresh per-operation CPU
+//     deadline, and must return undefined (the undefined-void contract is enforced);
+//   * a throwing, over-deadline, or non-void callback fails closed: its own subscription is
+//     unregistered so it is never re-invoked on later host events;
+//   * every subscription is pushed into the owning plugin's cleanupCallbacks, so revoke/deactivate
+//     disposes the dup'd guest callback handle and removes all listeners.
+//
+// Emit semantics (chosen and documented):
+//   * onLoad fires exactly once per subscription — when the target app's main process has finished
+//     loading its original app (see start(); app ready/whenReady resolves only after bootstrap's
+//     require of the original app registered its own boot code), or immediately at registration if
+//     the app already finished loading. No window argument: it is the app-process boot event.
+//   * onRendererReady fires per window per did-finish-load (i.e. per navigation), reusing the
+//     window record's loaded/rendererGeneration path inside start(); it passes the webContents id.
+//     Subscriptions made after a window already loaded fire once for each such window, mirroring
+//     onCreated's existing-window replay.
+//   * onUnload fires per window when its webContents is destroyed (the runtime's canonical unload
+//     point — a quitting app always destroys its windows, so app shutdown is covered by the same
+//     path without a separate before-quit wire that would double-fire normal per-window teardown);
+//     it passes the webContents id.
+function subscribeLifecycle(vm, pluginId, cleanupCallbacks, set, label, once, cbHandle) {
+  const callback = cbHandle.dup();
+  let registered = true;
+  let entry = null;
+  const unregister = () => {
+    if (!registered) return false;
+    registered = false;
+    callback.dispose();
+    set.delete(entry);
+    const index = cleanupCallbacks.indexOf(cleanup);
+    if (index !== -1) cleanupCallbacks.splice(index, 1);
+    return true;
+  };
+  const cleanup = () => {
+    unregister();
+  };
+  entry = {
+    pluginId,
+    vm,
+    unregister,
+    // argValues are JS numbers (window/contents ids today). Each is converted to a QuickJS handle
+    // for the guest call and disposed afterwards, exactly like onCreated's window-id handle.
+    invoke: (argValues) => {
+      if (!registered) return false;
+      const handles = [];
+      let succeeded = false;
+      try {
+        for (const value of argValues || []) handles.push(vm.newNumber(value));
+        succeeded = runQuickJSOperation(
+          vm,
+          pluginId,
+          label + " callback",
+          () => vm.callFunction(callback, vm.undefined, ...handles),
+          true,
+        );
+      } finally {
+        for (const handle of handles) handle.dispose();
+      }
+      if (!succeeded) unregister();
+      else if (once) unregister();
+      return succeeded;
+    },
+  };
+  set.add(entry);
+  cleanupCallbacks.push(cleanup);
+  return entry;
+}
+
+// Build and attach ctx.onLoad / ctx.onRendererReady / ctx.onUnload onto the main-plugin ctx object.
+// Exposed to every QuickJS main plugin (the reconcile path only loads a main plugin into QuickJS
+// when electron.window — or dev-mode runtime.unsafe, which runs raw instead — is granted).
+function attachLifecycleApi(vm, ctx, pluginId, cleanupCallbacks) {
+  const onLoad = vm.newFunction("onLoad", (cbHandle) => {
+    const entry = subscribeLifecycle(
+      vm, pluginId, cleanupCallbacks, loadCallbacks, "ctx.onLoad", true, cbHandle,
+    );
+    if (entry && appLoaded) {
+      // The app already finished loading before this plugin subscribed (typical: the plan arrives
+      // after app ready). Deliver the boot event synchronously, exactly once.
+      entry.invoke([]);
+    }
+    return vm.undefined;
+  });
+  vm.setProp(ctx, "onLoad", onLoad);
+  onLoad.dispose();
+
+  const onRendererReady = vm.newFunction("onRendererReady", (cbHandle) => {
+    const entry = subscribeLifecycle(
+      vm, pluginId, cleanupCallbacks, rendererReadyCallbacks, "ctx.onRendererReady", false, cbHandle,
+    );
+    if (entry) {
+      // Replay windows that already finished loading (the QuickJS sandbox loads asynchronously and
+      // can miss their did-finish-load), mirroring onCreated's existing-window replay. Future loads
+      // reach the subscription through the live did-finish-load dispatch in start().
+      for (const w of [...windows.values()]) {
+        if (!w.loaded) continue;
+        if (!entry.invoke([w.contents.id])) break;
+      }
+    }
+    return vm.undefined;
+  });
+  vm.setProp(ctx, "onRendererReady", onRendererReady);
+  onRendererReady.dispose();
+
+  const onUnload = vm.newFunction("onUnload", (cbHandle) => {
+    subscribeLifecycle(
+      vm, pluginId, cleanupCallbacks, unloadCallbacks, "ctx.onUnload", false, cbHandle,
+    );
+    return vm.undefined;
+  });
+  vm.setProp(ctx, "onUnload", onUnload);
+  onUnload.dispose();
+}
+
+// The target app's main process finished loading its original app: deliver every pending ctx.onLoad
+// exactly once. Guarded so a second signal (e.g. a later ready emission) never double-delivers.
+function markAppLoaded() {
+  if (appLoaded) return;
+  appLoaded = true;
+  const pending = [...loadCallbacks];
+  loadCallbacks.clear();
+  for (const entry of pending) {
+    // once: a successful or failed invocation unregisters the entry (fail-closed), so nothing here
+    // can fire twice.
+    entry.invoke([]);
+  }
+}
+
+// Per-window renderer-ready dispatch: fires ctx.onRendererReady subscribers for a window whose
+// contents finished loading (per navigation — called from the did-finish-load path in start()).
+function fireRendererReady(w) {
+  if (!w || !w.contents) return;
+  for (const entry of [...rendererReadyCallbacks]) {
+    entry.invoke([w.contents.id]);
+  }
+}
+
+// Per-window unload dispatch: fires ctx.onUnload subscribers when a window's webContents is
+// destroyed (called from the webContents destroyed path in start()).
+function fireWindowUnload(contentsId) {
+  for (const entry of [...unloadCallbacks]) {
+    entry.invoke([contentsId]);
+  }
 }
 
 // --- Developer-mode raw plugins (runtime.unsafe) ---
@@ -700,6 +966,10 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
     const logger = buildLogger(vm, plugin.id);
     vm.setProp(ctx, "logger", logger);
     logger.dispose();
+    // SPEC §9 MVP lifecycle events attach at the main context root (see attachLifecycleApi for the
+    // rationale and emit semantics). Only the sandboxed main path exposes them; the raw dev-mode
+    // ctx stays minimal ({ logger, raw }) so this does not widen the runtime.unsafe surface.
+    attachLifecycleApi(vm, ctx, plugin.id, cleanupCallbacks);
     if (hasPermission(plugin.granted, "electron.window")) {
       const win = buildWindowApi(vm, app, cleanupCallbacks, plugin.id);
       vm.setProp(ctx, "window", win);
@@ -1111,6 +1381,20 @@ function start(app, sinks = {}) {
   }
   appRef = app;
 
+  // Lifecycle boot event (SPEC §9 onLoad): mark the target app's main process as loaded once the
+  // app is ready. bootstrap.js calls runtime.start(...) and THEN requires the original app, so the
+  // original app's own boot code (its ready handlers / whenReady consumers) is registered before
+  // Electron emits ready — delivering onLoad only after the original app finished loading. On real
+  // Electron use app.whenReady() (its resolution runs after the ready event's synchronous dispatch
+  // and never double-fires); stub/test hosts without whenReady fall back to the ready event.
+  if (app && typeof app.whenReady === "function") {
+    app.whenReady().then(markAppLoaded).catch((e) => {
+      log("app-ready tracking failed: " + (e && e.message ? e.message : e), "warn");
+    });
+  } else if (app && typeof app.once === "function") {
+    app.once("ready", markAppLoaded);
+  }
+
   // Adapter (compat profile) selection and onBootstrap. Critical ordering invariant: this runs
   // synchronously inside start(), so it happens BEFORE bootstrap.js requires the original target
   // app (bootstrap.js: runtime.start(...) then require(originalAsar)). Phase B adapters hook
@@ -1152,8 +1436,13 @@ function start(app, sinks = {}) {
     };
     windows.set(contents.id, w);
     contents.on("destroyed", () => {
-      windows.delete(contents.id);
-      cleanupRendererPlugins(contents.id);
+      const contentsId = contents.id;
+      windows.delete(contentsId);
+      cleanupRendererPlugins(contentsId);
+      // Main-plugin lifecycle (SPEC §9 onUnload): fires per window when its webContents is
+      // destroyed. A quitting app always destroys its windows, so app shutdown reaches the same
+      // path — a separate before-quit wire would double-fire normal per-window teardown.
+      fireWindowUnload(contentsId);
     });
     contents.on("did-finish-load", () => {
       // Path A renderer-timing seam: the active adapter may opt into `renderer.gate(win, ready)`
@@ -1167,6 +1456,10 @@ function start(app, sinks = {}) {
         cleanupRendererPlugins(contents.id);
         reconcile(w);
         reconcileRendererPlugins(w);
+        // Main-plugin lifecycle (SPEC §9 onRendererReady): fires per window per did-finish-load
+        // (per navigation), after the window record reached the loaded state. Adapter gates call
+        // this exact onReady (see above), so gated timing applies to the event as well.
+        fireRendererReady(w);
       };
       const gate =
         activeAdapter &&
@@ -1212,6 +1505,12 @@ function reset() {
   abuseDisabledPlugins.clear();
   vmDisposeCount = 0;
   quickJSGetCount = 0;
+  loadCallbacks.clear();
+  rendererReadyCallbacks.clear();
+  unloadCallbacks.clear();
+  appLoaded = false;
+  hostPlatform = process.platform;
+  windowResolver = (id) => BrowserWindow.fromId(id);
 }
 
 module.exports = {
@@ -1224,5 +1523,18 @@ module.exports = {
     windows: () => windows,
     vmDisposeCount: () => vmDisposeCount,
     quickJSGetCount: () => quickJSGetCount,
+    // Platform gate seam for the bun harness: lets tests exercise the macOS/Windows-only host
+    // functions (setVibrancy/setMica) on any host. reset() restores the real host platform.
+    setPlatform: (platform) => {
+      hostPlatform = platform;
+    },
+    // Window-resolution seam for the bun harness: `bun test` shares one module registry across
+    // files, so index.js captures whichever test file's "electron" stub loaded first and a later
+    // file cannot rely on its own electron stub identity. Tests point this at their fake window
+    // map to exercise the setVibrancy/setMica handle resolution hermetically. reset() restores the
+    // production Electron BrowserWindow.fromId behavior.
+    setWindowResolver: (resolver) => {
+      windowResolver = typeof resolver === "function" ? resolver : (id) => BrowserWindow.fromId(id);
+    },
   },
 };
