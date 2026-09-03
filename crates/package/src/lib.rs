@@ -3,6 +3,7 @@
 //! perform install orchestration, or register plugins.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -44,6 +45,44 @@ const MAX_COMPRESSION_RATIO: u64 = 100;
 /// this constant (and prefer migrating callers to the explicit-version variants).
 pub const HOST_PROTOCOL_VERSION: &str = "0.1.0";
 
+/// Declared value type of one plugin config field (see [`ConfigField`]). Only scalar types are
+/// supported today; `object`/`array` config fields are rejected as reserved for a future schema
+/// version.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigType {
+    String,
+    Number,
+    Boolean,
+}
+
+impl ConfigType {
+    /// Lowercase JSON name of this config type (`string`/`number`/`boolean`), for error messages.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ConfigType::String => "string",
+            ConfigType::Number => "number",
+            ConfigType::Boolean => "boolean",
+        }
+    }
+}
+
+/// One declared key of the per-plugin `config` schema in `manifest.json`:
+/// `{ "type": "string"|"number"|"boolean", "default": <matching value>, "label": "…" }`.
+///
+/// Unknown keys inside a field declaration are rejected (`deny_unknown_fields`); the `default`,
+/// when present, must match the declared `type` (enforced by the manifest schema validator).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigField {
+    #[serde(rename = "type")]
+    pub field_type: ConfigType,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 /// A parsed plugin manifest and its execution plan (MVP: declared == granted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plugin {
@@ -59,6 +98,11 @@ pub struct Plugin {
     pub renderer: Option<String>,
     /// Main-process JS source for `electron.*` capabilities.
     pub main: Option<String>,
+    /// Declared per-plugin config schema (`{ key: { type, default?, label? } }`). Values are
+    /// stored per-application × per-plugin in the Core `PluginPolicy` and read at runtime via
+    /// `ctx.config`; the Manager renders a settings form from this schema.
+    #[serde(default)]
+    pub config: BTreeMap<String, ConfigField>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -76,7 +120,6 @@ struct Manifest {
     #[serde(default)]
     entry: Option<Entry>,
     #[serde(default)]
-    #[allow(dead_code)] // accepted for forward-compat; not processed yet
     config: serde_json::Value,
 }
 
@@ -110,8 +153,8 @@ pub fn validate_manifest_schema_for_host(
     host_version: &str,
 ) -> Result<(), String> {
     // Parse into a strict typed DTO (rejects unknown fields and wrong types).
-    let m: Manifest = serde_json::from_value(manifest.clone())
-        .map_err(|e| format!("manifest schema: {e}"))?;
+    let m: Manifest =
+        serde_json::from_value(manifest.clone()).map_err(|e| format!("manifest schema: {e}"))?;
 
     validate_id(&m.id)?;
     if m.name.trim().is_empty() {
@@ -122,6 +165,14 @@ pub fn validate_manifest_schema_for_host(
     }
     semver::Version::parse(&m.version).map_err(|e| format!("invalid `version`: {e}"))?;
     validate_tronhawk_protocol(host_version, &m.tronhawk)?;
+
+    // `config`: the optional per-plugin settings schema. Raw-value validation (before any typed
+    // parse) so each rejection carries a precise, actionable message (object/array `type` values
+    // get an explicit "reserved for a future schema" note). The `config` JSON value is still
+    // carried in typed [`Plugin::config`] form by [`validate_manifest_for_host`].
+    if !m.config.is_null() {
+        validate_config_schema(&m.config)?;
+    }
 
     // Permissions: known + no duplicates.
     let mut seen = std::collections::HashSet::new();
@@ -225,6 +276,137 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the raw `manifest.json` `config` value (the per-plugin settings schema). Rules:
+/// `config` must be an object of at most [`MAX_CONFIG_FIELDS`] field declarations, every key must
+/// satisfy the plugin-id character rules, every field must be an object whose keys are limited to
+/// `type`/`default`/`label`, `type` must be a supported scalar type (`object`/`array` are
+/// rejected with a "future" note), and a present `default` must match the declared `type`.
+const MAX_CONFIG_FIELDS: usize = 32;
+
+fn validate_config_schema(config: &serde_json::Value) -> Result<(), String> {
+    let fields = config
+        .as_object()
+        .ok_or_else(|| "`config` must be an object of config field declarations".to_string())?;
+    if fields.len() > MAX_CONFIG_FIELDS {
+        return Err(format!(
+            "`config` declares {} fields; the maximum is {MAX_CONFIG_FIELDS}",
+            fields.len()
+        ));
+    }
+    for (key, field) in fields {
+        validate_config_key(key)?;
+        let declaration = field
+            .as_object()
+            .ok_or_else(|| format!("`config` field `{key}` must be an object with a `type`"))?;
+        for field_key in declaration.keys() {
+            if !matches!(field_key.as_str(), "type" | "default" | "label") {
+                return Err(format!(
+                    "`config` field `{key}` has an unknown key `{field_key}` \
+                     (allowed: `type`, `default`, `label`)"
+                ));
+            }
+        }
+        // `label` (if present) must be a non-empty string limited to 64 chars — it is shown
+        // verbatim in the Manager settings form, so reject non-string / over-long values early.
+        if let Some(label) = declaration.get("label") {
+            if !label.is_string() {
+                return Err(format!(
+                    "`config` field `{key}` `label` must be a string (got `{label}`)"
+                ));
+            }
+            if label.as_str().is_some_and(|s| s.len() > 64) {
+                return Err(format!(
+                    "`config` field `{key}` `label` must be at most 64 characters"
+                ));
+            }
+            if label.as_str().is_some_and(str::is_empty) {
+                return Err(format!("`config` field `{key}` `label` must not be empty"));
+            }
+        }
+        let declared = declaration
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("`config` field `{key}` requires a string `type`"))?;
+        match declared {
+            "string" | "number" | "boolean" => {}
+            "object" | "array" => {
+                return Err(format!(
+                    "`config` field `{key}` type `{declared}` is reserved for a future schema \
+                     version; supported types today: `string`, `number`, `boolean`"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "`config` field `{key}` has an unsupported type `{other}`; \
+                     supported types: `string`, `number`, `boolean`"
+                ));
+            }
+        }
+        match declaration.get("default") {
+            // `null` is treated as "no default" (it deserializes to `Option::None`).
+            Some(default) if !default.is_null() => {
+                let matches_type = match declared {
+                    "string" => default.is_string(),
+                    "number" => default.is_number(),
+                    "boolean" => default.is_boolean(),
+                    _ => false,
+                };
+                if !matches_type {
+                    return Err(format!(
+                        "`config` field `{key}` `default` must be a {declared} (got `{default}`)"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `config` schema key with the same character rules as a plugin id (reverse-DNS-safe
+/// ASCII, lowercase letters/digits/`.`/`-`/`_`, no empty dot-segments).
+fn validate_config_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(format!(
+            "`config` field name `{key}` must be 1-128 characters"
+        ));
+    }
+    for c in key.chars() {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_';
+        if !ok {
+            return Err(format!(
+                "`config` field name `{key}` contains invalid character `{c}`"
+            ));
+        }
+    }
+    for segment in key.split('.') {
+        if segment.is_empty() {
+            return Err(format!(
+                "`config` field name `{key}` must not contain empty dot-segments (e.g. `..`)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a validated raw `config` JSON value into its typed per-key schema
+/// ([`ConfigField`] map). Only call after [`validate_config_schema`] succeeded, so the typed
+/// parse cannot fail.
+fn parse_plugin_config(
+    config: Option<&serde_json::Value>,
+) -> Result<BTreeMap<String, ConfigField>, String> {
+    match config {
+        // `null` is treated as "no config schema", matching the schema-validation gate
+        // (`if !m.config.is_null()`), so a manifest with an explicit `"config": null` (accepted
+        // before typed config landed) still installs with an empty schema.
+        Some(value) if value.is_null() => Ok(BTreeMap::new()),
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|e| format!("manifest config: {e}"))
+        }
+        None => Ok(BTreeMap::new()),
+    }
+}
+
 /// Validate a `manifest.json` value and resolve its entry files against `root`, using the default
 /// host protocol version [`HOST_PROTOCOL_VERSION`].
 pub fn validate_manifest(manifest: &serde_json::Value, root: &Path) -> Result<Plugin, String> {
@@ -247,7 +429,11 @@ fn validate_manifest_for_host(
     let permissions = manifest
         .get("permissions")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let css = match manifest.get("css") {
@@ -280,6 +466,8 @@ fn validate_manifest_for_host(
         None => None,
     };
 
+    let config = parse_plugin_config(manifest.get("config"))?;
+
     Ok(Plugin {
         id,
         name,
@@ -290,6 +478,7 @@ fn validate_manifest_for_host(
         css,
         renderer,
         main,
+        config,
     })
 }
 
@@ -378,7 +567,8 @@ pub fn extract_for_host(thx: &Path, dest: &Path, host_version: &str) -> Result<P
         return Err(format!("archive has too many entries ({})", archive.len()));
     }
     let mut planned: Vec<PathBuf> = Vec::with_capacity(archive.len());
-    let mut seen_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut total: u64 = 0;
     let mut total_compressed: u64 = 0;
     for i in 0..archive.len() {
@@ -476,10 +666,18 @@ fn reject_duplicate_archive_entries(thx: &Path) -> Result<(), String> {
         Some(i) => i,
         None => return Ok(()), // not a parseable ZIP; let ZipArchive report it
     };
-    let cd_size = u32::from_le_bytes([tail[eocd + 12], tail[eocd + 13], tail[eocd + 14], tail[eocd + 15]])
-        as u64;
-    let cd_offset = u32::from_le_bytes([tail[eocd + 16], tail[eocd + 17], tail[eocd + 18], tail[eocd + 19]])
-        as u64;
+    let cd_size = u32::from_le_bytes([
+        tail[eocd + 12],
+        tail[eocd + 13],
+        tail[eocd + 14],
+        tail[eocd + 15],
+    ]) as u64;
+    let cd_offset = u32::from_le_bytes([
+        tail[eocd + 16],
+        tail[eocd + 17],
+        tail[eocd + 18],
+        tail[eocd + 19],
+    ]) as u64;
     if cd_offset + cd_size > len {
         return Ok(()); // malformed offsets; let ZipArchive report it
     }
@@ -505,7 +703,9 @@ fn reject_duplicate_archive_entries(thx: &Path) -> Result<(), String> {
         }
         let name = String::from_utf8_lossy(&cd[pos + 46..pos + 46 + name_len]).into_owned();
         if !seen.insert(name.clone()) {
-            return Err(format!("duplicate archive entry: `{name}` appears more than once"));
+            return Err(format!(
+                "duplicate archive entry: `{name}` appears more than once"
+            ));
         }
         pos += record;
     }
@@ -642,11 +842,13 @@ fn is_windows_reserved_name(segment: &str) -> bool {
             name = format!("{}{}", upper[..3].iter().collect::<String>(), d);
         }
     }
-    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
-        || (name.len() == 4
-            && (name.starts_with("COM") || name.starts_with("LPT"))
-            && name.as_bytes()[3].is_ascii_digit()
-            && name.as_bytes()[3] != b'0')
+    matches!(
+        name.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (name.len() == 4
+        && (name.starts_with("COM") || name.starts_with("LPT"))
+        && name.as_bytes()[3].is_ascii_digit()
+        && name.as_bytes()[3] != b'0')
 }
 
 fn superscript_digit(c: char) -> Option<char> {
@@ -675,7 +877,9 @@ fn track_entry_name(
 ) -> Result<(), String> {
     if let Some(prev) = seen.get(&key) {
         if prev.as_str() == name {
-            return Err(format!("duplicate archive entry: `{name}` appears more than once"));
+            return Err(format!(
+                "duplicate archive entry: `{name}` appears more than once"
+            ));
         }
         return Err(format!(
             "archive entry `{name}` collides with `{prev}` on a case-insensitive filesystem"
@@ -774,7 +978,10 @@ mod tests {
         );
         // Fail-at-start: the offending archive must not have written anything into dest.
         let wrote_anything = std::fs::read_dir(&dest).unwrap().next().is_some();
-        assert!(!wrote_anything, "dest must stay empty on rejection, got: {err}");
+        assert!(
+            !wrote_anything,
+            "dest must stay empty on rejection, got: {err}"
+        );
         std::fs::remove_dir_all(&ws).ok();
         err
     }
@@ -787,7 +994,11 @@ mod tests {
             for (i, item) in table.iter_mut().enumerate() {
                 let mut c = i as u32;
                 for _ in 0..8 {
-                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
                 }
                 *item = c;
             }
@@ -902,7 +1113,10 @@ mod tests {
                 "tronhawk": "^0.1",
                 "permissions": []
             });
-            assert!(validate_manifest_schema(&m).is_err(), "id `{bad}` should be rejected");
+            assert!(
+                validate_manifest_schema(&m).is_err(),
+                "id `{bad}` should be rejected"
+            );
         }
     }
 
@@ -927,8 +1141,14 @@ mod tests {
         // A well-formed-but-incompatible range is rejected with a message naming both sides.
         let m = manifest_json("^2.0");
         let err = validate_manifest_schema_for_host(&m, "1.0.0").unwrap_err();
-        assert!(err.contains("`^2.0`"), "message should name the range: {err}");
-        assert!(err.contains("1.0.0"), "message should name the host version: {err}");
+        assert!(
+            err.contains("`^2.0`"),
+            "message should name the range: {err}"
+        );
+        assert!(
+            err.contains("1.0.0"),
+            "message should name the host version: {err}"
+        );
 
         // `~0.1.1` means >=0.1.1,<0.2.0 — host 0.1.0 does not satisfy it.
         let m2 = manifest_json("~0.1.1");
@@ -1097,7 +1317,10 @@ mod tests {
         let m = manifest_bytes("^0.1");
         let zeros = vec![0u8; 8 * 1024 * 1024];
         let err = assert_extract_rejects(
-            &[("manifest.json", m.as_slice()), ("bomb.bin", zeros.as_slice())],
+            &[
+                ("manifest.json", m.as_slice()),
+                ("bomb.bin", zeros.as_slice()),
+            ],
             "compression ratio",
         );
         assert!(err.contains("bomb.bin"), "{err}");
@@ -1125,5 +1348,196 @@ mod tests {
         assert_eq!(plugin.css.as_deref(), Some("body{}"));
         assert!(dest.join("lib/main.js").exists());
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    // --- `config` schema ------------------------------------------------------
+
+    fn manifest_with_config(config: serde_json::Value) -> serde_json::Value {
+        let mut manifest = manifest_json("^0.1");
+        manifest["config"] = config;
+        manifest
+    }
+
+    #[test]
+    fn config_schema_accepts_valid_scalar_fields_and_defaults() {
+        // A scalar schema with defaults and labels passes schema validation…
+        let m = manifest_with_config(serde_json::json!({
+            "opacity": { "type": "number", "default": 0.8, "label": "Opacity" },
+            "title": { "type": "string", "default": "glass" },
+            "vibrancy": { "type": "boolean", "default": true },
+            "empty_default": { "type": "string", "default": null },
+            "no_default": { "type": "number" },
+        }));
+        validate_manifest_schema(&m).unwrap();
+        // …and is parsed into typed ConfigField entries by the value routes.
+        let dir = tmp_ws().join("plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        let plugin = load_plugin_dir(&dir).unwrap();
+        assert_eq!(plugin.config.len(), 5);
+        let opacity = &plugin.config["opacity"];
+        assert_eq!(opacity.field_type, ConfigType::Number);
+        assert_eq!(opacity.default.as_ref().unwrap(), &serde_json::json!(0.8));
+        assert_eq!(opacity.label.as_deref(), Some("Opacity"));
+        assert_eq!(plugin.config["title"].field_type, ConfigType::String);
+        assert_eq!(plugin.config["vibrancy"].field_type, ConfigType::Boolean);
+        // `default: null` is treated as "no default" (matches Option deserialization).
+        assert_eq!(plugin.config["empty_default"].default, None);
+        assert_eq!(plugin.config["no_default"].default, None);
+        assert_eq!(plugin.config["no_default"].label, None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn config_schema_rejects_object_and_array_types_with_a_future_note() {
+        for declared in ["object", "array"] {
+            let m = manifest_with_config(serde_json::json!({
+                "nested": { "type": declared }
+            }));
+            let err = validate_manifest_schema(&m).unwrap_err();
+            assert!(
+                err.contains("reserved for a future schema"),
+                "`{declared}` must be rejected with a future note, got: {err}"
+            );
+            assert!(err.contains(&format!("`{declared}`")), "{err}");
+        }
+    }
+
+    #[test]
+    fn config_schema_rejects_unknown_field_declaration_keys() {
+        let m = manifest_with_config(serde_json::json!({
+            "opacity": { "type": "number", "bogus": 1 }
+        }));
+        let err = validate_manifest_schema(&m).unwrap_err();
+        assert!(err.contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn config_schema_rejects_default_type_mismatch() {
+        for (config, expected) in [
+            (
+                serde_json::json!({ "title": { "type": "string", "default": 42 } }),
+                "must be a string",
+            ),
+            (
+                serde_json::json!({ "opacity": { "type": "number", "default": "high" } }),
+                "must be a number",
+            ),
+            (
+                serde_json::json!({ "vibrancy": { "type": "boolean", "default": 1 } }),
+                "must be a boolean",
+            ),
+            (
+                serde_json::json!({ "title": { "type": "string", "default": ["a"] } }),
+                "must be a string",
+            ),
+        ] {
+            let m = manifest_with_config(config);
+            let err = validate_manifest_schema(&m).unwrap_err();
+            assert!(err.contains(expected), "expected `{expected}` in: {err}");
+        }
+    }
+
+    #[test]
+    fn config_schema_rejects_bad_config_keys() {
+        for bad in ["UPPER", "a b", "a..b", ".lead", ".", "..", "trail."] {
+            let mut fields = serde_json::Map::new();
+            fields.insert(bad.to_string(), serde_json::json!({ "type": "string" }));
+            let m = manifest_with_config(serde_json::Value::Object(fields));
+            let err = validate_manifest_schema(&m).unwrap_err();
+            assert!(
+                err.contains("field name"),
+                "config key `{bad}` should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_schema_rejects_more_than_32_fields() {
+        let mut fields = serde_json::Map::new();
+        for i in 0..33 {
+            fields.insert(
+                format!("key{i:02}"),
+                serde_json::json!({ "type": "number" }),
+            );
+        }
+        let m = manifest_with_config(serde_json::Value::Object(fields));
+        let err = validate_manifest_schema(&m).unwrap_err();
+        assert!(err.contains("maximum is 32"), "{err}");
+        // Exactly 32 is fine.
+        let mut fields = serde_json::Map::new();
+        for i in 0..32 {
+            fields.insert(
+                format!("key{i:02}"),
+                serde_json::json!({ "type": "number" }),
+            );
+        }
+        validate_manifest_schema(&manifest_with_config(serde_json::Value::Object(fields))).unwrap();
+    }
+
+    #[test]
+    fn config_null_is_treated_as_an_empty_schema_and_still_installs() {
+        // A manifest with an explicit `"config": null` (accepted before typed config landed) must
+        // pass schema validation AND the typed value route, yielding an empty schema — not fail
+        // with "invalid type: null, expected a map".
+        let m = manifest_with_config(serde_json::Value::Null);
+        validate_manifest_schema(&m).unwrap();
+        let dir = tmp_ws().join("config-null");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        let plugin = load_plugin_dir(&dir).unwrap();
+        assert!(plugin.config.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn config_label_must_be_a_bounded_string() {
+        for label in [serde_json::json!(42), serde_json::json!("x".repeat(65)), serde_json::json!("")] {
+            let m = manifest_with_config(serde_json::json!({
+                "opacity": { "type": "number", "label": label }
+            }));
+            let err = validate_manifest_schema(&m).unwrap_err();
+            assert!(
+                err.contains("`label`"),
+                "label `{label}` should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_dir_with_config_carries_the_schema_on_the_plugin() {
+        let dir = tmp_ws().join("config-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "com.example.config",
+                "name": "Config plugin",
+                "version": "1.0.0",
+                "author": "A",
+                "tronhawk": "^0.1",
+                "permissions": [],
+                "config": {
+                    "opacity": { "type": "number", "default": 0.5 },
+                    "title": { "type": "string", "default": "hi" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let plugin = load_plugin_dir(&dir).unwrap();
+        assert_eq!(plugin.id, "com.example.config");
+        assert_eq!(plugin.config.len(), 2);
+        assert_eq!(plugin.config["opacity"].field_type, ConfigType::Number);
+        assert_eq!(
+            plugin.config["opacity"].default.as_ref().unwrap(),
+            &serde_json::json!(0.5)
+        );
+        assert_eq!(plugin.config["title"].field_type, ConfigType::String);
+        assert_eq!(
+            plugin.config["title"].default.as_ref().unwrap(),
+            &serde_json::json!("hi")
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }

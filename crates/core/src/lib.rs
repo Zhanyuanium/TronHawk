@@ -4,6 +4,7 @@
 //! Consumes `tronhawk-package` for `.thx` format mechanics and `tronhawk-ipc` for transport.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -26,6 +27,11 @@ pub struct PluginGrant {
     pub css: Option<String>,
     pub renderer: Option<String>,
     pub main: Option<String>,
+    /// Merged per-plugin config values for this execution-plan snapshot: schema defaults overlaid
+    /// with the stored per-application policy config, restricted to schema-declared keys. An
+    /// enabled plugin with no config schema carries an empty map.
+    #[serde(default)]
+    pub config: BTreeMap<String, serde_json::Value>,
 }
 
 /// The execution plan served to the Runtime: a revision + the set of granted plugins.
@@ -68,6 +74,7 @@ fn plugin_grant(plugin: Plugin) -> PluginGrant {
         css: plugin.css,
         renderer: plugin.renderer,
         main: plugin.main,
+        config: BTreeMap::new(),
     }
 }
 

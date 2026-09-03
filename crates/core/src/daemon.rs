@@ -11,6 +11,7 @@ use crate::log_store::{LogLevel, LogQuery, LogStore, LogStream, NewLogRecord};
 use crate::{
     hash_bytes, hash_json, plugin_grant, transaction_dir, transaction_file, ExecutionPlan, Plugin,
 };
+use tronhawk_package::{ConfigField, ConfigType};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 /// Idle window (and the value advertised as `expiresAfterIdleSeconds`). Single source of truth:
@@ -59,6 +60,11 @@ pub struct PluginPolicy {
     pub enabled: bool,
     #[serde(default)]
     pub grants: Vec<String>,
+    /// Stored per-plugin config values (a whole-object snapshot replaced by `setPluginConfig`),
+    /// keyed by the plugin manifest's declared config schema. Missing for legacy state.json —
+    /// `#[serde(default)]` keeps old state files loadable.
+    #[serde(default)]
+    pub config: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,6 +320,8 @@ impl CoreService {
             "installPlugin" => self.install_plugin(inner, request.params),
             "setApplicationPluginPolicy" => self.set_policy(inner, request.params),
             "setDeveloperMode" => self.set_developer_mode(inner, request.params),
+            "getPluginConfig" => self.get_plugin_config(inner, request.params),
+            "setPluginConfig" => self.set_plugin_config(inner, request.params),
             "removePlugin" => self.remove_plugin(inner, request.params),
             "createLaunchSession" => self.create_launch_session(request.params),
             "queryLogs" => self.query_logs(request.params),
@@ -673,9 +681,18 @@ impl CoreService {
             ));
         }
 
+        // CRITICAL interlock: rebuilding the policy from `enabled` + `grants` must NOT wipe the
+        // per-plugin stored config. A Manager grant-toggle goes through here and would otherwise
+        // silently drop every configured value.
+        let config = application
+            .plugins
+            .get(&params.plugin_id)
+            .map(|existing| existing.config.clone())
+            .unwrap_or_default();
         let policy = PluginPolicy {
             enabled: params.enabled,
             grants: params.grants,
+            config,
         };
         let mut next = inner.state.clone();
         next.applications
@@ -692,6 +709,121 @@ impl CoreService {
             "Application plugin policy updated",
         );
         serde_json::to_value(policy).map_err(|e| RouterError::Internal(e.to_string()))
+    }
+
+    /// Read the merged config for an installed plugin in an application: schema defaults overlaid
+    /// with the stored per-application policy config, restricted to schema-declared keys.
+    fn get_plugin_config(
+        &self,
+        inner: &mut ServiceInner,
+        params: serde_json::Value,
+    ) -> RouterResult {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            application_id: String,
+            plugin_id: String,
+        }
+        let params: Params = parse_params(params)?;
+        let application = inner
+            .state
+            .applications
+            .get(&params.application_id)
+            .cloned()
+            .ok_or_else(|| RouterError::InvalidParams("application not found".into()))?;
+        let plugin = self
+            .installed_plugins(inner)?
+            .into_iter()
+            .find(|plugin| plugin.id == params.plugin_id)
+            .ok_or_else(|| RouterError::InvalidParams("plugin not found".into()))?;
+        let stored = application
+            .plugins
+            .get(&plugin.id)
+            .map(|policy| policy.config.clone())
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "config": merge_plugin_config(&plugin.config, &stored)
+        }))
+    }
+
+    /// Replace the whole stored config object for an installed plugin in an application. Every
+    /// key must be declared by the plugin's config schema and every value must match the schema
+    /// field type (strings capped at 4096 bytes); the object is persisted and a core event is
+    /// emitted. Returns the merged config (defaults overlaid on the newly stored values).
+    fn set_plugin_config(
+        &self,
+        inner: &mut ServiceInner,
+        params: serde_json::Value,
+    ) -> RouterResult {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            application_id: String,
+            plugin_id: String,
+            config: BTreeMap<String, serde_json::Value>,
+        }
+        let params: Params = parse_params(params)?;
+        if !inner
+            .state
+            .applications
+            .contains_key(&params.application_id)
+        {
+            return Err(RouterError::InvalidParams("application not found".into()));
+        }
+        let plugin = self
+            .installed_plugins(inner)?
+            .into_iter()
+            .find(|plugin| plugin.id == params.plugin_id)
+            .ok_or_else(|| RouterError::InvalidParams("plugin not found".into()))?;
+        for key in params.config.keys() {
+            if !plugin.config.contains_key(key) {
+                return Err(RouterError::InvalidParams(format!(
+                    "unknown config key `{key}`"
+                )));
+            }
+        }
+        for (key, value) in &params.config {
+            let field = &plugin.config[key];
+            let matches_type = match field.field_type {
+                ConfigType::String => value.is_string(),
+                ConfigType::Number => value.is_number(),
+                ConfigType::Boolean => value.is_boolean(),
+            };
+            if !matches_type {
+                return Err(RouterError::InvalidParams(format!(
+                    "config key `{key}` must be a {}",
+                    field.field_type.type_name()
+                )));
+            }
+            if field.field_type == ConfigType::String
+                && value.as_str().is_some_and(|string| string.len() > 4096)
+            {
+                return Err(RouterError::InvalidParams(format!(
+                    "config key `{key}` must be at most 4096 bytes"
+                )));
+            }
+        }
+        let merged = merge_plugin_config(&plugin.config, &params.config);
+
+        // REPLACE the whole stored config object (not a per-key merge): callers always send the
+        // full desired state.
+        let mut next = inner.state.clone();
+        next.applications
+            .get_mut(&params.application_id)
+            .expect("application checked above")
+            .plugins
+            .entry(params.plugin_id.clone())
+            .or_default()
+            .config = params.config;
+        write_state(&self.state_path, &next).map_err(RouterError::Internal)?;
+        inner.state = next;
+        self.append_core_event(
+            &params.application_id,
+            Some(&params.plugin_id),
+            "core.plugin_config.updated",
+            "Plugin config updated",
+        );
+        Ok(serde_json::json!({ "config": merged }))
     }
 
     fn install_plugin(&self, inner: &mut ServiceInner, params: serde_json::Value) -> RouterResult {
@@ -993,7 +1125,14 @@ impl CoreService {
             {
                 plugin.main = None;
             }
-            grants.push(plugin_grant(plugin));
+            // Carry the merged config (schema defaults overlaid with stored policy values) into
+            // this plan grant. Only enabled plugins reach this point, so a disabled plugin's
+            // config is never included in the plan; the snapshot is content-hashed, so a config
+            // change alters the plan revision.
+            let config = merge_plugin_config(&plugin.config, &policy.config);
+            let mut grant = plugin_grant(plugin);
+            grant.config = config;
+            grants.push(grant);
         }
         Ok(ExecutionPlan {
             revision: hash_json(&grants),
@@ -1392,7 +1531,27 @@ fn plugin_metadata_value(plugin: &Plugin) -> RouterResult {
         "author": plugin.author,
         "tronhawk": plugin.tronhawk,
         "requestedPermissions": plugin.permissions,
+        // The declared config schema, so the Manager can render a per-plugin settings form.
+        "config": plugin.config,
     }))
+}
+
+/// Merge a plugin's stored config into its full effective config for one application: schema
+/// defaults overlaid with stored values, restricted to schema-declared keys. A stored value wins
+/// over the schema default when both exist; a non-schema stored key (e.g. left over after the
+/// plugin manifest dropped a field) is ignored.
+fn merge_plugin_config(
+    schema_fields: &BTreeMap<String, ConfigField>,
+    stored: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut merged = BTreeMap::new();
+    for (key, field) in schema_fields {
+        let value = stored.get(key).cloned().or_else(|| field.default.clone());
+        if let Some(value) = value {
+            merged.insert(key.clone(), value);
+        }
+    }
+    merged
 }
 
 fn empty_plan() -> ExecutionPlan {
@@ -1706,6 +1865,48 @@ mod tests {
             tronhawk_package::pack(&source, &package).unwrap();
             package
         }
+
+        /// A fixture like [`package`] whose manifest also declares a per-plugin `config` schema.
+        fn package_with_config(
+            &self,
+            directory: &str,
+            id: &str,
+            version: &str,
+            config: serde_json::Value,
+        ) -> PathBuf {
+            let source = self.0.join(directory);
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("renderer.js"), "renderer source").unwrap();
+            std::fs::write(source.join("main.js"), "main source").unwrap();
+            let manifest = serde_json::json!({
+                "id": id,
+                "name": "Daemon test plugin",
+                "version": version,
+                "author": "Test",
+                "tronhawk": "^0.1",
+                "permissions": [
+                    "renderer.css",
+                    "renderer.script",
+                    "renderer.dom",
+                    "electron.window",
+                    "runtime.unsafe",
+                ],
+                "css": "body{}",
+                "entry": {
+                    "renderer": "renderer.js",
+                    "main": "main.js"
+                },
+                "config": config,
+            });
+            std::fs::write(
+                source.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let package = self.0.join(format!("{directory}.thx"));
+            tronhawk_package::pack(&source, &package).unwrap();
+            package
+        }
     }
 
     impl Drop for TempRoot {
@@ -1747,6 +1948,68 @@ mod tests {
             ResponseResult::Err { error } => error.code,
             ResponseResult::Ok { result } => panic!("unexpected RPC result: {result}"),
         }
+    }
+
+    fn error_message(response: tronhawk_ipc::Response) -> String {
+        match response.result {
+            ResponseResult::Err { error } => error.message,
+            ResponseResult::Ok { result } => panic!("unexpected RPC result: {result}"),
+        }
+    }
+
+    /// A manifest `config` schema exercising every scalar type, each with a default.
+    fn config_schema() -> serde_json::Value {
+        serde_json::json!({
+            "opacity": { "type": "number", "default": 0.8 },
+            "mode": { "type": "string", "default": "auto" },
+            "debug": { "type": "boolean", "default": false },
+            "title": { "type": "string", "default": "glass" },
+        })
+    }
+
+    fn config_merged_defaults() -> serde_json::Value {
+        serde_json::json!({
+            "opacity": 0.8,
+            "mode": "auto",
+            "debug": false,
+            "title": "glass",
+        })
+    }
+
+    fn get_plugin_config(
+        service: &CoreService,
+        secret: &str,
+        application_id: &str,
+        plugin_id: &str,
+    ) -> tronhawk_ipc::Response {
+        call(
+            service,
+            secret,
+            "getPluginConfig",
+            serde_json::json!({
+                "applicationId": application_id,
+                "pluginId": plugin_id,
+            }),
+        )
+    }
+
+    fn set_plugin_config(
+        service: &CoreService,
+        secret: &str,
+        application_id: &str,
+        plugin_id: &str,
+        config: serde_json::Value,
+    ) -> tronhawk_ipc::Response {
+        call(
+            service,
+            secret,
+            "setPluginConfig",
+            serde_json::json!({
+                "applicationId": application_id,
+                "pluginId": plugin_id,
+                "config": config,
+            }),
+        )
     }
 
     fn register(
@@ -2333,6 +2596,7 @@ mod tests {
                 PluginPolicy {
                     enabled: true,
                     grants: vec!["renderer.css".into(), "renderer.dom".into()],
+                    config: BTreeMap::new(),
                 },
             );
 
@@ -3348,5 +3612,513 @@ mod tests {
             serde_json::json!(["renderer.css"])
         );
         assert_ne!(dev_off["revision"], dev_on["revision"]);
+    }
+
+    // --- Per-plugin config (PluginPolicy.config / getPluginConfig / setPluginConfig) ----------
+
+    #[test]
+    fn plugin_config_rpcs_are_control_only_and_validate_targets() {
+        let temp = TempRoot::new("config-auth");
+        let executable = temp.executable("App.exe");
+        let package =
+            temp.package_with_config("plugin", "com.example.daemon", "1.0.0", config_schema());
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        let token = launch_token(&service, &control, &executable);
+
+        // Launch tokens are forbidden from the config control-plane RPCs (-32003, same fall-through
+        // as the other control methods).
+        for method in ["getPluginConfig", "setPluginConfig"] {
+            assert_eq!(
+                error_code(call(
+                    &service,
+                    &token,
+                    method,
+                    serde_json::json!({
+                        "applicationId": application_id,
+                        "pluginId": "com.example.daemon",
+                        "config": {},
+                    }),
+                )),
+                -32003,
+                "{method} must be control-token only"
+            );
+        }
+
+        // Unknown application -> -32602.
+        assert_eq!(
+            error_code(get_plugin_config(
+                &service,
+                &control,
+                "winexe-v1:missing",
+                "com.example.daemon",
+            )),
+            -32602
+        );
+        assert_eq!(
+            error_code(set_plugin_config(
+                &service,
+                &control,
+                "winexe-v1:missing",
+                "com.example.daemon",
+                serde_json::json!({}),
+            )),
+            -32602
+        );
+        // Installed-plugin lookup: unknown plugin id -> -32602.
+        assert_eq!(
+            error_code(get_plugin_config(
+                &service,
+                &control,
+                &application_id,
+                "com.example.gone"
+            )),
+            -32602
+        );
+        assert_eq!(
+            error_code(set_plugin_config(
+                &service,
+                &control,
+                &application_id,
+                "com.example.gone",
+                serde_json::json!({}),
+            )),
+            -32602
+        );
+        // Missing params and malformed config values -> -32602.
+        assert_eq!(
+            error_code(call(
+                &service,
+                &control,
+                "getPluginConfig",
+                serde_json::json!({ "applicationId": application_id }),
+            )),
+            -32602
+        );
+        assert_eq!(
+            error_code(call(
+                &service,
+                &control,
+                "setPluginConfig",
+                serde_json::json!({
+                    "applicationId": application_id,
+                    "pluginId": "com.example.daemon",
+                    "config": "not-an-object",
+                }),
+            )),
+            -32602
+        );
+    }
+
+    #[test]
+    fn plugin_config_validation_rejects_unknown_keys_type_mismatches_and_oversized_strings() {
+        let temp = TempRoot::new("config-validation");
+        let executable = temp.executable("App.exe");
+        let package =
+            temp.package_with_config("plugin", "com.example.daemon", "1.0.0", config_schema());
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+
+        // Unknown key -> -32602 naming the key.
+        let response = set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "bogus": 1 }),
+        );
+        assert_eq!(error_code(response.clone()), -32602);
+        assert!(
+            error_message(response).contains("bogus"),
+            "message must name the key"
+        );
+        // A key absent from the schema is rejected even when the value is well typed.
+        assert_eq!(
+            error_code(set_plugin_config(
+                &service,
+                &control,
+                &application_id,
+                "com.example.daemon",
+                serde_json::json!({ "opacity": 0.5, "extra": "x" }),
+            )),
+            -32602
+        );
+
+        // Type mismatches -> -32602 (message names the offending key).
+        for (config, expected) in [
+            (serde_json::json!({ "opacity": "high" }), "opacity"),
+            (serde_json::json!({ "mode": 7 }), "mode"),
+            (serde_json::json!({ "debug": 1 }), "debug"),
+            (serde_json::json!({ "title": ["a"] }), "title"),
+        ] {
+            let response = set_plugin_config(
+                &service,
+                &control,
+                &application_id,
+                "com.example.daemon",
+                config,
+            );
+            assert_eq!(error_code(response.clone()), -32602);
+            assert!(
+                error_message(response).contains(expected),
+                "message must name the key"
+            );
+        }
+
+        // A string value over 4096 bytes -> -32602.
+        let oversized = set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "title": "x".repeat(4097) }),
+        );
+        assert_eq!(error_code(oversized.clone()), -32602);
+        assert!(error_message(oversized).contains("4096"));
+
+        // No config is persisted by any rejected write.
+        assert_eq!(
+            ok(get_plugin_config(
+                &service,
+                &control,
+                &application_id,
+                "com.example.daemon"
+            ))["config"],
+            config_merged_defaults()
+        );
+    }
+
+    #[test]
+    fn plugin_config_merge_semantics_replace_and_persist_across_rebuild() {
+        let temp = TempRoot::new("config-merge");
+        let executable = temp.executable("App.exe");
+        let package =
+            temp.package_with_config("plugin", "com.example.daemon", "1.0.0", config_schema());
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+
+        // Nothing stored yet: get returns the schema defaults merged, schema keys only.
+        let get = |service: &CoreService, secret: &str| -> serde_json::Value {
+            ok(get_plugin_config(
+                service,
+                secret,
+                &application_id,
+                "com.example.daemon",
+            ))["config"]
+                .clone()
+        };
+        assert_eq!(get(&service, &control), config_merged_defaults());
+
+        // A partial set returns defaults overlaid by the new stored values…
+        let partial = ok(set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "opacity": 0.5, "mode": "fast" }),
+        ));
+        assert_eq!(
+            partial["config"],
+            serde_json::json!({
+                "opacity": 0.5,
+                "mode": "fast",
+                "debug": false,
+                "title": "glass",
+            })
+        );
+        // …and subsequent gets reflect exactly the same merged shape.
+        assert_eq!(
+            get(&service, &control),
+            serde_json::json!({
+                "opacity": 0.5,
+                "mode": "fast",
+                "debug": false,
+                "title": "glass",
+            })
+        );
+
+        // setPluginConfig REPLACES the whole stored object: setting one key drops the others, so
+        // the merged result falls back to defaults for every key not in the new object.
+        let replaced = ok(set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "debug": true }),
+        ));
+        assert_eq!(
+            replaced["config"],
+            serde_json::json!({
+                "opacity": 0.8,
+                "mode": "auto",
+                "debug": true,
+                "title": "glass",
+            })
+        );
+
+        // A stored key that is not schema-declared (e.g. left over from an older manifest) is
+        // ignored by the merge: only schema keys are returned.
+        {
+            let mut inner = service.inner.lock().unwrap();
+            inner
+                .state
+                .applications
+                .get_mut(&application_id)
+                .unwrap()
+                .plugins
+                .get_mut("com.example.daemon")
+                .unwrap()
+                .config
+                .insert("ghost".to_string(), serde_json::json!("leftover"));
+        }
+        assert_eq!(
+            get(&service, &control),
+            serde_json::json!({
+                "opacity": 0.8,
+                "mode": "auto",
+                "debug": true,
+                "title": "glass",
+            })
+        );
+
+        // A set persists across a service rebuild (whole replacement drops the ghost key too).
+        ok(set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "opacity": 0.9 }),
+        ));
+        drop(service);
+        let rebuilt = CoreService::new(&temp.0).unwrap();
+        let persisted_control = std::fs::read_to_string(rebuilt.control_token_path()).unwrap();
+        assert_eq!(
+            get(&rebuilt, &persisted_control),
+            serde_json::json!({
+                "opacity": 0.9,
+                "mode": "auto",
+                "debug": false,
+                "title": "glass",
+            })
+        );
+
+        // Every successful set emitted the core event with the right attribution.
+        let logs = query_logs(&rebuilt, &persisted_control);
+        let updates = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["code"] == "core.plugin_config.updated")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 3);
+        assert!(updates.iter().all(|event| {
+            event["applicationId"] == application_id
+                && event["pluginId"] == "com.example.daemon"
+                && event["message"] == "Plugin config updated"
+        }));
+    }
+
+    #[test]
+    fn plugin_config_reaches_the_plan_revision_and_is_absent_when_disabled() {
+        let temp = TempRoot::new("config-plan");
+        let executable = temp.executable("App.exe");
+        let package =
+            temp.package_with_config("plugin", "com.example.daemon", "1.0.0", config_schema());
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+
+        // The enabled plugin's grant carries the merged config snapshot.
+        let before = plan(&service, &token);
+        assert_eq!(
+            before["plugins"][0]["config"],
+            config_merged_defaults(),
+            "the plan grant must carry the merged config"
+        );
+        let before_revision = before["revision"].as_str().unwrap().to_string();
+
+        // Changing config changes the plan revision and the grant carries the new merged values.
+        ok(set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "opacity": 0.33, "mode": "fast", "debug": true, "title": "custom" }),
+        ));
+        let after = plan(&service, &token);
+        assert_ne!(
+            after["revision"], before_revision,
+            "config change must bump the revision"
+        );
+        assert_eq!(
+            after["plugins"][0]["config"],
+            serde_json::json!({
+                "opacity": 0.33,
+                "mode": "fast",
+                "debug": true,
+                "title": "custom",
+            })
+        );
+
+        // A disabled plugin is not in the plan at all, so its config is never included.
+        ok(set_policy(&service, &control, &application_id, false, &[]));
+        assert!(plan(&service, &token)["plugins"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // Re-enabling the plugin brings the stored config back into the plan.
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+        let reenabled = plan(&service, &token);
+        assert_eq!(
+            reenabled["plugins"][0]["config"],
+            serde_json::json!({
+                "opacity": 0.33,
+                "mode": "fast",
+                "debug": true,
+                "title": "custom",
+            })
+        );
+    }
+
+    #[test]
+    fn set_policy_preserves_plugin_config() {
+        // Regression: setApplicationPluginPolicy rebuilds the PluginPolicy from enabled + grants;
+        // a grant-toggle must never wipe the stored per-plugin config.
+        let temp = TempRoot::new("config-set-policy");
+        let executable = temp.executable("App.exe");
+        let package =
+            temp.package_with_config("plugin", "com.example.daemon", "1.0.0", config_schema());
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+            serde_json::json!({ "opacity": 0.5, "mode": "fast" }),
+        ));
+
+        // Toggle disabled → enabled (and an unrelated re-registration at the same level): the
+        // config must survive every policy rebuild.
+        ok(set_policy(&service, &control, &application_id, false, &[]));
+        register(&service, &control, &executable, 2);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+
+        let merged = ok(get_plugin_config(
+            &service,
+            &control,
+            &application_id,
+            "com.example.daemon",
+        ));
+        assert_eq!(
+            merged["config"],
+            serde_json::json!({
+                "opacity": 0.5,
+                "mode": "fast",
+                "debug": false,
+                "title": "glass",
+            }),
+            "a grant-toggle must preserve the stored plugin config"
+        );
+        // The persisted policy itself carries the config, and the manager snapshot exposes it.
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.0.join("config/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted["applications"][&application_id]["plugins"]["com.example.daemon"]["config"]
+                ["opacity"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn legacy_state_without_plugin_config_loads_with_defaults() {
+        // A state.json written before the config field existed must load: PluginPolicy.config
+        // defaults to empty via #[serde(default)].
+        let temp = TempRoot::new("legacy-state-config");
+        let config_dir = temp.0.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "global": { "developerMode": false },
+                "applications": {
+                    "winexe-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                        "executablePath": "c:/apps/legacy.exe",
+                        "displayName": "Legacy",
+                        "supportLevel": 2,
+                        "plugins": {
+                            "com.example.legacy": {
+                                "enabled": true,
+                                "grants": ["renderer.css"]
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let service = CoreService::new(&temp.0).unwrap();
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        let snapshot = ok(call(
+            &service,
+            &control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        let policy = &snapshot["applications"]
+            ["winexe-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            ["plugins"]["com.example.legacy"];
+        assert_eq!(policy["enabled"], true);
+        assert_eq!(policy["grants"], serde_json::json!(["renderer.css"]));
+        assert_eq!(
+            policy["config"],
+            serde_json::json!({}),
+            "legacy policies must load with an empty config"
+        );
+        // A later state write persists the config field as present and empty.
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": true }),
+        ));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.0.join("config/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted["applications"]
+                ["winexe-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                ["plugins"]["com.example.legacy"]["config"],
+            serde_json::json!({})
+        );
     }
 }
