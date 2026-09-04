@@ -132,3 +132,11 @@ completed or superseded are no longer listed.
 - [ ] Workspace `cargo fmt --all --check` drift (pre-existing, out of scope for this batch):
       `apps/manager/src-tauri/src/lib.rs:171`, `crates/injector/src/registry.rs`,
       `crates/package/src/lib.rs`, `vendor/electron-hook/**`. Needs a format-only pass by owners.
+- [ ] **Launcher `.asar.unpacked` junction (non-fatal for Obsidian).** The injector launcher logs
+      `failed to link app.asar.unpacked: mklink /J reported success but ... is not a junction` for
+      Obsidian (its `app.asar` has an `.unpacked` dir). Obsidian has no critical native module there,
+      so it still launches; targets with native modules (e.g. `better-sqlite3`) may fail to load them
+      if the merged `*.asar.unpacked` is not a valid junction to the real `app.asar.unpacked`.
+      Investigate the reparse-aware reconciliation (whether the created junction is validated against a
+      canonicalized path that differs from the `mklink` target) before relying on it for
+      native-module targets.
