@@ -110,6 +110,13 @@ h3 { margin-bottom: 5px; color: #e9f5f1; font: 700 15px/1.25 "Space Grotesk", sa
 
 .dialog { width: min(500px, calc(100vw - 48px)); padding: 0; color: #edf5f1; border: 1px solid rgba(183,234,220,.2); border-radius: 16px; background: #132635; box-shadow: 0 30px 90px rgba(0,0,0,.5); }.dialog::backdrop { background: rgba(5,13,20,.73); backdrop-filter: blur(4px); }.dialog-card { padding: 25px; }.dialog-heading { display: flex; justify-content: space-between; gap: 15px; }.dialog-heading h2 { margin-bottom: 0; }.icon-button { display: grid; width: 31px; height: 31px; place-items: center; color: #b8cbc6; border: 0; border-radius: 7px; background: transparent; font-size: 24px; line-height: 1; }.icon-button:hover { background: rgba(219,245,237,.1); }.support-level-field { display: grid; gap: 7px; margin-top: 20px; color: #c4d6d1; font: 500 11px "Cascadia Mono", monospace; letter-spacing: .05em; }.support-level-field select { width: 100%; padding: 10px 34px 10px 11px; color: #edf9f5; border: 1px solid rgba(145,234,217,.25); border-radius: 9px; background: #102431; font: 600 13px "Bahnschrift", sans-serif; }.dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 25px; }
 
+/* Transparent launch (IFEO) settings row on the Applications page. The switch reuses .switch; the
+   panel and note reuse the existing panel/permission-note geometry, so only spacing is added here. */
+.iefo-panel { margin-top: 18px; }
+.iefo-body { display: grid; gap: 11px; padding: 16px 20px; }
+.iefo-status { margin: 0; color: #b7d1ca; font-size: 12px; line-height: 1.55; }
+.permission-note.is-warning { margin-top: 0; color: #f2d9c6; border-left-color: #f1a26c; background: rgba(241, 162, 108, .09); }
+
 /* Windows-bundled faces keep the desktop UI expressive without network font requests. */
 .brand, .brand-mark, h1, h2, h3, .summary-value, .app-icon, .plugin-icon, .section-title { font-family: "Bahnschrift", "Segoe UI Variable Display", "Segoe UI", sans-serif; }
 .nav-symbol, .side-footer strong, .eyebrow, .summary-label, .app-plugin-count, .activity-item time, .version, .plugin-target, .picker-label, .picker-button small, .section-count, .permission-row code, .support-badge, .status-badge, .risk-badge, .log-row, .state-icon { font-family: "Cascadia Mono", "Consolas", monospace; }

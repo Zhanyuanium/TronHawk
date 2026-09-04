@@ -73,6 +73,15 @@ export function createManagerService() {
     async registerApplication(supportLevel) {
       return invoke("register_application", { supportLevel });
     },
+    async removeApplication(applicationId) {
+      return invoke("remove_application", { applicationId });
+    },
+    async getIefo(applicationId) {
+      return invoke("get_iefo_registration", { applicationId });
+    },
+    async setIefo(applicationId, enabled) {
+      return invoke("set_iefo_registration", { applicationId, enabled });
+    },
     async setDeveloperMode(enabled) {
       return invoke("set_developer_mode", { enabled });
     },

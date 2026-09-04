@@ -48,6 +48,7 @@ const dictionaries = {
     "action.refresh": "↻ Refresh",
     "action.loadOlder": "Load older",
     "action.viewLogs": "View log status",
+    "action.removeApp": "Remove application",
 
     "context.aria": "Selected application policy",
     "context.label": "Policy scope",
@@ -84,6 +85,20 @@ const dictionaries = {
     "appcard.enabled": "{count} enabled",
     "appcard.selectAria": "Select {name} as the policy scope",
     "appcard.launchHelp.disabled": "Level 0 applications cannot be launched with extensions",
+    "appcard.remove": "Remove {name}",
+    "appcard.removeAria": "Remove {name} from the workspace",
+
+    "iefo.title": "Transparent launch (IFEO)",
+    "iefo.detail": "When enabled, double-clicking this application outside the Manager launches it through TronHawk with its policies applied.",
+    "iefo.on": "Transparent launch is on. External double-clicks run through TronHawk.",
+    "iefo.off": "Transparent launch is off. External double-clicks run the application directly.",
+    "iefo.loading": "Reading transparent launch status…",
+    "iefo.ownedNote": "This application’s launch registration is owned by another program, so TronHawk cannot manage it here.",
+    "iefo.toggleOn": "Turn off transparent launch for {name}",
+    "iefo.toggleOff": "Turn on transparent launch for {name}",
+    "iefo.notice.enabled": "Transparent launch enabled. External double-clicks now run through TronHawk.",
+    "iefo.notice.disabled": "Transparent launch disabled. External double-clicks run the application directly.",
+    "iefo.notice.cancelled": "Elevation canceled. The transparent launch setting was not changed.",
 
     "plugins.eyebrow": "Installed packages",
     "plugins.title": "Plugins",
@@ -227,6 +242,7 @@ const dictionaries = {
     "msg.pluginRemoved": "Plugin removed from Core.",
     "msg.autostartOn": "Core autostart enabled.",
     "msg.autostartOff": "Core autostart disabled.",
+    "msg.applicationRemoved": "Application removed. Its registration and policies were removed.",
 
     "dialog.add.eyebrow": "New policy scope",
     "dialog.add.title": "Add an application",
@@ -245,6 +261,13 @@ const dictionaries = {
     "dialog.remove.copy": "This removes the installed package and its application policies from Core.",
     "dialog.remove.keep": "Keep plugin",
     "dialog.remove.confirm": "Remove plugin",
+    "dialog.removeApp.title": "Remove application?",
+    "dialog.removeApp.titleNamed": "Remove {name}?",
+    "dialog.removeApp.titleFallback": "application",
+    "dialog.removeApp.copy": "This removes only this application’s registration and its policies from Core. Other applications and installed plugin data are unaffected.",
+    "dialog.removeApp.keep": "Keep application",
+    "dialog.removeApp.confirm": "Remove application",
+    "dialog.removeApp.cancel": "Cancel",
   },
 
   zh: {
@@ -290,6 +313,7 @@ const dictionaries = {
     "action.refresh": "↻ 刷新",
     "action.loadOlder": "加载更早",
     "action.viewLogs": "查看日志状态",
+    "action.removeApp": "移除应用",
 
     "context.aria": "选定应用的策略",
     "context.label": "策略作用域",
@@ -326,6 +350,20 @@ const dictionaries = {
     "appcard.enabled": "已启用 {count}",
     "appcard.selectAria": "选择 {name} 作为策略作用域",
     "appcard.launchHelp.disabled": "级别 0 的应用无法以扩展启动",
+    "appcard.remove": "移除 {name}",
+    "appcard.removeAria": "从工作区移除 {name}",
+
+    "iefo.title": "透明启动（IFEO）",
+    "iefo.detail": "启用后，在管理器之外双击该应用将经由 TronHawk 启动，并应用其策略。",
+    "iefo.on": "透明启动已开启，外部双击将经由 TronHawk。",
+    "iefo.off": "透明启动已关闭，外部双击将直接启动该应用。",
+    "iefo.loading": "正在读取透明启动状态…",
+    "iefo.ownedNote": "该应用的启动登记归属其它程序，TronHawk 无法在此管理。",
+    "iefo.toggleOn": "为 {name} 关闭透明启动",
+    "iefo.toggleOff": "为 {name} 开启透明启动",
+    "iefo.notice.enabled": "已启用透明启动，外部双击将通过 TronHawk 运行。",
+    "iefo.notice.disabled": "已关闭透明启动，外部双击将直接启动应用。",
+    "iefo.notice.cancelled": "已取消提权，透明启动设置未更改。",
 
     "plugins.eyebrow": "已安装的包",
     "plugins.title": "插件",
@@ -469,6 +507,7 @@ const dictionaries = {
     "msg.pluginRemoved": "插件已从 Core 中移除。",
     "msg.autostartOn": "Core 自动启动已开启。",
     "msg.autostartOff": "Core 自动启动已关闭。",
+    "msg.applicationRemoved": "应用已移除，其登记与策略已删除。",
 
     "dialog.add.eyebrow": "新的策略作用域",
     "dialog.add.title": "添加应用",
@@ -487,6 +526,13 @@ const dictionaries = {
     "dialog.remove.copy": "这将从 Core 移除该已安装包及其应用策略。",
     "dialog.remove.keep": "保留插件",
     "dialog.remove.confirm": "移除插件",
+    "dialog.removeApp.title": "移除应用？",
+    "dialog.removeApp.titleNamed": "移除 {name}？",
+    "dialog.removeApp.titleFallback": "应用",
+    "dialog.removeApp.copy": "这只会从 Core 移除该应用的登记与其策略，不影响其它应用与已安装插件的数据。",
+    "dialog.removeApp.keep": "保留应用",
+    "dialog.removeApp.confirm": "移除应用",
+    "dialog.removeApp.cancel": "取消",
   },
 };
 

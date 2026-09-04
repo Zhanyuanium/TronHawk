@@ -46,6 +46,17 @@
         </div>
       </form>
     </dialog>
+    <dialog id="remove-application-dialog" class="dialog dialog-small">
+      <form id="remove-application-form" method="dialog" class="dialog-card">
+        <p class="eyebrow" data-i18n="action.removeApp">Remove application</p>
+        <h2 id="remove-app-title" data-i18n="dialog.removeApp.title">Remove application?</h2>
+        <p id="remove-app-copy" class="muted" data-i18n="dialog.removeApp.copy">This removes only this application’s registration and its policies from Core. Other applications and installed plugin data are unaffected.</p>
+        <div class="dialog-actions">
+          <button class="button button-quiet" value="cancel" data-i18n="dialog.removeApp.keep">Keep application</button>
+          <button id="confirm-remove-app" class="button button-danger" value="default" data-i18n="dialog.removeApp.confirm">Remove application</button>
+        </div>
+      </form>
+    </dialog>
     <script type="module" src="app.js"></script>
   </body>
 </html>

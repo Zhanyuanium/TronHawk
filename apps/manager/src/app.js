@@ -8,16 +8,23 @@ const removeForm = document.querySelector("#remove-form");
 const applicationDialog = document.querySelector("#application-dialog");
 const applicationForm = document.querySelector("#application-form");
 const supportLevelInput = document.querySelector("#support-level");
+const removeApplicationDialog = document.querySelector("#remove-application-dialog");
+const removeApplicationForm = document.querySelector("#remove-application-form");
 
 const state = {
   view: "applications", status: "loading", applications: [], plugins: [], filter: "all",
   selectedPluginId: undefined, selectedApplicationId: undefined, removePluginId: null,
+  removeApplicationId: null,
   developerMode: false,
   // Effective per-plugin config values for the selected application × plugin ("applicationId|pluginId").
   // `configValues` is null until the scope's stored values have been read (or the scope declares none).
   configScope: "", configValues: null, configGeneration: 0,
   // Core boot autostart preference; undefined until the first load (drives the switch's disabled state).
   coreAutostart: undefined, coreAutostartLoading: false,
+  // Transparent launch (IFEO) registration for the currently selected application. `id` is the
+  // application the loaded state belongs to; `loading` guards the initial read; `owned === false`
+  // means the registration is owned by another program, so the switch is disabled.
+  iefo: { id: null, loading: false, registered: false, owned: true, error: "" },
   error: "", operationError: "", notice: "", busy: false,
   logs: { events: [], nextBeforeSequence: null, scope: "all", stream: "all", loaded: false, loading: false, loadingOlder: false, error: "" },
 };
@@ -90,9 +97,28 @@ function emptyState({ variant = "section", icon = "＋", title, description, act
 }
 
 function renderApplications() {
+  loadIefo();
   const application = selectedApplication();
   const active = state.plugins.filter((plugin) => policyFor(plugin).enabled).length;
-  return `${pageHeader(t("applications.eyebrow"), t("applications.title"), t("applications.desc"), addApplicationAction())}<section class="summary-grid"><article class="summary-card featured"><span class="summary-label">${t("summary.connection")}</span><span class="summary-value">${t("summary.connectedValue")}</span><span class="summary-detail">${application ? t("summary.connectedFor", { name: escapeHtml(application.name) }) : t("summary.connectedEmpty")}</span></article><article class="summary-card"><span class="summary-label">${t("summary.applications")}</span><strong class="summary-value">${state.applications.length}</strong><span class="summary-detail">${t("summary.applicationsDetail")}</span></article><article class="summary-card"><span class="summary-label">${t("summary.enabledHere")}</span><strong class="summary-value">${active}</strong><span class="summary-detail">${application ? t("summary.enabledFor") : t("summary.enabledChoose")}</span></article></section><section class="dashboard-grid"><article class="panel"><header class="panel-header"><h2>${t("applications.panelTitle")}</h2><span class="summary-detail">${state.applications.length ? t("applications.chooseScope") : t("applications.startWithExecutable")}</span></header><div class="application-list">${state.applications.length ? state.applications.map(appCard).join("") : emptyApplications()}</div></article><aside class="panel"><header class="panel-header"><h2>${t("applications.coreActivity")}</h2><button class="text-link" data-view="logs">${t("action.viewLogs")}</button></header><div class="activity-pending"><i class="activity-dot"></i><div><strong>${t("applications.activityTitle")}</strong><span>${t("applications.activityDesc")}</span></div></div></aside></section>`;
+  return `${pageHeader(t("applications.eyebrow"), t("applications.title"), t("applications.desc"), addApplicationAction())}<section class="summary-grid"><article class="summary-card featured"><span class="summary-label">${t("summary.connection")}</span><span class="summary-value">${t("summary.connectedValue")}</span><span class="summary-detail">${application ? t("summary.connectedFor", { name: escapeHtml(application.name) }) : t("summary.connectedEmpty")}</span></article><article class="summary-card"><span class="summary-label">${t("summary.applications")}</span><strong class="summary-value">${state.applications.length}</strong><span class="summary-detail">${t("summary.applicationsDetail")}</span></article><article class="summary-card"><span class="summary-label">${t("summary.enabledHere")}</span><strong class="summary-value">${active}</strong><span class="summary-detail">${application ? t("summary.enabledFor") : t("summary.enabledChoose")}</span></article></section><section class="dashboard-grid"><article class="panel"><header class="panel-header"><h2>${t("applications.panelTitle")}</h2><span class="summary-detail">${state.applications.length ? t("applications.chooseScope") : t("applications.startWithExecutable")}</span></header><div class="application-list">${state.applications.length ? state.applications.map(appCard).join("") : emptyApplications()}</div></article><aside class="panel"><header class="panel-header"><h2>${t("applications.coreActivity")}</h2><button class="text-link" data-view="logs">${t("action.viewLogs")}</button></header><div class="activity-pending"><i class="activity-dot"></i><div><strong>${t("applications.activityTitle")}</strong><span>${t("applications.activityDesc")}</span></div></div></aside></section>${iefoSection()}`;
+}
+function iefoSection() {
+  const application = selectedApplication();
+  if (!application) return "";
+  const id = application.id;
+  const current = state.iefo.id === id;
+  const loading = state.iefo.loading || !current;
+  const registered = current && state.iefo.registered;
+  const owned = current ? state.iefo.owned : true;
+  const error = current ? state.iefo.error : "";
+  const toggleLabel = registered ? t("iefo.toggleOn", { name: application.name }) : t("iefo.toggleOff", { name: application.name });
+  const toggleTitle = !owned ? t("iefo.ownedNote") : loading ? t("iefo.loading") : toggleLabel;
+  const disabled = state.busy || loading || !owned || Boolean(error);
+  const status = loading ? t("iefo.loading") : registered ? t("iefo.on") : t("iefo.off");
+  const switchHtml = `<label class="switch" title="${escapeHtml(toggleTitle)}"><input type="checkbox" data-toggle-iefo="${escapeHtml(id)}" ${registered ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="${escapeHtml(toggleLabel)}"><span class="slider"></span></label>`;
+  const errorBanner = error ? `<div class="error-banner" role="alert" style="margin:0;"><span>${escapeHtml(error)}</span></div>` : "";
+  const ownedNote = !owned ? `<p class="permission-note is-warning" style="margin-top:0;">${escapeHtml(t("iefo.ownedNote"))}</p>` : "";
+  return `<section class="panel iefo-panel" aria-label="${escapeHtml(t("iefo.title"))}"><header class="panel-header"><div><h2>${t("iefo.title")}</h2><p class="muted" style="margin:3px 0 0;font-size:12px;">${escapeHtml(t("iefo.detail"))}</p></div>${switchHtml}</header><div class="iefo-body"><p class="iefo-status" role="status">${escapeHtml(status)}</p>${errorBanner}${ownedNote}</div></section>`;
 }
 function emptyApplications() {
   return emptyState({ variant: "application", icon: "＋", title: t("empty.addFirst.title"), description: t("empty.addFirst.desc"), actionLabel: t("action.addApplicationPlain"), actionData: "data-add-application", busy: state.busy });
@@ -102,7 +128,9 @@ function appCard(application) {
   const canLaunch = application.supportLevel > 0;
   const launchLabel = t("action.launch.withExtensions", { name: application.name });
   const launchHelp = canLaunch ? launchLabel : t("appcard.launchHelp.disabled");
-  return `<article class="app-card ${selected ? "is-selected" : ""}" data-select-application="${escapeHtml(application.id)}" role="button" tabindex="0" aria-pressed="${selected}" aria-label="${escapeHtml(t("appcard.selectAria", { name: application.name }))}" style="cursor:pointer;"><span class="app-icon" data-tone="${applicationTone(application.id)}">${initials(application.name)}</span><div><h3>${escapeHtml(application.name)}</h3><span class="app-meta">${t("appcard.registeredExecutable")}</span><span class="support-badge level-${application.supportLevel}">${levelLabel(application.supportLevel)}</span></div><div style="display:flex;align-items:center;gap:16px;"><span class="app-plugin-count">${t("appcard.enabled", { count: application.enabledPluginCount })}</span><button type="button" class="button button-quiet" style="min-height:32px;padding:6px 12px;font-size:12px;" data-launch="${escapeHtml(application.id)}" ${!canLaunch || state.busy ? "disabled" : ""} title="${escapeHtml(launchHelp)}" aria-label="${escapeHtml(launchHelp)}">${t("action.launch")}</button></div></article>`;
+  const removeTitle = t("appcard.remove", { name: application.name });
+  const removeAria = t("appcard.removeAria", { name: application.name });
+  return `<article class="app-card ${selected ? "is-selected" : ""}" data-select-application="${escapeHtml(application.id)}" role="button" tabindex="0" aria-pressed="${selected}" aria-label="${escapeHtml(t("appcard.selectAria", { name: application.name }))}" style="cursor:pointer;"><span class="app-icon" data-tone="${applicationTone(application.id)}">${initials(application.name)}</span><div><h3>${escapeHtml(application.name)}</h3><span class="app-meta">${t("appcard.registeredExecutable")}</span><span class="support-badge level-${application.supportLevel}">${levelLabel(application.supportLevel)}</span></div><div style="display:flex;align-items:center;gap:16px;"><span class="app-plugin-count">${t("appcard.enabled", { count: application.enabledPluginCount })}</span><button type="button" class="button button-quiet" style="min-height:32px;padding:6px 12px;font-size:12px;" data-launch="${escapeHtml(application.id)}" ${!canLaunch || state.busy ? "disabled" : ""} title="${escapeHtml(launchHelp)}" aria-label="${escapeHtml(launchHelp)}">${t("action.launch")}</button><button type="button" class="button button-icon" data-remove-application="${escapeHtml(application.id)}" ${state.busy ? "disabled" : ""} title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeAria)}">×</button></div></article>`;
 }
 
 function renderPlugins() {
@@ -331,14 +359,47 @@ async function loadCoreAutostart() {
   }
 }
 
+async function loadIefo() {
+  const application = selectedApplication();
+  const targetId = application?.id;
+  if (!targetId || state.iefo.id === targetId || state.iefo.loading) return;
+  state.iefo.id = targetId;
+  state.iefo.loading = true;
+  state.iefo.registered = false;
+  state.iefo.owned = true;
+  state.iefo.error = "";
+  try {
+    const result = await service.getIefo(targetId);
+    if (state.iefo.id !== targetId) return;
+    state.iefo.registered = Boolean(result && result.registered);
+    state.iefo.owned = result && "owned" in result ? result.owned !== false : true;
+  } catch (error) {
+    if (state.iefo.id !== targetId) return;
+    state.iefo.error = errorMessage(error);
+  } finally {
+    if (state.iefo.id !== targetId) return;
+    state.iefo.loading = false;
+    if (state.view === "applications") render();
+  }
+}
+
 appRoot.addEventListener("click", async (event) => {
   const launchButton = event.target.closest("button[data-launch]");
+  const removeApplicationButton = event.target.closest("button[data-remove-application]");
   const selectCard = event.target.closest("[data-select-application]");
   const button = event.target.closest("button");
   if (button && button.disabled) return;
   if (launchButton) {
     if (launchButton.disabled) return;
     await perform(() => service.launchApplication(launchButton.dataset.launch), t("msg.launched"));
+    return;
+  }
+  if (removeApplicationButton) {
+    if (removeApplicationButton.disabled) return;
+    const application = state.applications.find((entry) => entry.id === removeApplicationButton.dataset.removeApplication);
+    state.removeApplicationId = application?.id ?? null;
+    document.querySelector("#remove-app-title").textContent = t("dialog.removeApp.titleNamed", { name: application?.name ?? t("dialog.removeApp.titleFallback") });
+    removeApplicationDialog.showModal();
     return;
   }
   if (selectCard) { state.selectedApplicationId = selectCard.dataset.selectApplication; render(); return; }
@@ -392,6 +453,22 @@ appRoot.addEventListener("change", async (event) => {
     const completed = await perform(() => service.setCoreAutostart(enabled), enabled ? t("msg.autostartOn") : t("msg.autostartOff"));
     if (!completed) state.coreAutostart = !enabled;
     render();
+    return;
+  }
+  if (event.target.matches("[data-toggle-iefo]")) {
+    const applicationId = event.target.dataset.toggleIefo;
+    const enabled = event.target.checked;
+    state.busy = true; state.operationError = ""; state.notice = ""; render();
+    try {
+      const result = await service.setIefo(applicationId, enabled);
+      if (state.iefo.id === applicationId) state.iefo.registered = Boolean(result && result.registered);
+      state.notice = result && result.cancelled ? t("iefo.notice.cancelled") : (state.iefo.registered ? t("iefo.notice.enabled") : t("iefo.notice.disabled"));
+    } catch (error) {
+      state.operationError = errorMessage(error);
+    } finally {
+      state.busy = false;
+      render();
+    }
     return;
   }
   if (event.target.matches("[data-toggle-policy]")) {
@@ -456,6 +533,14 @@ applicationForm.addEventListener("submit", async (event) => {
     t("msg.applicationRegistered"),
     t("msg.applicationRegisterCanceled"),
   );
+});
+
+removeApplicationForm.addEventListener("submit", async (event) => {
+  if (event.submitter?.value !== "default" || !state.removeApplicationId) return;
+  event.preventDefault();
+  const applicationId = state.removeApplicationId;
+  removeApplicationDialog.close(); state.removeApplicationId = null;
+  await perform(() => service.removeApplication(applicationId), t("msg.applicationRemoved"));
 });
 
 load();
