@@ -182,13 +182,19 @@ Install UX: show requested vs not-requested capabilities (accept / reject / deta
 
 MVP UI: Applications (with supported level), Plugins (enable / disable / remove), Permissions view,
 plugin settings UI (schema-driven from the manifest `config{}`), launch-with-extensions button, Logs.
+Copy is localized (en / zh) with the display language persisted per-user; a Core-autostart toggle
+keeps the Core daemon registered to start at login so transparent launch works without opening the
+Manager.
 
 ## 12. Data & Config
 
-Storage root `%LOCALAPPDATA%\TronHawk\` (overridable via `TRONHAWK_STORAGE_ROOT`) → `config/`,
-`plugins/{installed, cache}`, `logs/`, `profiles/`, `runtime/`.
+Storage root `%LOCALAPPDATA%\com.tronhawk.manager\core\` (overridable via `TRONHAWK_STORAGE_ROOT`) →
+`config/`, `plugins/{installed, cache}`, `logs/`, `profiles/`, `runtime/`. On first start at this
+default root, Core migrates the legacy `%LOCALAPPDATA%\TronHawk\` tree (merge-copy, best-effort
+cleanup) so existing config, plugins, and logs survive.
 Config tiers: global (`language`, `developerMode` — set by the Manager Settings view, off by
-default; disabling developer mode purges every `runtime.unsafe` grant), application
+default; disabling developer mode purges every `runtime.unsafe` grant, `coreAutostart` — default on,
+registers Core to start at login), application
 (`enabledPlugins`), plugin — now wired: a manifest `config{}` schema (≤32 typed fields) is validated
 at pack/install, per-application × per-plugin values are stored in Core policy, and edited via the
 Manager's schema-driven settings form.
