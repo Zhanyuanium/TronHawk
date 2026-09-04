@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "./i18n.js";
 
-const permissionDetails = {
-  "renderer.css": ["Allows the plugin's renderer CSS to be applied.", "low"],
-  "renderer.script": ["Allows the plugin's renderer script to run.", "medium"],
-  "electron.window": ["Allows the plugin to work with managed application windows.", "high"],
-  "runtime.unsafe": ["Grants raw Node.js + Electron in the target app — arbitrary code execution. Developer mode only.", "high"],
+// Stable risk identifiers (used for the `risk-*` CSS class and the `permission.risk.<id>` key).
+const permissionRisk = {
+  "renderer.css": "low",
+  "renderer.script": "medium",
+  "electron.window": "high",
+  "runtime.unsafe": "high",
 };
 
 function presentSnapshot(snapshot) {
@@ -74,6 +76,12 @@ export function createManagerService() {
     async setDeveloperMode(enabled) {
       return invoke("set_developer_mode", { enabled });
     },
+    async getCoreAutostart() {
+      return invoke("get_core_autostart");
+    },
+    async setCoreAutostart(enabled) {
+      return invoke("set_core_autostart", { enabled });
+    },
     async queryLogs({ applicationId, stream, beforeSequence, limit }) {
       const params = { limit };
       if (applicationId) params.applicationId = applicationId;
@@ -82,7 +90,9 @@ export function createManagerService() {
       return invoke("query_logs", params);
     },
     getPermissionDetails(permission) {
-      return permissionDetails[permission] ?? ["Requested by this plugin.", "unknown"];
+      const risk = permissionRisk[permission];
+      if (!risk) return [t("perm.default"), "unknown"];
+      return [t(`perm.${permission}`), risk];
     },
   };
 }

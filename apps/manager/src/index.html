@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#101b28" />
     <link rel="stylesheet" href="styles.css" />
-    <title>TronHawk Manager</title>
+    <title data-i18n="app.title">TronHawk Manager</title>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -15,34 +15,34 @@
       <form id="application-form" method="dialog" class="dialog-card">
         <div class="dialog-heading">
           <div>
-            <p class="eyebrow">New policy scope</p>
-            <h2>Add an application</h2>
+            <p class="eyebrow" data-i18n="dialog.add.eyebrow">New policy scope</p>
+            <h2 data-i18n="dialog.add.title">Add an application</h2>
           </div>
-          <button class="icon-button" value="cancel" aria-label="Close add application dialog">×</button>
+          <button class="icon-button" value="cancel" data-i18n="dialog.add.closeAria" data-i18n-attr="aria-label" aria-label="Close add application dialog">×</button>
         </div>
-        <p class="muted">Choose the support level for this executable. Continue to select the executable in the native picker.</p>
+        <p class="muted" data-i18n="dialog.add.desc">Choose the support level for this executable. Continue to select the executable in the native picker.</p>
         <label class="support-level-field" for="support-level">
-          <span>Support level</span>
+          <span data-i18n="dialog.add.supportLevel">Support level</span>
           <select id="support-level" name="support-level">
-            <option value="2" selected>Level 2 — Electron integration</option>
-            <option value="1">Level 1 — Renderer integration</option>
-            <option value="0">Level 0 — Register without plugin support</option>
+            <option value="2" selected data-i18n="dialog.add.level2">Level 2 — Electron integration</option>
+            <option value="1" data-i18n="dialog.add.level1">Level 1 — Renderer integration</option>
+            <option value="0" data-i18n="dialog.add.level0">Level 0 — Register without plugin support</option>
           </select>
         </label>
         <div class="dialog-actions">
-          <button class="button button-quiet" value="cancel">Cancel</button>
-          <button class="button button-primary" value="default">Choose executable</button>
+          <button class="button button-quiet" value="cancel" data-i18n="dialog.add.cancel">Cancel</button>
+          <button class="button button-primary" value="default" data-i18n="dialog.add.chooseExec">Choose executable</button>
         </div>
       </form>
     </dialog>
     <dialog id="remove-dialog" class="dialog dialog-small">
       <form id="remove-form" method="dialog" class="dialog-card">
-        <p class="eyebrow">Remove plugin</p>
-        <h2 id="remove-title">Remove plugin?</h2>
-        <p id="remove-copy" class="muted">This removes the installed package and its application policies from Core.</p>
+        <p class="eyebrow" data-i18n="dialog.remove.eyebrow">Remove plugin</p>
+        <h2 id="remove-title" data-i18n="dialog.remove.title">Remove plugin?</h2>
+        <p id="remove-copy" class="muted" data-i18n="dialog.remove.copy">This removes the installed package and its application policies from Core.</p>
         <div class="dialog-actions">
-          <button class="button button-quiet" value="cancel">Keep plugin</button>
-          <button id="confirm-remove" class="button button-danger" value="default">Remove plugin</button>
+          <button class="button button-quiet" value="cancel" data-i18n="dialog.remove.keep">Keep plugin</button>
+          <button id="confirm-remove" class="button button-danger" value="default" data-i18n="dialog.remove.confirm">Remove plugin</button>
         </div>
       </form>
     </dialog>
