@@ -5,6 +5,7 @@ const { describe, test, expect } = require("bun:test");
 const adapters = require("../adapters");
 const obsidian = require("./obsidian");
 const example = require("./example");
+const wco = require("./wco");
 
 // Keep any adapter-selection warnings out of test output.
 adapters.init({ log: () => {} });
@@ -70,16 +71,16 @@ describe("obsidian adapter matches()", () => {
 });
 
 describe("obsidian adapter registration order", () => {
-  test("example still wins for the TronHawk test app (registered first)", () => {
-    expect(adapters.select({ name: "tronhawk-test-app" })).toBe(example);
-    // Even a test-app whose exe looks like Obsidian resolves to example: first match wins.
+  test("wco adapter wins for the TronHawk test app (registered before example)", () => {
+    expect(adapters.select({ name: "tronhawk-test-app" })).toBe(wco);
+    // Even a test-app whose exe looks like Obsidian resolves to wco: first match wins.
     expect(
       adapters.select({
         name: "tronhawk-test-app",
         packageJsonName: undefined,
         exeBasename: "Obsidian.exe",
       }),
-    ).toBe(example);
+    ).toBe(wco);
   });
 
   test("obsidian wins for Obsidian appInfo", () => {

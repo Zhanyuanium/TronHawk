@@ -102,6 +102,15 @@ completed or superseded are no longer listed.
       vendored electron-hook).
 - [ ] **ChatGPT/Codex** — MSIX + a custom "owl" Electron fork; GUI does not start under raw-exe
       Detours launch (needs AUMID). Application-profile concern.
+- [ ] **Generic Window Controls Overlay (WCO) elimination adapter** — landed a generic
+      `onWindowOptions` adapter seam + `applyWindowOptions` (fail-open) so an adapter can rewrite
+      every `new BrowserWindow(opts)` the target main process issues. The `wco` adapter drops
+      `titleBarOverlay` and forces `titleBarStyle:"hidden"` (no native min/max/close buttons; no
+      self-drawn controls). Validated against the TronHawk test-app (which simulates a WCO window
+      on Windows). Real-target note: VS Code / WorkBuddy use WCO but are **unpacked apps (no
+      `resources/app.asar`)**, which the ASAR-remap injection path cannot reach — so the WCO-
+      elimination mechanism is proven on the test-app, and real VS Code validation is gated on the
+      unresolved unpacked-app injection concern (ADR 0001/0004).
 
 ## Newly tracked / observations
 

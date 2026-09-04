@@ -4,6 +4,7 @@ const { describe, test, expect } = require("bun:test");
 const path = require("path");
 const adapters = require("./adapters");
 const example = require("./adapters/example");
+const wco = require("./adapters/wco");
 
 // Keep expected warnings (throwing matches/onBootstrap) out of the test output.
 adapters.init({ log: () => {} });
@@ -84,8 +85,8 @@ describe("select", () => {
   const matchingInfo = { name: "tronhawk-test-app", packageJsonName: undefined };
   const nonMatchingInfo = { name: "another-app", packageJsonName: undefined };
 
-  test("returns the example adapter for a matching appInfo", () => {
-    expect(adapters.select(matchingInfo)).toBe(example);
+  test("returns the wco adapter for a matching test-app appInfo (registered before example)", () => {
+    expect(adapters.select(matchingInfo)).toBe(wco);
   });
 
   test("returns null when nothing matches", () => {
@@ -145,5 +146,40 @@ describe("runOnBootstrap", () => {
       },
     };
     expect(() => adapters.runOnBootstrap(boom, ctx)).not.toThrow();
+  });
+});
+
+describe("applyWindowOptions", () => {
+  test("returns opts unchanged when the adapter has no onWindowOptions", () => {
+    const opts = { titleBarStyle: "hidden", titleBarOverlay: { color: "#000" } };
+    expect(adapters.applyWindowOptions({ id: "noop" }, opts)).toBe(opts);
+    expect(adapters.applyWindowOptions(null, opts)).toBe(opts);
+    expect(adapters.applyWindowOptions({ id: "noop" }, undefined)).toBeUndefined();
+  });
+
+  test("routes opts through adapter.onWindowOptions (WCO removal: overlay deleted, style hidden)", () => {
+    const original = { width: 800, titleBarStyle: "hidden", titleBarOverlay: { color: "#2f3241" } };
+    const next = adapters.applyWindowOptions(wco, original);
+    // Returns a NEW options object; never mutates the caller's original.
+    expect(next).not.toBe(original);
+    expect(next.titleBarOverlay).toBeUndefined();
+    expect(next.titleBarStyle).toBe("hidden");
+    // Unrelated options are preserved.
+    expect(next.width).toBe(800);
+  });
+
+  test("returns the original opts and does not throw when onWindowOptions throws (fail-open)", () => {
+    const boom = {
+      id: "boom",
+      onWindowOptions() {
+        throw new Error("window opts exploded");
+      },
+    };
+    const opts = { width: 800 };
+    let result;
+    expect(() => {
+      result = adapters.applyWindowOptions(boom, opts);
+    }).not.toThrow();
+    expect(result).toBe(opts);
   });
 });

@@ -5,6 +5,9 @@
 // .thx. The generic interface is intentionally minimal for Phase A:
 //     matches(appInfo)  -> truthy/falsy   (required; a throw is treated as no-match)
 //     onBootstrap(ctx)  -> void           (optional)
+//     onWindowOptions(opts) -> opts       (optional; see applyWindowOptions — lets an adapter
+//                                          rewrite every `new BrowserWindow(opts)` issued by the
+//                                          target main process, e.g. WCO/titleBarOverlay removal)
 //
 // The loader is invoked synchronously inside start() (src/index.js), which happens BEFORE
 // bootstrap.js requires the original target app — so adapter onBootstrap runs before the
@@ -18,10 +21,13 @@ const path = require("path");
 const exampleAdapter = require("./adapters/example");
 const obsidianAdapter = require("./adapters/obsidian");
 const chatgptAdapter = require("./adapters/chatgpt");
+const wcoAdapter = require("./adapters/wco");
 
-// Registry order matters: the first adapter whose matches() returns truthy wins. obsidian is
-// registered AFTER example so the test-app's `example` still wins for the TronHawk test app.
-const ADAPTERS = [exampleAdapter, obsidianAdapter, chatgptAdapter];
+// Registry order matters: the first adapter whose matches() returns truthy wins. The TronHawk
+// test app is matched by `wco` (the generic Window Controls Overlay elimination adapter, which
+// also carries the renderer gate for the test app) so the WCO mechanism is exercised end-to-end
+// against the deterministic test-app. obsidian/chatgpt remain for their real apps.
+const ADAPTERS = [wcoAdapter, exampleAdapter, obsidianAdapter, chatgptAdapter];
 
 // Host logger, shape log(level, message). Wired by the runtime via init(); defaults to console
 // so any use before wiring (e.g. bun test) still surfaces warnings/errors.
@@ -107,4 +113,23 @@ function runOnBootstrap(adapter, ctx) {
   }
 }
 
-module.exports = { init, buildAppInfo, select, runOnBootstrap };
+// Call adapter.onWindowOptions(opts) if present and return its rewritten options. Fail-open: an
+// adapter window hook must never crash the target's window creation — on any throw the ORIGINAL
+// options are returned untouched (adapter authors must still keep the hook pure, this is defense
+// in depth). Adapters with no hook get opts back unchanged.
+function applyWindowOptions(adapter, opts) {
+  if (!adapter || typeof adapter.onWindowOptions !== "function") return opts;
+  try {
+    return adapter.onWindowOptions(opts);
+  } catch (e) {
+    logger(
+      "warn",
+      adapterName(adapter) +
+        " onWindowOptions threw; using original window options: " +
+        errorMessage(e),
+    );
+    return opts;
+  }
+}
+
+module.exports = { init, buildAppInfo, select, runOnBootstrap, applyWindowOptions };
