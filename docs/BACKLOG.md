@@ -140,3 +140,13 @@ completed or superseded are no longer listed.
       Investigate the reparse-aware reconciliation (whether the created junction is validated against a
       canonicalized path that differs from the `mklink` target) before relying on it for
       native-module targets.
+- [ ] **IFEO transparent launch (external double-click) is limited/unreliable.** With a target's IFEO
+      `Debugger` set to the injector launcher, launching the target from outside (double-click) routes
+      to the launcher, whose `electron_hook::launch` then creates the target again — Windows re-applies
+      the IFEO `Debugger` to that creation, causing an infinite launcher re-entry loop. A
+      `DEBUG_ONLY_THIS_PROCESS` recursion-guard bypass (create as a short-lived debuggee, pump to the
+      loader breakpoint, detach) was implemented and stopped the loop, but the target (Obsidian) then
+      did not survive (likely debug-loop/detach timing interacting with the Detours injection, or the
+      injected DLL's asar remap). It was reverted. **Launch-with-extensions (from the Manager) is the
+      reliable path**; the IFEO toggle remains but external transparent launch is known-limited until
+      the debug-event/injection-timing interaction is resolved.
