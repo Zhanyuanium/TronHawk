@@ -111,13 +111,17 @@ function iefoSection() {
   const registered = current && state.iefo.registered;
   const owned = current ? state.iefo.owned : true;
   const error = current ? state.iefo.error : "";
+  // `owned` is only meaningful once a registration exists: a Debugger present but not
+  // TronHawk-owned (registered && !owned) means another program manages it, so the
+  // switch is disabled. An unregistered target (registered=false) is still switchable.
+  const foreign = registered && !owned;
   const toggleLabel = registered ? t("iefo.toggleOn", { name: application.name }) : t("iefo.toggleOff", { name: application.name });
-  const toggleTitle = !owned ? t("iefo.ownedNote") : loading ? t("iefo.loading") : toggleLabel;
-  const disabled = state.busy || loading || !owned || Boolean(error);
+  const toggleTitle = foreign ? t("iefo.ownedNote") : loading ? t("iefo.loading") : toggleLabel;
+  const disabled = state.busy || loading || foreign || Boolean(error);
   const status = loading ? t("iefo.loading") : registered ? t("iefo.on") : t("iefo.off");
   const switchHtml = `<label class="switch" title="${escapeHtml(toggleTitle)}"><input type="checkbox" data-toggle-iefo="${escapeHtml(id)}" ${registered ? "checked" : ""} ${disabled ? "disabled" : ""} aria-label="${escapeHtml(toggleLabel)}"><span class="slider"></span></label>`;
   const errorBanner = error ? `<div class="error-banner" role="alert" style="margin:0;"><span>${escapeHtml(error)}</span></div>` : "";
-  const ownedNote = !owned ? `<p class="permission-note is-warning" style="margin-top:0;">${escapeHtml(t("iefo.ownedNote"))}</p>` : "";
+  const ownedNote = foreign ? `<p class="permission-note is-warning" style="margin-top:0;">${escapeHtml(t("iefo.ownedNote"))}</p>` : "";
   return `<section class="panel iefo-panel" aria-label="${escapeHtml(t("iefo.title"))}"><header class="panel-header"><div><h2>${t("iefo.title")}</h2><p class="muted" style="margin:3px 0 0;font-size:12px;">${escapeHtml(t("iefo.detail"))}</p></div>${switchHtml}</header><div class="iefo-body"><p class="iefo-status" role="status">${escapeHtml(status)}</p>${errorBanner}${ownedNote}</div></section>`;
 }
 function emptyApplications() {
