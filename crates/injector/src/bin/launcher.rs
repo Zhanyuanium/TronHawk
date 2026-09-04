@@ -402,7 +402,42 @@ fn link_app_asar_unpacked(real_asar: &Path, merged_asar: &Path) -> Result<(), St
     reconcile_unpacked_link(&merged_unpacked, &real_unpacked)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Target executable path normalization
+// ---------------------------------------------------------------------------------------------
+
+/// Convert an executable path into the ordinary Win32 absolute form that CreateProcess / Detours
+/// can actually launch.
+///
+/// Core stores application executable paths in canonical form: `std::fs::canonicalize` on Windows
+/// yields a `\\?\...` extended-length (verbatim) path, and Core's own normalization rewrites the
+/// separators to `/` (so the stored form looks like `//?/C:/Program Files/Obsidian/Obsidian.exe`).
+/// `electron_hook::launch` fails to start such extended-path executables (the process does not
+/// survive creation), while the plain `C:\Program Files\...` form works.
+///
+/// This strips the verbatim prefix — in either the `\\?\` or the forward-slash `//?/` spelling —
+/// and normalizes the remaining separators to `\`, preserving the real on-disk casing (the
+/// filesystem is case-insensitive). A path without the extended prefix is returned as-is apart
+/// from `/`→`\` separator normalization, so genuine UNC paths (`\\server\share\...`) are left
+/// alone, and verbatim UNC (`\\?\UNC\server\share\...`) is recovered as `\\server\share\...`.
+fn normalize_win_exe_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let stripped = trimmed
+        .strip_prefix(r"\\?\")
+        .or_else(|| trimmed.strip_prefix("//?/"))
+        .unwrap_or(trimmed);
+    let mut normalized = stripped.replace('/', r"\");
+    if normalized.len() > 4 && normalized[..4].eq_ignore_ascii_case(r"UNC\") {
+        normalized = format!(r"\\{}", &normalized[4..]);
+    }
+    normalized
+}
+
 fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
+    // Core hands us the canonical `//?/...` path; CreateProcess/Detours cannot launch that form,
+    // so normalize once up front and use the plain Win32 path everywhere below (asar discovery,
+    // cache keying, the launch-session handoff, and electron_hook::launch itself).
+    let target_exe = normalize_win_exe_path(target_exe);
     let dir = launcher_dir();
     let dll = dir.join(DLL_NAME);
     let bootstrap = dir.join(BOOTSTRAP_NAME);
@@ -428,12 +463,12 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     // dir; the target's own files are never touched. Cache names are derived from the target
     // executable (asar_cache_id) so concurrent/multiple targets never share a merged asar or its
     // `.unpacked` junction.
-    let cache_id = asar_cache_id(target_exe);
+    let cache_id = asar_cache_id(&target_exe);
     log_line(&format!("asar cache id: {cache_id}"));
     let asar_path = if std::env::var_os("TRONHAWK_MINIMAL_ASAR").is_some() {
         log_line("using minimal asar stub (TRONHAWK_MINIMAL_ASAR set)");
         minimal_stub(&bootstrap, &cache_id)? // explicit A/B lever
-    } else if let Some(real) = find_real_asar(target_exe) {
+    } else if let Some(real) = find_real_asar(&target_exe) {
         let cache = electron_hook::paths::asar_cache_path(&cache_id);
         match tronhawk_injector::asar_merge::build_merged_asar(&real, &cache, &bootstrap_abs) {
             Ok(report) => {
@@ -483,11 +518,11 @@ fn launch(target_exe: &str, target_args: &[String]) -> Result<(), String> {
     let control_token = tronhawk_injector::launch_session::read_control_token()?;
     tronhawk_injector::launch_session::with_launch_session(
         port,
-        target_exe,
+        &target_exe,
         &control_token,
         || {
             electron_hook::launch(
-                target_exe,
+                &target_exe,
                 dll_str,
                 asar_str,
                 target_args.to_vec(),
@@ -795,6 +830,76 @@ mod tests {
             assert!(contents.contains("alpha stage"));
             assert!(contents.contains("beta stage"));
         });
+    }
+
+    #[test]
+    fn normalize_win_exe_path_strips_extended_prefixes_and_unifies_separators() {
+        // Core-stored canonical form: `\\?\` verbatim prefix written with forward slashes.
+        assert_eq!(
+            normalize_win_exe_path("//?/C:/Program Files/Obsidian/Obsidian.exe"),
+            r"C:\Program Files\Obsidian\Obsidian.exe"
+        );
+        // Backslash verbatim spelling.
+        assert_eq!(
+            normalize_win_exe_path(r"\\?\C:\a\b.exe"),
+            r"C:\a\b.exe"
+        );
+        // No extended prefix: unchanged apart from `/` -> `\`.
+        assert_eq!(
+            normalize_win_exe_path(r"C:\Program Files\Obsidian\Obsidian.exe"),
+            r"C:\Program Files\Obsidian\Obsidian.exe"
+        );
+        assert_eq!(
+            normalize_win_exe_path("C:/Program Files/Obsidian/Obsidian.exe"),
+            r"C:\Program Files\Obsidian\Obsidian.exe"
+        );
+        // Mixed separators after the prefix are unified.
+        assert_eq!(
+            normalize_win_exe_path(r"\\?\C:\a/b\c.exe"),
+            r"C:\a\b\c.exe"
+        );
+        // Whitespace around the argument is trimmed.
+        assert_eq!(
+            normalize_win_exe_path("  //?/C:/a/b.exe  "),
+            r"C:\a\b.exe"
+        );
+        // A genuine UNC path is untouched.
+        assert_eq!(
+            normalize_win_exe_path(r"\\server\share\apps\x.exe"),
+            r"\\server\share\apps\x.exe"
+        );
+        // A verbatim UNC path is recovered to the ordinary UNC form.
+        assert_eq!(
+            normalize_win_exe_path(r"\\?\UNC\server\share\apps\x.exe"),
+            r"\\server\share\apps\x.exe"
+        );
+        assert_eq!(
+            normalize_win_exe_path("//?/UNC/server/share/apps/x.exe"),
+            r"\\server\share\apps\x.exe"
+        );
+    }
+
+    #[test]
+    fn normalize_win_exe_path_preserves_given_case() {
+        // The path is treated case-insensitively by the filesystem; normalization must not
+        // uppercase/lowercase anything (only the prefix and separators change).
+        assert_eq!(
+            normalize_win_exe_path("//?/c:/program files/obsidian/Obsidian.exe"),
+            r"c:\program files\obsidian\Obsidian.exe"
+        );
+        assert_eq!(
+            normalize_win_exe_path(r"\\?\D:\Mixed\Case\App.exe"),
+            r"D:\Mixed\Case\App.exe"
+        );
+    }
+
+    #[test]
+    fn normalize_win_exe_path_of_a_plain_name_is_unchanged() {
+        assert_eq!(normalize_win_exe_path("notepad.exe"), "notepad.exe");
+        assert_eq!(
+            normalize_win_exe_path("./relative/tool.exe"),
+            r".\relative\tool.exe"
+        );
     }
 
     #[test]
