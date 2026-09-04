@@ -4,9 +4,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::autostart::{autostart_command, AutostartStore, RunKeyAutostart};
 use crate::log_store::{LogLevel, LogQuery, LogStore, LogStream, NewLogRecord};
 use crate::{
     hash_bytes, hash_json, plugin_grant, transaction_dir, transaction_file, ExecutionPlan, Plugin,
@@ -44,12 +45,23 @@ const RATE_IDLE_RESET: Duration = Duration::from_secs(600);
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GlobalState {
     developer_mode: bool,
+    /// Whether Core registers itself in the HKCU Run key at boot. Defaults to true; a legacy
+    /// state file without the field loads with the default via `#[serde(default)]`.
+    #[serde(default = "core_autostart_default")]
+    core_autostart: bool,
+}
+
+/// The `coreAutostart` default for a fresh state and for legacy state files that predate the
+/// field: Core registers itself unless the user opted out.
+fn core_autostart_default() -> bool {
+    true
 }
 
 impl Default for GlobalState {
     fn default() -> Self {
         Self {
             developer_mode: false,
+            core_autostart: core_autostart_default(),
         }
     }
 }
@@ -122,11 +134,13 @@ struct PluginCache {
     stale: bool,
 }
 
-#[derive(Debug)]
 struct ServiceInner {
     state: DaemonState,
     plugin_cache: Option<PluginCache>,
     log_rates: HashMap<String, LogRate>,
+    /// Autostart Run-entry backend. Swappable so daemon tests can inject a fake; production
+    /// always uses the Windows `reg`-backed [`RunKeyAutostart`].
+    autostart: Arc<dyn AutostartStore>,
 }
 
 /// Single-writer Core state and request router.
@@ -179,6 +193,7 @@ impl CoreService {
                 state,
                 plugin_cache: None,
                 log_rates: HashMap::new(),
+                autostart: Arc::new(RunKeyAutostart),
             }),
         })
     }
@@ -317,6 +332,14 @@ impl CoreService {
                     Err(RouterError::InvalidParams("expected empty params".into()))
                 }
             }
+            "getCoreAutostart" => {
+                if is_empty_params(&request.params) {
+                    self.get_core_autostart(inner)
+                } else {
+                    Err(RouterError::InvalidParams("expected empty params".into()))
+                }
+            }
+            "setCoreAutostart" => self.set_core_autostart(inner, request.params),
             "installPlugin" => self.install_plugin(inner, request.params),
             "setApplicationPluginPolicy" => self.set_policy(inner, request.params),
             "setDeveloperMode" => self.set_developer_mode(inner, request.params),
@@ -624,6 +647,105 @@ impl CoreService {
         };
         self.append_core_event("global", None, "core.developerMode.updated", message);
         Ok(serde_json::json!({ "developerMode": params.enabled }))
+    }
+
+    /// Effective Core-autostart state: the persisted preference OR the presence of the HKCU Run
+    /// entry. The OR keeps reporting an entry that is actually registered even when the persisted
+    /// preference was turned off afterwards (e.g. a failed disable), and a preference that is on
+    /// but has not reached the registry yet still reports enabled — the registry op is a
+    /// reconciliation detail recorded in the event log.
+    fn get_core_autostart(&self, inner: &ServiceInner) -> RouterResult {
+        Ok(serde_json::json!({
+            "enabled": inner.state.global.core_autostart || inner.autostart.is_registered(),
+        }))
+    }
+
+    /// Set the Core-autostart preference and reconcile the HKCU Run entry. Control-token only.
+    /// `register` runs only when the entry is missing (idempotent — never rewritten); `unregister`
+    /// is a no-op when the entry is already absent. A failed registry op is surfaced as an RPC
+    /// error (the preference is NOT flipped to a state the registry does not back) and is also
+    /// recorded as a `core.autostart.register_failed` event.
+    fn set_core_autostart(
+        &self,
+        inner: &mut ServiceInner,
+        params: serde_json::Value,
+    ) -> RouterResult {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            enabled: bool,
+        }
+        let params: Params = parse_params(params)?;
+        let store = Arc::clone(&inner.autostart);
+
+        if params.enabled {
+            if !store.is_registered() {
+                let executable = std::env::current_exe()
+                    .map_err(|error| RouterError::Internal(format!("resolve core executable: {error}")))?;
+                if let Err(error) = store.register(&autostart_command(&executable)) {
+                    self.report_autostart_failure("registration", &error);
+                    return Err(RouterError::Internal(format!(
+                        "Core autostart registration failed: {error}"
+                    )));
+                }
+            }
+        } else if store.is_registered() {
+            if let Err(error) = store.unregister() {
+                self.report_autostart_failure("unregistration", &error);
+                return Err(RouterError::Internal(format!(
+                    "Core autostart unregistration failed: {error}"
+                )));
+            }
+        }
+
+        if inner.state.global.core_autostart != params.enabled {
+            let mut next = inner.state.clone();
+            next.global.core_autostart = params.enabled;
+            write_state(&self.state_path, &next).map_err(RouterError::Internal)?;
+            inner.state = next;
+        }
+        Ok(serde_json::json!({ "enabled": params.enabled }))
+    }
+
+    /// Startup reconciliation of the autostart preference: when the persisted preference is true
+    /// and the HKCU Run entry is missing, register `<core.exe> /autostart`. Called by the daemon
+    /// entrypoint on the default storage root (the root the Run entry actually launches).
+    /// Failures are recorded as `core.autostart.register_failed` events and never crash startup.
+    pub fn ensure_core_autostart_registered(&self) {
+        let (enabled, store) = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            (inner.state.global.core_autostart, Arc::clone(&inner.autostart))
+        };
+        if !enabled || store.is_registered() {
+            return;
+        }
+        let command = match std::env::current_exe() {
+            Ok(executable) => autostart_command(&executable),
+            Err(error) => {
+                self.report_autostart_failure(
+                    "registration",
+                    &format!("cannot resolve core executable: {error}"),
+                );
+                return;
+            }
+        };
+        if let Err(error) = store.register(&command) {
+            self.report_autostart_failure("registration", &error);
+        }
+    }
+
+    /// Record a startup-scoped Core event (e.g. a failed legacy-storage migration) through the
+    /// secure event log. Best-effort: a broken log store never fails daemon startup.
+    pub fn record_startup_event(&self, code: &'static str, message: &str) {
+        self.append_core_event("global", None, code, message);
+    }
+
+    fn report_autostart_failure(&self, action: &str, error: &str) {
+        let message = format!("Core autostart {action} failed: {error}");
+        self.append_core_event("global", None, "core.autostart.register_failed", &message);
+        eprintln!("[core] {message}");
     }
 
     fn set_policy(&self, inner: &mut ServiceInner, params: serde_json::Value) -> RouterResult {
@@ -955,7 +1077,7 @@ impl CoreService {
         application_id: &str,
         plugin_id: Option<&str>,
         code: &'static str,
-        message: &'static str,
+        message: &str,
     ) {
         if let Ok(mut logs) = self.logs.lock() {
             let _ = logs.append(NewLogRecord {
@@ -1762,19 +1884,6 @@ fn file_mtime_ns(entry: &std::fs::DirEntry) -> Result<u128, String> {
 
 pub fn serve_service(port: u16, service: std::sync::Arc<CoreService>) -> std::io::Result<()> {
     tronhawk_ipc::serve(port, move |request| service.handle_request(request))
-}
-
-pub fn default_storage_root() -> PathBuf {
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local_app_data).join("TronHawk");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("TronHawk");
-    }
-    std::env::temp_dir().join("TronHawk")
 }
 
 #[cfg(test)]
@@ -4119,6 +4228,506 @@ mod tests {
                 ["winexe-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
                 ["plugins"]["com.example.legacy"]["config"],
             serde_json::json!({})
+        );
+    }
+
+    // --- Core autostart (HKCU Run preference + registration) --------------------------------
+
+    /// No-side-effect autostart backend for tests: records every register/unregister attempt,
+    /// tracks the (fake) registry presence, and can be made to fail.
+    #[derive(Clone)]
+    struct RecordingAutostart {
+        state: Arc<Mutex<AutostartRecording>>,
+    }
+
+    #[derive(Default)]
+    struct AutostartRecording {
+        registered: bool,
+        register_failure: Option<String>,
+        unregister_failure: Option<String>,
+        calls: Vec<String>,
+        last_command: Option<String>,
+    }
+
+    impl RecordingAutostart {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(AutostartRecording::default())),
+            }
+        }
+
+        fn set_registered(&self, registered: bool) {
+            self.state.lock().unwrap().registered = registered;
+        }
+
+        fn fail_register(&self, message: &str) {
+            self.state.lock().unwrap().register_failure = Some(message.to_owned());
+        }
+
+        fn fail_unregister(&self, message: &str) {
+            self.state.lock().unwrap().unregister_failure = Some(message.to_owned());
+        }
+
+        fn registered(&self) -> bool {
+            self.state.lock().unwrap().registered
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.state.lock().unwrap().calls.clone()
+        }
+
+        fn last_command(&self) -> Option<String> {
+            self.state.lock().unwrap().last_command.clone()
+        }
+    }
+
+    impl AutostartStore for RecordingAutostart {
+        fn is_registered(&self) -> bool {
+            self.state.lock().unwrap().registered
+        }
+
+        fn register(&self, command: &str) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("register".to_owned());
+            state.last_command = Some(command.to_owned());
+            if let Some(error) = state.register_failure.clone() {
+                return Err(error);
+            }
+            state.registered = true;
+            Ok(())
+        }
+
+        fn unregister(&self) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("unregister".to_owned());
+            if let Some(error) = state.unregister_failure.clone() {
+                return Err(error);
+            }
+            state.registered = false;
+            Ok(())
+        }
+    }
+
+    /// Replace a service's autostart backend with a recording fake (production CoreService uses
+    /// the real RunKeyAutostart, which must never run `reg` in tests).
+    fn install_autostart_fake(service: &CoreService) -> RecordingAutostart {
+        let fake = RecordingAutostart::new();
+        service.inner.lock().unwrap().autostart = Arc::new(fake.clone());
+        fake
+    }
+
+    #[test]
+    fn core_autostart_defaults_on_and_rpcs_are_control_only() {
+        let temp = TempRoot::new("autostart-auth");
+        let executable = temp.executable("Auto.exe");
+        let (service, control) = service(&temp);
+        assert_eq!(
+            service.inner.lock().unwrap().state.global.core_autostart,
+            true,
+            "coreAutostart defaults to true"
+        );
+
+        // Both autostart RPCs are control-token-only.
+        let token = launch_token(&service, &control, &executable);
+        assert_eq!(
+            error_code(call(
+                &service,
+                &token,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            -32003
+        );
+        assert_eq!(
+            error_code(call(
+                &service,
+                &token,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": false }),
+            )),
+            -32003
+        );
+
+        // Malformed params are rejected.
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "enabled": "yes" }),
+            serde_json::json!({ "enabled": false, "extra": true }),
+        ] {
+            assert_eq!(
+                error_code(call(&service, &control, "setCoreAutostart", params)),
+                -32602
+            );
+        }
+        assert_eq!(
+            error_code(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({ "enabled": false }),
+            )),
+            -32602
+        );
+
+        // Fresh state: preference true => enabled (even with no registry entry).
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": true })
+        );
+    }
+
+    #[test]
+    fn set_core_autostart_registers_persists_and_is_idempotent() {
+        let temp = TempRoot::new("autostart-set");
+        let (service, control) = service(&temp);
+        let fake = install_autostart_fake(&service);
+        let expected_command = autostart_command(&std::env::current_exe().unwrap());
+
+        // Enable: registers once (entry missing), persists the preference.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": true }),
+            )),
+            serde_json::json!({ "enabled": true })
+        );
+        assert_eq!(fake.calls(), vec!["register".to_owned()]);
+        assert_eq!(fake.last_command(), Some(expected_command));
+        assert!(fake.registered());
+        assert_eq!(
+            service.inner.lock().unwrap().state.global.core_autostart,
+            true
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.0.join("config/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["global"]["coreAutostart"], true);
+
+        // Enabling again is idempotent: the entry exists, so nothing is rewritten.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": true }),
+            )),
+            serde_json::json!({ "enabled": true })
+        );
+        assert_eq!(fake.calls(), vec!["register".to_owned()]);
+
+        // Disable: unregisters and persists false.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": false }),
+            )),
+            serde_json::json!({ "enabled": false })
+        );
+        assert_eq!(
+            fake.calls(),
+            vec!["register".to_owned(), "unregister".to_owned()]
+        );
+        assert!(!fake.registered());
+        assert_eq!(
+            service.inner.lock().unwrap().state.global.core_autostart,
+            false
+        );
+
+        // Disabling again is idempotent: no registry call (entry already absent).
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": false }),
+            )),
+            serde_json::json!({ "enabled": false })
+        );
+        assert_eq!(
+            fake.calls(),
+            vec!["register".to_owned(), "unregister".to_owned()]
+        );
+    }
+
+    #[test]
+    fn core_autostart_effective_state_is_preference_or_registry() {
+        let temp = TempRoot::new("autostart-effective");
+        let (service, control) = service(&temp);
+        let fake = install_autostart_fake(&service);
+
+        // Preference true (fresh default) with no entry => enabled.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": true })
+        );
+
+        // Preference false, no entry => disabled.
+        ok(call(
+            &service,
+            &control,
+            "setCoreAutostart",
+            serde_json::json!({ "enabled": false }),
+        ));
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": false })
+        );
+
+        // Preference false but a registry entry appears (e.g. created externally or left by a
+        // crashed disable) => enabled, because the boot entry is actually active.
+        fake.set_registered(true);
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": true })
+        );
+    }
+
+    #[test]
+    fn core_autostart_preference_survives_service_rebuild() {
+        let temp = TempRoot::new("autostart-persist");
+        let (service, control) = service(&temp);
+        let fake = install_autostart_fake(&service);
+
+        ok(call(
+            &service,
+            &control,
+            "setCoreAutostart",
+            serde_json::json!({ "enabled": false }),
+        ));
+        assert_eq!(fake.registered(), false);
+        drop(service);
+
+        let rebuilt = CoreService::new(&temp.0).unwrap();
+        let rebuilt_control = std::fs::read_to_string(rebuilt.control_token_path()).unwrap();
+        install_autostart_fake(&rebuilt);
+        assert_eq!(
+            ok(call(
+                &rebuilt,
+                &rebuilt_control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": false }),
+            "the persisted false preference must survive a rebuild"
+        );
+    }
+
+    #[test]
+    fn core_autostart_startup_ensure_registers_only_when_enabled_and_absent() {
+        let temp = TempRoot::new("autostart-ensure");
+        let (core, _control) = service(&temp);
+
+        // Default preference true + missing entry => one register with the quoted /autostart cmd.
+        let fake = install_autostart_fake(&core);
+        core.ensure_core_autostart_registered();
+        assert!(fake.registered());
+        let command = fake.last_command().unwrap();
+        assert!(
+            command.ends_with("\" /autostart"),
+            "command must launch core with /autostart: {command}"
+        );
+        assert!(command.starts_with('"'), "executable must be quoted: {command}");
+
+        // Entry already present => no second write.
+        core.ensure_core_autostart_registered();
+        assert_eq!(fake.calls(), vec!["register".to_owned()]);
+
+        // Preference false => never registers.
+        let temp_disabled = TempRoot::new("autostart-ensure-disabled");
+        let (disabled, _control) = service(&temp_disabled);
+        let fake = install_autostart_fake(&disabled);
+        disabled.inner.lock().unwrap().state.global.core_autostart = false;
+        disabled.ensure_core_autostart_registered();
+        assert!(fake.calls().is_empty());
+        assert!(!fake.registered());
+    }
+
+    #[test]
+    fn core_autostart_failures_record_events_and_never_crash() {
+        let temp = TempRoot::new("autostart-fail");
+        let (service, control) = service(&temp);
+
+        // Startup-ensure failure: registered event, service keeps serving, preference stays on
+        // (get reports the preference; the event log carries the reason).
+        let fake = install_autostart_fake(&service);
+        fake.fail_register("registry denied");
+        service.ensure_core_autostart_registered();
+        assert!(!fake.registered());
+        let logs = query_logs(&service, &control);
+        let failures = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["code"] == "core.autostart.register_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Core autostart registration failed: registry denied"));
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": true })
+        );
+
+        // setCoreAutostart failure surfaces as an RPC error and the preference is not flipped.
+        assert_eq!(
+            error_code(call(
+                &service,
+                &control,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": true }),
+            )),
+            -32603
+        );
+        let logs = query_logs(&service, &control);
+        let failures = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["code"] == "core.autostart.register_failed")
+            .count();
+        assert_eq!(failures, 2);
+
+        // Unregister failure also records an event and returns an error.
+        fake.set_registered(true);
+        fake.fail_unregister("registry busy");
+        assert_eq!(
+            error_code(call(
+                &service,
+                &control,
+                "setCoreAutostart",
+                serde_json::json!({ "enabled": false }),
+            )),
+            -32603
+        );
+        assert_eq!(
+            service.inner.lock().unwrap().state.global.core_autostart,
+            true,
+            "a failed disable must not flip the persisted preference"
+        );
+    }
+
+    #[test]
+    fn legacy_global_state_without_core_autostart_loads_with_default_on() {
+        // A state.json written before coreAutostart existed must load with the field defaulting
+        // to true (developer-mode persistence is untouched).
+        let temp = TempRoot::new("legacy-autostart");
+        let config_dir = temp.0.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "global": { "developerMode": true },
+                "applications": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let service = CoreService::new(&temp.0).unwrap();
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        let snapshot = ok(call(
+            &service,
+            &control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert_eq!(snapshot["global"]["developerMode"], true);
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getCoreAutostart",
+                serde_json::json!({}),
+            )),
+            serde_json::json!({ "enabled": true }),
+            "legacy state without coreAutostart must default to on"
+        );
+    }
+
+    #[test]
+    fn migration_preserves_developer_mode_and_config_state() {
+        // End-to-end guard for the legacy-storage migration: after the merge copy, a daemon
+        // built on the new root reads developer mode / application config from the migrated
+        // state, and further writes land in the new root — never the legacy one.
+        let legacy = TempRoot::new("migrate-dev-legacy");
+        let current = TempRoot::new("migrate-dev-current");
+        let config_dir = legacy.0.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "global": { "developerMode": true },
+                "applications": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::migrate_legacy_storage(&legacy.0, &current.0).unwrap(),
+            crate::MigrationOutcome::Migrated
+        );
+        let service = CoreService::new(&current.0).unwrap();
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        let snapshot = ok(call(
+            &service,
+            &control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert_eq!(
+            snapshot["global"]["developerMode"],
+            true,
+            "developer mode must survive the storage-root migration"
+        );
+
+        // A state write after migration lands in the new root only.
+        ok(call(
+            &service,
+            &control,
+            "setDeveloperMode",
+            serde_json::json!({ "enabled": false }),
+        ));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(current.0.join("config/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["global"]["developerMode"], false);
+        assert!(
+            !legacy.0.exists(),
+            "the legacy root must be removed after a successful migration"
         );
     }
 }

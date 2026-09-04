@@ -8,12 +8,18 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+mod autostart;
 mod daemon;
 mod log_store;
+mod storage;
 
+pub use autostart::{autostart_command, is_autostart_arg, AutostartStore, RunKeyAutostart};
 pub use daemon::{
-    application_id_for_executable, default_storage_root, serve_service, ApplicationState,
-    CoreService, PluginPolicy,
+    application_id_for_executable, serve_service, ApplicationState, CoreService, PluginPolicy,
+};
+pub use storage::{
+    default_storage_root, is_default_storage_root, legacy_storage_root, migrate_legacy_storage,
+    MigrationOutcome,
 };
 
 pub use tronhawk_package::Plugin;

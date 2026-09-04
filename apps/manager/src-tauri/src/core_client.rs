@@ -216,15 +216,20 @@ fn storage_root() -> PathBuf {
         return PathBuf::from(root);
     }
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local_app_data).join("TronHawk");
+        return PathBuf::from(local_app_data)
+            .join("com.tronhawk.manager")
+            .join("core");
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("TronHawk");
+            .join("com.tronhawk.manager")
+            .join("core");
     }
-    std::env::temp_dir().join("TronHawk")
+    std::env::temp_dir()
+        .join("com.tronhawk.manager")
+        .join("core")
 }
 
 fn ipc_port() -> u16 {

@@ -231,6 +231,22 @@ fn set_developer_mode(state: State<'_, ManagerState>, enabled: bool) -> Result<V
         .call("setDeveloperMode", json!({ "enabled": enabled }))
 }
 
+/// Reads the effective Core autostart state (persisted preference OR the presence of the HKCU
+/// Run entry). A thin passthrough to Core's `getCoreAutostart` control RPC.
+#[tauri::command]
+fn get_core_autostart(state: State<'_, ManagerState>) -> Result<Value, String> {
+    state.core.call("getCoreAutostart", json!({}))
+}
+
+/// Enables/disables Core boot autostart: Core reconciles its HKCU Run entry and persists the
+/// preference. A thin passthrough to Core's `setCoreAutostart` control RPC.
+#[tauri::command]
+fn set_core_autostart(state: State<'_, ManagerState>, enabled: bool) -> Result<Value, String> {
+    state
+        .core
+        .call("setCoreAutostart", json!({ "enabled": enabled }))
+}
+
 #[tauri::command]
 fn install_plugin(
     app: AppHandle,
@@ -273,7 +289,9 @@ pub fn run() {
             set_plugin_config,
             remove_plugin,
             install_plugin,
-            set_developer_mode
+            set_developer_mode,
+            get_core_autostart,
+            set_core_autostart
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

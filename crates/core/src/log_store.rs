@@ -406,6 +406,8 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
                     | "core.policy.updated"
                     | "core.developerMode.updated"
                     | "core.launch_session.created"
+                    | "core.storage.migrate_failed"
+                    | "core.autostart.register_failed"
             )
         }
     };
