@@ -4458,6 +4458,8 @@ dependencies = [
  "sha2",
  "tronhawk-ipc",
  "tronhawk-package",
+ "winapi",
+ "winreg 0.52.0",
 ]
 
 [[package]]

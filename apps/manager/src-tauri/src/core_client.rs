@@ -12,6 +12,11 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// RPC bound for control calls that may wait on a user decision (UAC elevation). Core keeps the
+/// state lock free during the prompt, but it only answers once ShellExecuteExW returns — which
+/// is after the user accepts or dismisses UAC — so the socket read must tolerate a long prompt.
+const ELEVATED_RPC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 const STORAGE_ROOT_ENV: &str = "TRONHAWK_STORAGE_ROOT";
 const IPC_PORT_ENV: &str = "TRONHAWK_IPC_PORT";
 
@@ -57,6 +62,20 @@ impl CoreClient {
         self.ensure_core_available()?;
         let token = self.read_control_token()?;
         self.call_with_token(method, params, &token)
+    }
+
+    /// Control RPCs that may wait on a UAC prompt use a much more generous timeout than a normal
+    /// round-trip (see [`ELEVATED_RPC_TIMEOUT`]). Used by the IFEO registration toggle.
+    pub(crate) fn call_elevated(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.ensure_core_available()?;
+        let token = self.read_control_token()?;
+        tronhawk_ipc::call_control(
+            self.port,
+            &token,
+            method,
+            params,
+            ELEVATED_RPC_TIMEOUT,
+        )
     }
 
     /// One authenticated control RPC over the shared `tronhawk-ipc` client. The client first

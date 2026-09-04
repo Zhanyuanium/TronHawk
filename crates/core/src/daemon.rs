@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::autostart::{autostart_command, AutostartStore, RunKeyAutostart};
+use crate::iefo::{IefoReader, IefoWriteOutcome, IefoWriter, LauncherIefoWriter, RegistryIefoReader};
+#[cfg(test)]
+use crate::iefo::IefoSnapshot;
 use crate::log_store::{LogLevel, LogQuery, LogStore, LogStream, NewLogRecord};
 use crate::{
     hash_bytes, hash_json, plugin_grant, transaction_dir, transaction_file, ExecutionPlan, Plugin,
@@ -156,6 +159,12 @@ pub struct CoreService {
     launch_key: String,
     inner: Mutex<ServiceInner>,
     logs: Mutex<LogStore>,
+    /// HKLM IFEO registration backend (elevated write through the co-located injector launcher).
+    /// Swappable so daemon tests can inject a fake; production always uses [`LauncherIefoWriter`].
+    iefo_writer: Arc<dyn IefoWriter>,
+    /// HKLM IFEO read backend (direct, non-elevated). Swappable so daemon tests can inject a
+    /// fake; production always uses [`RegistryIefoReader`].
+    iefo_reader: Arc<dyn IefoReader>,
 }
 
 impl CoreService {
@@ -195,6 +204,8 @@ impl CoreService {
                 log_rates: HashMap::new(),
                 autostart: Arc::new(RunKeyAutostart),
             }),
+            iefo_writer: Arc::new(LauncherIefoWriter),
+            iefo_reader: Arc::new(RegistryIefoReader),
         })
     }
 
@@ -221,6 +232,13 @@ impl CoreService {
 
         // Control-token requests are authorized by possession of the persistent control token.
         if constant_time_eq(request.secret.as_bytes(), self.control_token.as_bytes()) {
+            // setIefoRegistration may sit on a UAC prompt for a long time, and the runtime's plan
+            // polls share the state mutex. Dispatch it BEFORE taking the state lock: the handler
+            // snapshots the application record under a short lock, then runs the elevated write
+            // with the mutex free.
+            if request.method == "setIefoRegistration" {
+                return self.set_iefo_registration(request);
+            }
             let mut inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return rpc_error(request.id, -32603, "internal error"),
@@ -325,6 +343,8 @@ impl CoreService {
     ) -> tronhawk_ipc::Response {
         let result = match request.method.as_str() {
             "registerApplication" => self.register_application(inner, request.params),
+            "removeApplication" => self.remove_application(inner, request.params),
+            "getIefoRegistration" => self.get_iefo_registration(inner, request.params),
             "getManagerSnapshot" => {
                 if is_empty_params(&request.params) {
                     self.manager_snapshot(inner)
@@ -591,6 +611,158 @@ impl CoreService {
             "displayName": application.display_name,
             "supportLevel": application.support_level,
         }))
+    }
+
+    /// Remove a registered application: its state (registration + per-plugin policy/config) is
+    /// dropped from `state.json`, the record is persisted, and a `core.application.removed`
+    /// event is logged. Deliberately does NOT touch the HKLM IFEO entry — transparent launch is
+    /// owned by the separate `setIefoRegistration` switch, so removing an application never
+    /// silently tears down (or silently keeps) a redirection the user manages explicitly.
+    /// Unknown ids are invalid params (-32602).
+    fn remove_application(
+        &self,
+        inner: &mut ServiceInner,
+        params: serde_json::Value,
+    ) -> RouterResult {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            application_id: String,
+        }
+        let params: Params = parse_params(params)?;
+        if !inner.state.applications.contains_key(&params.application_id) {
+            return Err(RouterError::InvalidParams("application not found".into()));
+        }
+        let mut next = inner.state.clone();
+        next.applications.remove(&params.application_id);
+        write_state(&self.state_path, &next).map_err(RouterError::Internal)?;
+        inner.state = next;
+        self.append_core_event(
+            &params.application_id,
+            None,
+            "core.application.removed",
+            "Application removed",
+        );
+        Ok(serde_json::json!({ "removed": true }))
+    }
+
+    /// Read the current HKLM IFEO registration for an application by resolving its executable
+    /// and probing the registry directly — no launcher, no elevation. Unknown ids are invalid
+    /// params (-32602); a missing/unreadable key (or a non-Windows host) degrades to
+    /// `{ registered: false, owned: false }`.
+    fn get_iefo_registration(
+        &self,
+        inner: &mut ServiceInner,
+        params: serde_json::Value,
+    ) -> RouterResult {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            application_id: String,
+        }
+        let params: Params = parse_params(params)?;
+        let application = inner
+            .state
+            .applications
+            .get(&params.application_id)
+            .cloned()
+            .ok_or_else(|| RouterError::InvalidParams("application not found".into()))?;
+        let snapshot = self
+            .iefo_reader
+            .read(&application.executable_path)
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "applicationId": params.application_id,
+            "registered": snapshot.registered,
+            "owned": snapshot.owned,
+        }))
+    }
+
+    /// Enable/disable the HKLM IFEO registration for an application by re-launching the
+    /// co-located injector launcher elevated (`register`/`unregister <exe>`). Runs WITHOUT the
+    /// state mutex held across the UAC prompt (see [`Self::handle_request`]); the application
+    /// record is snapshotted under a short lock first.
+    ///
+    /// - Exit code 0 (Applied) → `registered = enabled`, `cancelled = false`.
+    /// - A dismissed UAC prompt (Cancelled) → `cancelled = true`, `registered` reflects whatever
+    ///   is still in the registry (the Manager snaps its switch back to the real state).
+    /// - Any other launcher failure → -32603 with a `core.iefo.write_failed` event.
+    fn set_iefo_registration(&self, request: tronhawk_ipc::Request) -> tronhawk_ipc::Response {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            application_id: String,
+            enabled: bool,
+        }
+        let params: Params = match parse_params(request.params) {
+            Ok(params) => params,
+            Err(_) => return rpc_error(request.id, -32602, "invalid params"),
+        };
+        let executable_path = match self.inner.lock() {
+            Ok(inner) => match inner.state.applications.get(&params.application_id) {
+                Some(application) => application.executable_path.clone(),
+                None => return rpc_error(request.id, -32602, "application not found"),
+            },
+            Err(_) => return rpc_error(request.id, -32603, "internal error"),
+        };
+
+        let outcome = match self.iefo_writer.apply(&executable_path, params.enabled) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.report_iefo_failure(&params.application_id, params.enabled, &error);
+                return rpc_error(
+                    request.id,
+                    -32603,
+                    format!("IFEO registration failed: {error}"),
+                );
+            }
+        };
+
+        let (registered, cancelled) = match outcome {
+            IefoWriteOutcome::Applied => (params.enabled, false),
+            // The user declined elevation: nothing changed, so report the state actually still
+            // in the registry (degraded to false when the entry can no longer be read).
+            IefoWriteOutcome::Cancelled => (
+                self.iefo_reader
+                    .read(&executable_path)
+                    .map(|snapshot| snapshot.registered)
+                    .unwrap_or(false),
+                true,
+            ),
+        };
+        match outcome {
+            IefoWriteOutcome::Applied if params.enabled => self.append_core_event(
+                &params.application_id,
+                None,
+                "core.iefo.registered",
+                "IFEO registration enabled",
+            ),
+            IefoWriteOutcome::Applied => self.append_core_event(
+                &params.application_id,
+                None,
+                "core.iefo.unregistered",
+                "IFEO registration disabled",
+            ),
+            // A cancelled UAC prompt changes nothing, so no event is recorded.
+            IefoWriteOutcome::Cancelled => {}
+        }
+        rpc_ok(
+            request.id,
+            serde_json::json!({
+                "applicationId": params.application_id,
+                "registered": registered,
+                "cancelled": cancelled,
+            }),
+        )
+    }
+
+    /// Record an elevated IFEO write failure as a `core.iefo.write_failed` event and echo it to
+    /// the daemon stderr. The message never embeds the target executable path.
+    fn report_iefo_failure(&self, application_id: &str, enabled: bool, error: &str) {
+        let action = if enabled { "enable" } else { "disable" };
+        let message = format!("IFEO {action} failed: {error}");
+        self.append_core_event(application_id, None, "core.iefo.write_failed", &message);
+        eprintln!("[core] {message}");
     }
 
     fn create_launch_session(&self, params: serde_json::Value) -> RouterResult {
@@ -4314,6 +4486,507 @@ mod tests {
         let fake = RecordingAutostart::new();
         service.inner.lock().unwrap().autostart = Arc::new(fake.clone());
         fake
+    }
+
+    /// No-side-effect IFEO write backend for tests: records every apply attempt and can be told
+    /// to report an applied write, a UAC cancellation, or a hard failure.
+    #[derive(Clone)]
+    struct RecordingIefoWriter {
+        state: Arc<Mutex<IefoWriteRecording>>,
+    }
+
+    struct IefoWriteRecording {
+        outcome: IefoWriteOutcome,
+        failure: Option<String>,
+        calls: Vec<(String, bool)>,
+    }
+
+    impl Default for IefoWriteRecording {
+        fn default() -> Self {
+            Self {
+                outcome: IefoWriteOutcome::Applied,
+                failure: None,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl RecordingIefoWriter {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(IefoWriteRecording::default())),
+            }
+        }
+
+        fn set_outcome(&self, outcome: IefoWriteOutcome) {
+            self.state.lock().unwrap().outcome = outcome;
+        }
+
+        fn set_failure(&self, message: &str) {
+            self.state.lock().unwrap().failure = Some(message.to_owned());
+        }
+
+        fn calls(&self) -> Vec<(String, bool)> {
+            self.state.lock().unwrap().calls.clone()
+        }
+    }
+
+    impl IefoWriter for RecordingIefoWriter {
+        fn apply(&self, target_exe: &str, enabled: bool) -> Result<IefoWriteOutcome, String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push((target_exe.to_owned(), enabled));
+            if let Some(error) = state.failure.clone() {
+                return Err(error);
+            }
+            Ok(state.outcome)
+        }
+    }
+
+    /// No-side-effect IFEO read backend for tests: returns a canned snapshot, or an error when
+    /// none is configured (exercising the daemon's degraded-read path).
+    #[derive(Clone)]
+    struct StubIefoReader {
+        state: Arc<Mutex<IefoReadRecording>>,
+    }
+
+    #[derive(Default)]
+    struct IefoReadRecording {
+        snapshot: Option<IefoSnapshot>,
+        calls: Vec<String>,
+    }
+
+    impl StubIefoReader {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(IefoReadRecording::default())),
+            }
+        }
+
+        fn set_snapshot(&self, snapshot: Option<IefoSnapshot>) {
+            self.state.lock().unwrap().snapshot = snapshot;
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.state.lock().unwrap().calls.clone()
+        }
+    }
+
+    impl IefoReader for StubIefoReader {
+        fn read(&self, target_exe: &str) -> Result<IefoSnapshot, String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(target_exe.to_owned());
+            state
+                .snapshot
+                .ok_or_else(|| "no IFEO entry".to_owned())
+        }
+    }
+
+    /// Replace a service's IFEO backends with recording fakes (production CoreService uses the
+    /// real elevated launcher / HKLM reader, which must never run in tests).
+    fn install_iefo_fakes(service: &mut CoreService) -> (RecordingIefoWriter, StubIefoReader) {
+        let writer = RecordingIefoWriter::new();
+        let reader = StubIefoReader::new();
+        service.iefo_writer = Arc::new(writer.clone());
+        service.iefo_reader = Arc::new(reader.clone());
+        (writer, reader)
+    }
+
+    /// The registered executable path Core hands to the IFEO backends for `application_id`.
+    fn registered_executable_path(
+        service: &CoreService,
+        control: &str,
+        application_id: &str,
+    ) -> String {
+        ok(call(
+            service,
+            control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ))["applications"][application_id]["executablePath"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn unknown_application_id() -> String {
+        format!("winexe-v1:{}", "0".repeat(64))
+    }
+
+    #[test]
+    fn remove_and_iefo_rpcs_are_control_only_and_reject_bad_input() {
+        let temp = TempRoot::new("remove-iefo-auth");
+        let app = temp.executable("Auth.exe");
+        let (mut service, control) = service(&temp);
+        let (writer, reader) = install_iefo_fakes(&mut service);
+        let application_id = register(&service, &control, &app, 2);
+        let token = launch_token(&service, &control, &app);
+
+        // The three new RPCs are control-token-only: a launch token is forbidden, and the fake
+        // backends stay untouched.
+        for (method, params) in [
+            (
+                "removeApplication",
+                serde_json::json!({ "applicationId": application_id }),
+            ),
+            (
+                "getIefoRegistration",
+                serde_json::json!({ "applicationId": application_id }),
+            ),
+            (
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "enabled": true }),
+            ),
+        ] {
+            assert_eq!(
+                error_code(call(&service, &token, method, params)),
+                -32003
+            );
+        }
+        assert!(writer.calls().is_empty());
+        assert!(reader.calls().is_empty());
+
+        // Malformed params (missing/unknown/wrong-typed fields) are invalid params.
+        for (method, params) in [
+            ("removeApplication", serde_json::json!({})),
+            (
+                "removeApplication",
+                serde_json::json!({ "applicationId": application_id, "extra": true }),
+            ),
+            ("removeApplication", serde_json::json!({ "applicationId": 1 })),
+            ("getIefoRegistration", serde_json::json!({})),
+            (
+                "getIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "extra": true }),
+            ),
+            ("setIefoRegistration", serde_json::json!({})),
+            (
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id }),
+            ),
+            (
+                "setIefoRegistration",
+                serde_json::json!({
+                    "applicationId": application_id,
+                    "enabled": true,
+                    "extra": true,
+                }),
+            ),
+            (
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "enabled": "yes" }),
+            ),
+        ] {
+            assert_eq!(
+                error_code(call(&service, &control, method, params)),
+                -32602
+            );
+        }
+
+        // Unknown application ids are invalid params for all three RPCs (and never touch the
+        // backends).
+        let unknown = unknown_application_id();
+        for (method, params) in [
+            ("removeApplication", serde_json::json!({ "applicationId": unknown })),
+            ("getIefoRegistration", serde_json::json!({ "applicationId": unknown })),
+            (
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": unknown, "enabled": true }),
+            ),
+        ] {
+            assert_eq!(
+                error_code(call(&service, &control, method, params)),
+                -32602
+            );
+        }
+        assert!(writer.calls().is_empty());
+        assert!(reader.calls().is_empty());
+    }
+
+    #[test]
+    fn remove_application_drops_only_the_target_and_keeps_other_app_data() {
+        let temp = TempRoot::new("remove-app");
+        let one = temp.executable("One.exe");
+        let two = temp.executable("Two.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (mut service, control) = service(&temp);
+        let (writer, reader) = install_iefo_fakes(&mut service);
+        let one_id = register(&service, &control, &one, 2);
+        let two_id = register(&service, &control, &two, 1);
+        install_package(&service, &control, &package);
+        ok(set_policy(&service, &control, &one_id, true, &["renderer.css"]));
+        ok(set_policy(
+            &service,
+            &control,
+            &two_id,
+            true,
+            &["renderer.css", "renderer.script"],
+        ));
+
+        // removeApplication returns the contract shape and never consults the IFEO backends.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "removeApplication",
+                serde_json::json!({ "applicationId": one_id }),
+            )),
+            serde_json::json!({ "removed": true })
+        );
+        assert!(writer.calls().is_empty());
+        assert!(reader.calls().is_empty());
+
+        // The removed application is gone; the other one (with its policy) survives.
+        let snapshot = ok(call(
+            &service,
+            &control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert!(snapshot["applications"].get(&one_id).is_none());
+        assert!(snapshot["applications"].get(&two_id).is_some());
+        assert_eq!(
+            snapshot["applications"][&two_id]["plugins"]["com.example.daemon"]["enabled"],
+            true
+        );
+
+        // The removal is recorded as a core event against the removed application id.
+        let logs = query_logs(&service, &control);
+        assert!(logs["events"].as_array().unwrap().iter().any(|event| {
+            event["code"] == "core.application.removed"
+                && event["applicationId"] == one_id
+        }));
+
+        // Removal is durable across a CoreService rebuild.
+        drop(service);
+        let rebuilt = CoreService::new(&temp.0).unwrap();
+        let rebuilt_control = std::fs::read_to_string(rebuilt.control_token_path()).unwrap();
+        let snapshot = ok(call(
+            &rebuilt,
+            &rebuilt_control,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+        ));
+        assert!(snapshot["applications"].get(&one_id).is_none());
+        assert!(snapshot["applications"].get(&two_id).is_some());
+    }
+
+    #[test]
+    fn set_iefo_registration_applied_maps_and_records_events() {
+        let temp = TempRoot::new("iefo-applied");
+        let app = temp.executable("Applied.exe");
+        let (mut service, control) = service(&temp);
+        let (writer, reader) = install_iefo_fakes(&mut service);
+        let application_id = register(&service, &control, &app, 2);
+        let executable_path = registered_executable_path(&service, &control, &application_id);
+        writer.set_outcome(IefoWriteOutcome::Applied);
+
+        // Enable: registered = enabled, cancelled = false, and the writer saw the executable.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "enabled": true }),
+            )),
+            serde_json::json!({
+                "applicationId": application_id,
+                "registered": true,
+                "cancelled": false,
+            })
+        );
+        assert_eq!(
+            writer.calls(),
+            vec![(executable_path.clone(), true)]
+        );
+        assert!(reader.calls().is_empty());
+
+        // Disable: registered = enabled = false.
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "enabled": false }),
+            )),
+            serde_json::json!({
+                "applicationId": application_id,
+                "registered": false,
+                "cancelled": false,
+            })
+        );
+        assert_eq!(
+            writer.calls(),
+            vec![(executable_path.clone(), true), (executable_path, false)]
+        );
+
+        // The two applied writes are recorded as core events.
+        let logs = query_logs(&service, &control);
+        let codes = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| {
+                if event["applicationId"] == application_id {
+                    event["code"].as_str()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"core.iefo.registered"));
+        assert!(codes.contains(&"core.iefo.unregistered"));
+    }
+
+    #[test]
+    fn set_iefo_registration_cancellation_reports_the_actual_state_and_no_event() {
+        let temp = TempRoot::new("iefo-cancel");
+        let app = temp.executable("Cancelled.exe");
+        let (mut service, control) = service(&temp);
+        let (writer, reader) = install_iefo_fakes(&mut service);
+        let application_id = register(&service, &control, &app, 2);
+        writer.set_outcome(IefoWriteOutcome::Cancelled);
+
+        // Cancelling an enable while nothing is registered: nothing changed, registered=false.
+        reader.set_snapshot(None); // unreadable entry -> degraded read
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "enabled": true }),
+            )),
+            serde_json::json!({
+                "applicationId": application_id,
+                "registered": false,
+                "cancelled": true,
+            })
+        );
+
+        // Cancelling a disable while a registration remains: the switch must snap back to the
+        // actual (still-registered) state.
+        reader.set_snapshot(Some(IefoSnapshot {
+            registered: true,
+            owned: true,
+        }));
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "setIefoRegistration",
+                serde_json::json!({ "applicationId": application_id, "enabled": false }),
+            )),
+            serde_json::json!({
+                "applicationId": application_id,
+                "registered": true,
+                "cancelled": true,
+            })
+        );
+        assert_eq!(writer.calls().len(), 2);
+        // A cancelled prompt changes nothing, so no registered/unregistered event is recorded.
+        let logs = query_logs(&service, &control);
+        assert!(logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["code"] != "core.iefo.registered"
+                && event["code"] != "core.iefo.unregistered"));
+    }
+
+    #[test]
+    fn set_iefo_registration_write_failure_surfaces_an_error_and_event() {
+        let temp = TempRoot::new("iefo-fail");
+        let app = temp.executable("Fail.exe");
+        let (mut service, control) = service(&temp);
+        let (writer, reader) = install_iefo_fakes(&mut service);
+        let application_id = register(&service, &control, &app, 2);
+        writer.set_failure("registry denied");
+
+        let response = call(
+            &service,
+            &control,
+            "setIefoRegistration",
+            serde_json::json!({ "applicationId": application_id, "enabled": true }),
+        );
+        assert_eq!(error_code(response.clone()), -32603);
+        // The failure reason travels on the wire (it never embeds the executable path).
+        let message = error_message(response);
+        assert!(message.contains("registry denied"), "message: {message}");
+        assert!(!message.contains("Fail.exe"), "message: {message}");
+        assert_eq!(writer.calls().len(), 1);
+        assert!(reader.calls().is_empty());
+
+        // The readable reason lands in a core event (never on the wire as a raw path).
+        let logs = query_logs(&service, &control);
+        assert!(logs["events"].as_array().unwrap().iter().any(|event| {
+            event["code"] == "core.iefo.write_failed"
+                && event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("registry denied"))
+        }));
+    }
+
+    #[test]
+    fn get_iefo_registration_shapes_and_read_degrades_on_failure() {
+        let temp = TempRoot::new("iefo-get");
+        let app = temp.executable("Probe.exe");
+        let (mut service, control) = service(&temp);
+        let (writer, reader) = install_iefo_fakes(&mut service);
+        let application_id = register(&service, &control, &app, 2);
+        let executable_path = registered_executable_path(&service, &control, &application_id);
+
+        // Owned + registered -> the contract shape echoes applicationId.
+        reader.set_snapshot(Some(IefoSnapshot {
+            registered: true,
+            owned: true,
+        }));
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getIefoRegistration",
+                serde_json::json!({ "applicationId": application_id }),
+            )),
+            serde_json::json!({
+                "applicationId": application_id,
+                "registered": true,
+                "owned": true,
+            })
+        );
+
+        // A third-party registration (Debugger present, no TronHawk marker) -> owned=false.
+        reader.set_snapshot(Some(IefoSnapshot {
+            registered: true,
+            owned: false,
+        }));
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getIefoRegistration",
+                serde_json::json!({ "applicationId": application_id }),
+            ))["owned"],
+            false
+        );
+
+        // An unreadable/missing key (or a non-Windows host) degrades to registered/owned=false.
+        reader.set_snapshot(None);
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "getIefoRegistration",
+                serde_json::json!({ "applicationId": application_id }),
+            )),
+            serde_json::json!({
+                "applicationId": application_id,
+                "registered": false,
+                "owned": false,
+            })
+        );
+
+        // Every read probed the registered executable path.
+        assert_eq!(reader.calls(), vec![executable_path.clone(); 3]);
+        assert!(writer.calls().is_empty());
     }
 
     #[test]

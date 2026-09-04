@@ -224,6 +224,51 @@ fn remove_plugin(state: State<'_, ManagerState>, plugin_id: String) -> Result<Va
         .call("removePlugin", json!({ "pluginId": plugin_id }))
 }
 
+/// Removes a registered application (its registration and per-plugin policy/config only; any
+/// transparent-launch registration is deliberately left for the separate IFEO toggle). A thin
+/// passthrough to Core's `removeApplication` control RPC; the response is `{ "removed": true }`
+/// and unknown ids surface as a Core -32602 error.
+#[tauri::command]
+fn remove_application(
+    state: State<'_, ManagerState>,
+    application_id: String,
+) -> Result<Value, String> {
+    state.core.call(
+        "removeApplication",
+        json!({ "applicationId": application_id }),
+    )
+}
+
+/// Reads whether the application currently has a TronHawk transparent-launch (IFEO) registration.
+/// A thin passthrough to Core's `getIefoRegistration` control RPC; Core probes HKLM directly (no
+/// launcher, no elevation) and never returns paths. The response is
+/// `{ "applicationId", "registered", "owned" }`.
+#[tauri::command]
+fn get_iefo_registration(
+    state: State<'_, ManagerState>,
+    application_id: String,
+) -> Result<Value, String> {
+    state.core.call(
+        "getIefoRegistration",
+        json!({ "applicationId": application_id }),
+    )
+}
+
+/// Enables/disables the application's transparent-launch (IFEO) registration. Core relaunches
+/// the injector launcher elevated (UAC), so this command uses an extended RPC timeout; the
+/// response is `{ "applicationId", "registered", "cancelled" }`.
+#[tauri::command]
+fn set_iefo_registration(
+    state: State<'_, ManagerState>,
+    application_id: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    state.core.call_elevated(
+        "setIefoRegistration",
+        json!({ "applicationId": application_id, "enabled": enabled }),
+    )
+}
+
 #[tauri::command]
 fn set_developer_mode(state: State<'_, ManagerState>, enabled: bool) -> Result<Value, String> {
     state
@@ -284,6 +329,7 @@ pub fn run() {
             launch_application,
             query_logs,
             register_application,
+            remove_application,
             set_application_plugin_policy,
             get_plugin_config,
             set_plugin_config,
@@ -291,7 +337,9 @@ pub fn run() {
             install_plugin,
             set_developer_mode,
             get_core_autostart,
-            set_core_autostart
+            set_core_autostart,
+            get_iefo_registration,
+            set_iefo_registration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

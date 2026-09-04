@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 mod autostart;
 mod daemon;
+mod iefo;
 mod log_store;
 mod storage;
 

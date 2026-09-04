@@ -399,6 +399,7 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
             matches!(
                 record.code.as_str(),
                 "core.application.registered"
+                    | "core.application.removed"
                     | "core.plugin.installed"
                     | "core.plugin.removed"
                     | "core.plugin.scan_failed"
@@ -408,6 +409,9 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
                     | "core.launch_session.created"
                     | "core.storage.migrate_failed"
                     | "core.autostart.register_failed"
+                    | "core.iefo.registered"
+                    | "core.iefo.unregistered"
+                    | "core.iefo.write_failed"
             )
         }
     };
