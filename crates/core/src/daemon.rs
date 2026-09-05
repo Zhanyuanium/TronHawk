@@ -327,16 +327,27 @@ impl CoreService {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, String> {
         let root = root.into();
         let installed_root = root.join("plugins").join("installed");
+        let plugin_cache_root = root.join("plugins").join("cache");
         let config_root = root.join("config");
+        let profiles_root = root.join("profiles");
+        let runtime_root = root.join("runtime");
         let state_path = config_root.join("state.json");
         let control_token_path = config_root.join("control.token");
         let launch_key_path = config_root.join("launch.key");
         std::fs::create_dir_all(&installed_root)
             .map_err(|e| format!("create installed root: {e}"))?;
+        // Disk backing for the SPEC §12 `plugins/cache` directory. This is unrelated to the
+        // in-memory `PluginCache` snapshot above, which keeps its existing behavior.
+        std::fs::create_dir_all(&plugin_cache_root)
+            .map_err(|e| format!("create plugin cache root: {e}"))?;
         // A crash mid-install/remove can leave hidden transaction dirs behind; sweep them
         // best-effort so they never accumulate into permanent debris.
         sweep_orphaned_transaction_dirs(&installed_root);
         create_config_directory(&config_root)?;
+        std::fs::create_dir_all(&profiles_root)
+            .map_err(|e| format!("create profiles root: {e}"))?;
+        std::fs::create_dir_all(&runtime_root)
+            .map_err(|e| format!("create runtime root: {e}"))?;
 
         let (state, state_needs_write) = read_state(&state_path)?;
         if state_needs_write {
