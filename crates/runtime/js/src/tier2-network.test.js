@@ -182,19 +182,39 @@ describe("ctx.network (ADR 0008)", () => {
     expect(pluginMessages(PID, "info", "NET-UNEXPECTED-RESOLVE").length).toBe(0);
   });
 
-  test("ctx.network is only present when network.access is granted", async () => {
-    // A main plugin that loads via electron.window but WITHOUT network.access must not get ctx.network
-    // (the network host function is only mounted when network.access is granted).
+  test("ctx.network denied stub rejects with a catchable error when network.access is missing", async () => {
+    // Without network.access the runtime mounts a denied stub (SDK PluginContext requires
+    // ctx.network): request() must return a rejected Promise — never throw synchronously — with
+    // "network.access not granted", and must never touch the networkRequest transport.
     const withoutAccess = `
       module.exports = {
-        activate: (ctx) => {
+        activate: async (ctx) => {
           ctx.logger.info("NET-TYPEOF:" + (typeof ctx.network));
+          let syncThrew = false;
+          let p = null;
+          try {
+            p = ctx.network.request({ url: "https://api.example.com/", method: "GET" });
+          } catch (e) {
+            syncThrew = true;
+          }
+          ctx.logger.info("NET-SYNC-THREW:" + syncThrew);
+          try {
+            await p;
+            ctx.logger.info("NET-UNEXPECTED-RESOLVE");
+          } catch (e) {
+            ctx.logger.info("NET-DENIED:" + (e && e.message ? e.message : e));
+          }
         },
       };
     `;
     applyPlan(plan("r1", withoutAccess, ["electron.window"]));
     await waitFor(() => pluginMessages(PID, "info", "NET-TYPEOF").length > 0, "plugin loaded");
-    expect(pluginMessages(PID, "info", "NET-TYPEOF")[0][2]).toBe("NET-TYPEOF:undefined");
+    await waitFor(() => pluginMessages(PID, "info", "NET-DENIED").length > 0, "denied rejection");
+    expect(pluginMessages(PID, "info", "NET-TYPEOF")[0][2]).toBe("NET-TYPEOF:object");
+    expect(pluginMessages(PID, "info", "NET-SYNC-THREW")[0][2]).toBe("NET-SYNC-THREW:false");
+    expect(pluginMessages(PID, "info", "NET-DENIED")[0][2]).toContain("network.access not granted");
+    expect(pluginMessages(PID, "info", "NET-UNEXPECTED-RESOLVE").length).toBe(0);
+    expect(requestCalls.some(([method]) => method === "networkRequest")).toBe(false);
     // A network-only grant still loads (wanted-predicate widened) — verified by a separate test above.
     expect(testing.mainPlugins().has(PID)).toBe(true);
   });

@@ -963,6 +963,87 @@ function buildNetworkApi(vm, pluginId) {
   return network;
 }
 
+// Denied `ctx.network` stub — mounted whenever `network.access` is NOT granted so the required
+// `ctx.network` surface (SDK PluginContext) is always present. `request()` never touches the
+// transport; it returns a QuickJS Promise rejected with the same string shape as a real transport
+// failure (`vm.newString`), so guest `try/catch` sees "network.access not granted" instead of a
+// synchronous `undefined` TypeError. Never throws synchronously — always returns the promise.
+const NETWORK_ACCESS_DENIED = "network.access not granted";
+function buildNetworkDeniedApi(vm, pluginId) {
+  const network = vm.newObject();
+  const request = vm.newFunction("request", () => {
+    const { opId, handle } = newHostPromise(vm, pluginId, "network.request");
+    // Settle asynchronously to reuse the pending-job pump path (same as the real bridge).
+    Promise.resolve().then(() => {
+      settleOp(opId, "reject", () => vm.newString(NETWORK_ACCESS_DENIED));
+    });
+    return handle;
+  });
+  vm.setProp(network, "request", request);
+  request.dispose();
+  return network;
+}
+
+// `ctx.css` — renderer-only async host API bridging `webContents.insertCSS` (data, never JS).
+// Requires the `renderer.css` grant. `insert(css)` injects via the host and resolves to the
+// Electron CSS key; `remove(key)` revokes via removeCssKey (bounded retries, same path as the
+// manifest-CSS reconcile). Each op is a QuickJS Promise delivered by the pump (ADR 0008).
+function buildCssApi(vm, pluginId, w, cleanupCallbacks) {
+  const contents = w.contents;
+  const css = vm.newObject();
+  const liveKeys = new Set();
+  const insert = vm.newFunction("insert", (cssHandle) => {
+    if (vm.typeof(cssHandle) !== "string") {
+      pluginLog(pluginId, "warn", "css.insert: argument must be a CSS string");
+      return vm.undefined;
+    }
+    const cssText = vm.getString(cssHandle);
+    const { opId, handle } = newHostPromise(vm, pluginId, "css.insert");
+    contents
+      .insertCSS(cssText)
+      .then((key) => {
+        liveKeys.add(key);
+        settleOp(opId, "resolve", () => vm.newString(key));
+      })
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(css, "insert", insert);
+  insert.dispose();
+  const remove = vm.newFunction("remove", (idHandle) => {
+    if (vm.typeof(idHandle) !== "string") {
+      pluginLog(pluginId, "warn", "css.remove: argument must be a CSS key string");
+      return vm.undefined;
+    }
+    const key = vm.getString(idHandle);
+    if (key === "") {
+      pluginLog(pluginId, "warn", "css.remove: invalid key");
+      return vm.undefined;
+    }
+    const { opId, handle } = newHostPromise(vm, pluginId, "css.remove");
+    removeCssKey(w, pluginId, key).then((removed) => {
+      if (removed) {
+        liveKeys.delete(key);
+        settleOp(opId, "resolve", () => vm.undefined);
+      } else {
+        settleOp(opId, "reject", () => vm.newString("CSS removal failed"));
+      }
+    });
+    return handle;
+  });
+  vm.setProp(css, "remove", remove);
+  remove.dispose();
+  if (Array.isArray(cleanupCallbacks)) {
+    cleanupCallbacks.push(() => {
+      for (const key of [...liveKeys]) {
+        liveKeys.delete(key);
+        removeCssKey(w, pluginId, key).catch(() => {});
+      }
+    });
+  }
+  return css;
+}
+
 // `ctx.storage` — renderer-only async host API bridging the target page's localStorage, with a
 // host-owned namespaced key (`tronhawk:<pluginId>:<key>`, pluginId is NEVER guest-supplied) so one
 // plugin cannot read another's keys. Each get/set is a QuickJS Promise delivered by the pump; the
@@ -1514,6 +1595,28 @@ function runRawPlugin(plugin, generation, fingerprint, windowRecord) {
       get: (key) => (typeof key === "string" ? (plugin.config || {})[key] : undefined),
       set: () => {},
     },
+    // Required surface (SDK PluginContext): real Core-side fetch when granted, denied stub that
+    // returns a rejected Promise (never throws synchronously) otherwise.
+    network: hasPermission(plugin.granted, "network.access")
+      ? {
+          request: (req) => {
+            const url = req && typeof req.url === "string" ? req.url : "";
+            const method =
+              req && typeof req.method === "string" ? req.method.toUpperCase() : "GET";
+            const headers =
+              req && typeof req.headers === "object" && req.headers !== null ? req.headers : {};
+            const body = req && typeof req.body === "string" ? req.body : "";
+            if (!planRequest) return Promise.reject(new Error("network transport unavailable"));
+            return planRequest(
+              "networkRequest",
+              { pluginId: plugin.id, url, method, headers, body },
+              { timeout: 30000 },
+            ).then(({ id, envelope }) => validatePlanEnvelope(envelope, id));
+          },
+        }
+      : {
+          request: () => Promise.reject(new Error(NETWORK_ACCESS_DENIED)),
+        },
     raw: {
       electron: require("electron"),
       node: { require, process },
@@ -1634,6 +1737,11 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
     config.dispose();
     if (hasPermission(plugin.granted, "network.access")) {
       const net = buildNetworkApi(vm, plugin.id);
+      vm.setProp(ctx, "network", net);
+      net.dispose();
+    } else {
+      // Required surface (SDK PluginContext): denied stub rejects with a catchable error.
+      const net = buildNetworkDeniedApi(vm, plugin.id);
       vm.setProp(ctx, "network", net);
       net.dispose();
     }
@@ -1831,6 +1939,16 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       const net = buildNetworkApi(vm, plugin.id);
       vm.setProp(ctx, "network", net);
       net.dispose();
+    } else {
+      // Required surface (SDK PluginContext): denied stub rejects with a catchable error.
+      const net = buildNetworkDeniedApi(vm, plugin.id);
+      vm.setProp(ctx, "network", net);
+      net.dispose();
+    }
+    if (hasPermission(plugin.granted, "renderer.css")) {
+      const css = buildCssApi(vm, plugin.id, w, cleanupCallbacks);
+      vm.setProp(ctx, "css", css);
+      css.dispose();
     }
     if (hasPermission(plugin.granted, "renderer.storage")) {
       const storage = buildStorageApi(vm, plugin.id, contents);
