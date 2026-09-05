@@ -48,7 +48,7 @@ Support is tiered, not binary:
 |---|---|
 | 0 | Unsupported |
 | 1 | Renderer extension: CSS injection, JS injection, DOM manipulation |
-| 2 | Electron extension: BrowserWindow / webContents / session / IPC |
+| 2 | Electron extension: BrowserWindow (wired) / webContents / session / IPC (future, see PLUGIN-SDK) |
 
 ## 6. Tech Decisions
 
@@ -114,10 +114,12 @@ Pre-production validation (must PoC → ADR before committing):
    + app load work, but full GUI startup fails under raw-exe launch (needs AUMID; see ADR).
 5. VS Code — ❌ no `resources/app.asar` (unpacked `resources/app/`); the ASAR-remap path cannot
    target it. Obsidian (standard Electron 43.3.0) validated instead — injection + renderer
-   CSS/DOM injection work, but it loads via a custom `app://` protocol so only the shell renders.
+   CSS/DOM injection work; it loads via a custom `app://` protocol, which the per-app
+   **compat adapter** covers (ADR 0001/0003).
    Root cause confirmed (ADR 0004): the minimal modded asar broke Obsidian's runtime module
-   resolution (`@electron/remote`); fixed by a merged asar (Path I). Full UI then needs the
-   per-app **compat adapter** injection (ADR 0001/0003).
+   resolution (`@electron/remote`); fixed by a merged asar (Path I). A Sep-2026 real run confirmed
+   the full note workspace rendering with `injected; electron=43.3.0`, `adapter active: obsidian`,
+   and `CSS injected` events.
 
 PoC → ADR: `docs/adr/0001-injection-backend.md`. electron-hook is **vendored** (`vendor/electron-hook/`,
 LGPL-3.0 + MIT Detours) and activates via a **launcher wrapper** (Detours), so IFEO's `Debugger` key
@@ -128,12 +130,12 @@ guards (contextIsolation, sandbox, ASAR, code cache, custom preload).
 
 ## 9. Plugin Model
 
-Package `.thx` (ZIP): `manifest.json`, `dist/{renderer.js, main.js}`, `assets/`, `signature.json`, `metadata.json`.
+Package `.thx` (ZIP): `manifest.json`, `dist/{renderer.js, main.js}`, `assets/` (`signature.json` / `metadata.json` are reserved for a future signed-package release and are not verified today).
 Manifest required fields: `id`, `name`, `version`, `author`, `tronhawk`; optional `css` (inline CSS
 data, or `entry.css` file) for CSS-only themes, `entry.{renderer,main}`, and `permissions[]`.
 
 Execution contexts:
-- **Renderer** (Chromium/V8): CSS is data-only; plugin JS runs in QuickJS with one-second evaluation
+- **Renderer** (Chromium/V8): manifest CSS is data-only (CSS-only plugins never execute JS); plugins holding `renderer.css` can also call `ctx.css.insert` / `ctx.css.remove` at runtime; plugin JS runs in QuickJS with one-second evaluation
   and callback CPU deadlines. `renderer.script` only allows the host-owned document-title setter
   (ADR 0002); `renderer.dom` query/observe is implemented as async host functions returning
   serialized `DomElement` snapshots (ADR 0008); renderer-only `ctx.storage` is host-namespaced per
@@ -182,11 +184,11 @@ privileged API verifies permission first.
 | `renderer.dom` | read DOM via serialized `DomElement` snapshots (`query`/`observe`) | medium |
 | `renderer.storage` | read/write this plugin's own host-namespaced storage (strings, bounded) | low |
 | `electron.window` | modify window (`setOpacity`, `setVibrancy`) | high |
-| `electron.webContents` | page load, DevTools | — |
-| `electron.session` | UA, proxy, cookies | — |
-| `electron.ipc` | observe / intercept IPC | high |
+| `electron.webContents` | page load, DevTools (future) | — |
+| `electron.session` | UA, proxy, cookies (future) | — |
+| `electron.ipc` | observe / intercept IPC (future) | high |
 | `network.access` | internet access (Core-side domain-whitelisted fetch via `ctx.network.request`) | — |
-| `network.proxy` | modify requests | high |
+| `network.proxy` | modify requests (future) | high |
 | `runtime.unsafe` | raw Node / Electron (developer mode) | critical (opt-in, developer mode) |
 
 Install UX: show requested vs not-requested capabilities (accept / reject / details).

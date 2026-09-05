@@ -15,7 +15,7 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 |---|---|---|
 | both | `ctx.logger` (info/warn/error) | Implemented — host-attributed, string-only |
 | renderer | `renderer.css`: data-only CSS pipeline (CSS-only plugins via a manifest `css`/`entry.css` file) | Implemented — stylesheets are injected into each window via `webContents.insertCSS` and removed on unload/revocation; CSS-only plugins never execute JS |
-| renderer | `ctx.css.insert` / `ctx.css.remove` | Future — the `CssAPI` host functions are typed in the SDK but not yet exposed to the renderer QuickJS context; CSS-injection today is data-only from the manifest, not a runtime-callable host function |
+| renderer | `ctx.css.insert` / `ctx.css.remove` (`renderer.css`) | Implemented — runtime-callable host functions on top of the manifest data-only CSS pipeline: `insert` injects via `webContents.insertCSS` and returns the key, `remove` revokes it (bounded retry); CSS-only plugins still never execute JS |
 | renderer | `ctx.script.setDocumentTitle` (`renderer.script`) | Implemented — host-owned fixed assignment; input is data, never JS source |
 | main | `ctx.window.onCreated` / `setOpacity` / `setSize` / `setPosition` (`electron.window`) | Implemented |
 | main | `ctx.onLoad` / `ctx.onRendererReady` / `ctx.onUnload` (`electron.window`) | Implemented — main-context lifecycle events: `onLoad` fires once at app ready (a late subscription fires immediately), `onRendererReady` per window per load/navigation (a late subscription replays already-loaded windows), `onUnload` per window webContents destroy; synchronous `undefined` callbacks invoked under the CPU-deadline contract, fail-closed unregister on throw/timeout/non-void |
@@ -26,7 +26,7 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | main | `ctx.webContents.*` | Future |
 | both | `ctx.session.*` | Future |
 | both | `ctx.ipc.*` | Future |
-| both | `ctx.network.request` (`network.access`) | Implemented — Core-side domain-whitelisted fetch (ADR 0008); the promise rejects with a catchable error on a non-whitelisted URL or network failure |
+| both | `ctx.network.request` (`network.access`) | Implemented — Core-side domain-whitelisted fetch (ADR 0008); the promise rejects with a catchable error on a non-whitelisted URL or network failure. `ctx.network` is always present: without the grant (including raw plugins) it is a stub whose `request` rejects with `network.access not granted` |
 | both | `ctx.config.get` / `ctx.config.set` | Implemented — get reads the per-app-per-plugin config snapshot (schema defaults overlaid with stored values); set is a no-op for sandboxed plugins (config is persisted only through the Manager settings form) |
 | both | `ctx.raw` (`runtime.unsafe`, developer mode) | Implemented — raw host execution while developer mode is on + `runtime.unsafe` granted |
 

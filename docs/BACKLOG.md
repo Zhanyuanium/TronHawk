@@ -26,6 +26,10 @@ completed or superseded are no longer listed.
 - [x] Plugin `deactivate(ctx)` lifecycle — resolved: the runtime now invokes the plugin's exported
       `deactivate` (double-revoke guarded) before disposing the VM, for both main and renderer
       plugins; a returned Promise is drained (ADR 0008).
+- [x] Runtime-callable `ctx.css.insert` / `ctx.css.remove` — resolved: renderer plugins holding
+      `renderer.css` can inject/revoke stylesheets at runtime (bounded remove retry); `ctx.network`
+      is now always present (denying stub without `network.access`), closing the SDK required-field
+      drift.
 - [x] QuickJS pending-job draining — resolved (ADR 0008): the runtime now drains pending jobs
       (`executePendingJobs()`) around host-async operations and at `activate`/`deactivate`, so the
       SDK contract broadens from synchronous `void` to `void | Promise<void>` for lifecycle hooks
@@ -34,9 +38,8 @@ completed or superseded are no longer listed.
       `crates/runtime/js/src/adapters`, ADR 0003); Obsidian's blocker root-caused and fixed at the
       injection layer (ADR 0004: merged asar, so `app.getAppPath()`/module resolution serve real
       files). The broader *application profiles* (recognition, per-app plugin UX, Manager UI) remain
-      deferred (SPEC §18). Remaining for Obsidian: confirm the workspace mounts under the merged
-      asar on a real run, then Path A (adapter `renderer.gate` injects once `.workspace` mounts);
-      WorkBuddy not yet validated.
+      deferred (SPEC §18). Obsidian workspace mount confirmed on a Sep-2026 real run (full note
+      UI rendered; Path A `renderer.gate` fired on `.workspace`); WorkBuddy not yet validated.
 
 ## Phase 4 — Manager UI (functional; these remain)
 
@@ -108,7 +111,9 @@ completed or superseded are no longer listed.
       `package.json` lacks a `version`, so `app.getVersion()` falls back to the exe's 4-part
       `1.22.0.0`, which electron-updater rejects. Confirmed Electron behavior. Mitigation: copy the
       original asar's `version`/`name`/`productName` into the modded asar (`make_package_json` in
-      vendored electron-hook).
+      vendored electron-hook). Update: under the merged asar (Path I) the modded `package.json`
+      comes from the real app (which carries a version), so this may already be resolved — needs a
+      real re-run to confirm.
 - [ ] **ChatGPT/Codex** — MSIX + a custom "owl" Electron fork; GUI does not start under raw-exe
       Detours launch (needs AUMID). Application-profile concern.
 - [ ] **Generic Window Controls Overlay (WCO) elimination adapter** — landed a generic
@@ -127,15 +132,11 @@ completed or superseded are no longer listed.
 
 ## Newly tracked / observations
 
-- [ ] **`tests/integration.ps1` end-to-end gate fails in this environment — injection not reaching
-      the target.** Core events arrive (launch_session/policy/registered) and the target process
-      spawns, but the injected `bootstrap.js` never runs (a module-entry marker file is never
-      written) and no Runtime/Plugin events are recorded. This is an **environment-level
-      `electron-hook`/Detours injection failure**, NOT a regression from the Tier0/DevMode work: a
-      `git stash` to the pre-change baseline reproduces the identical failure. Investigate
-      separately (e.g. Detours/Exploit Protection / antivirus interference, or the vendored
-      electron-hook build against Electron 43.4.1) before relying on this test as a gate. Unit +
-      SDK + CLI + plugin typecheck suites all pass.
+- [x] **`tests/integration.ps1` end-to-end gate fails in this environment.** Resolved: the root
+      cause was a stale `target/debug/tronhawk-sidecar.json` from an old `--aumid` probe — the
+      injected DLL's `DllMain` re-applied it and clobbered the fresh env, so `bootstrap()` never
+      ran. Fixed structurally (the launcher deletes the sidecar after a successful `--aumid`
+      attach); the gate now passes on `main`, including DUR-1 restart-reconnect.
 - [ ] **SEC-1 relay residual (accepted-in-threat-model).** `getServerProof` is unauthenticated, so
       a process that can reach an already-running real daemon could obtain proofs. The primary
       port-squat scenario (impostor binds before Core starts) has no daemon to relay to, so the
@@ -152,8 +153,10 @@ completed or superseded are no longer listed.
       Node/Electron environment (`ctx.raw.electron` / `ctx.raw.node`) — no QuickJS sandbox, no CPU
       deadline, no memory/stack limits.
 - [ ] Workspace `cargo fmt --all --check` drift (pre-existing, out of scope for this batch):
-      `apps/manager/src-tauri/src/lib.rs:171`, `crates/injector/src/registry.rs`,
-      `crates/package/src/lib.rs`, `vendor/electron-hook/**`. Needs a format-only pass by owners.
+      14 files ~100 spots, incl. `crates/core/src/daemon.rs`, `crates/injector/src/bin/launcher.rs`,
+      `crates/injector/src/asar_merge.rs`, `crates/package/src/lib.rs`,
+      `apps/manager/src-tauri/src/core_client.rs`, `vendor/electron-hook/**`. Needs a format-only
+      pass by owners.
 - [ ] **Launcher `.asar.unpacked` junction (non-fatal for Obsidian).** The injector launcher logs
       `failed to link app.asar.unpacked: mklink /J reported success but ... is not a junction` for
       Obsidian (its `app.asar` has an `.unpacked` dir). Obsidian has no critical native module there,
