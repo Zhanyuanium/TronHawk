@@ -12,9 +12,8 @@
 // (docs/adr/0002-renderer-js-sandbox.md).
 const { BrowserWindow } = require("electron");
 // Original BrowserWindow constructor, captured before any adapter may wrap it (see the
-// onWindowOptions/WCO seam in start()). start() swaps require("electron").BrowserWindow for a
-// wrapper that routes window options through the selected adapter; this reference stays the real
-// constructor so the wrapper always constructs an actual window and re-wrapping is idempotent.
+// onWindowOptions/WCO seam in start()). The wrapping constructor always constructs through this
+// real reference, so re-wrapping is idempotent and instanceof semantics are preserved.
 const RealBrowserWindow = BrowserWindow;
 
 // Compat adapter (compat profile) loader — see src/adapters.js. Adapters are trusted runtime
@@ -22,6 +21,12 @@ const RealBrowserWindow = BrowserWindow;
 // their selection/bootstrap runs synchronously inside start(), BEFORE bootstrap.js requires the
 // original target app.
 const adapters = require("./adapters");
+
+// electron module-resolution shim (ADR 0009). require("electron").BrowserWindow is a
+// configurable:false getter-only accessor, so direct assignment silently no-ops. This shim wraps
+// require("module")._load to hand out a Proxy facade whose BrowserWindow getter returns a wrapping
+// constructor — the only way to rewrite window options before the real constructor runs.
+const shim = require("./electron-require-shim");
 
 const MAX_LOG_MESSAGE_BYTES = 1024;
 let runtimeLogSink = (level, message) => console.log(`[tronhawk-runtime][${level}] ${message}`);
@@ -2190,7 +2195,10 @@ function start(app, sinks = {}) {
       if (adapterWindowOpts) {
         try {
           // Function-wrapper + Object.setPrototypeOf keeps the constructor semantics and static
-          // members of the real class while funneling options through the adapter.
+          // members of the real class while funneling options through the adapter. This is handed
+          // to the electron module-resolution shim (ADR 0009): a Proxy facade's BrowserWindow
+          // getter returns this wrapper, so target code that requires("electron") and constructs a
+          // window gets the wrapper — the options are rewritten before the real constructor runs.
           const WrappedBrowserWindow = function (...args) {
             const opts = args[0] && typeof args[0] === "object" ? args[0] : {};
             const next = adapters.applyWindowOptions(adapter, opts);
@@ -2208,8 +2216,11 @@ function start(app, sinks = {}) {
               // non-writable static — skip
             }
           }
-          require("electron").BrowserWindow = WrappedBrowserWindow;
-          log("wco adapter active: BrowserWindow WCO overlay removal enabled");
+          if (shim.installElectronFacade(() => WrappedBrowserWindow)) {
+            log("wco adapter active: BrowserWindow WCO overlay removal enabled (electron require facade)");
+          } else {
+            log("wco adapter active: electron require facade install failed; original BrowserWindow kept", "warn");
+          }
         } catch (e) {
           log(
             "BrowserWindow WCO overlay removal failed; continuing with original BrowserWindow: " +
