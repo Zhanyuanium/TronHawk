@@ -693,6 +693,17 @@ fn aumid(aumid: &str) -> Result<(), String> {
         .map_err(|error| format!("inject pid {new_pid}: {error}"))?;
     println!("[probe] attached to pid {new_pid}");
 
+    // The sidecar is re-applied by the injected DLL's DllMain from the DLL's own directory, so it
+    // must never outlive the attach: a stale sidecar (e.g. from a previous `--aumid` probe) would
+    // clobber a later normal launch with old MODLOADER_FOLDER_NAME / a dead IPC secret, silently
+    // breaking asar-remap (bootstrap never runs). Delete it best-effort now that attach is done.
+    if let Err(error) = std::fs::remove_file(&sidecar_path) {
+        eprintln!(
+            "[probe] warning: could not remove sidecar {}: {error}",
+            sidecar_path.display()
+        );
+    }
+
     Ok(())
 }
 
