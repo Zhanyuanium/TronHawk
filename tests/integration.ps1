@@ -134,9 +134,9 @@ try {
     $packagedExe = Join-Path $poc "test-app-packaged-win32-x64\test-app-packaged.exe"
     if (-not (Test-Path -LiteralPath $packagedExe)) {
         Write-Output "[it] packaging test-app"
-        bunx @electron/packager "$repo\apps\test-app" test-app-packaged --platform=win32 --arch=x64 --asar --out $poc 2>&1 | Out-Null
+        $packOut = bunx @electron/packager "$repo\apps\test-app" test-app-packaged --platform=win32 --arch=x64 --asar --out $poc 2>&1
         if ($LASTEXITCODE -ne 0) {
-            throw "Electron test-app packaging failed with exit code $LASTEXITCODE"
+            throw "Electron test-app packaging failed with exit code $LASTEXITCODE : $packOut"
         }
     }
 

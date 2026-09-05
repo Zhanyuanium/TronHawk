@@ -11,6 +11,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+      - name: Build runtime.js bundle
+        run: |
+          bun install --cwd crates/runtime/js
+          bun --cwd crates/runtime/js run build
+      - name: Build core + injector
+        run: cargo build -p tronhawk-core -p tronhawk-injector
+      - name: Stage manager sidecar binaries
+        shell: pwsh
+        run: |
+          $dest = "apps/manager/src-tauri/binaries"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item -Force "target/debug/tronhawk-core.exe" "$dest/tronhawk-core-x86_64-pc-windows-msvc.exe"
+          Copy-Item -Force "target/debug/tronhawk-injector-launcher.exe" "$dest/tronhawk-injector-launcher-x86_64-pc-windows-msvc.exe"
+          Copy-Item -Force "target/debug/tronhawk_injector.dll" "$dest/tronhawk_injector.dll"
+          Copy-Item -Force "crates/injector/assets/bootstrap.js" "$dest/bootstrap.js"
+          Copy-Item -Force "crates/runtime/assets/runtime.js" "$dest/runtime.js"
       - name: Test workspace
         run: cargo test --workspace
       - name: Build workspace
@@ -44,6 +63,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.0"
+      - name: Install workspace deps
+        run: bun install
       - name: Build injector + core
         run: cargo build -p tronhawk-injector -p tronhawk-core
       - name: Run injection integration test

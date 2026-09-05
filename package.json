@@ -4,5 +4,8 @@
   "scripts": {
     "create-tronhawk-plugin": "bun tools/create-tronhawk-plugin/src/cli.ts"
   },
-  "workspaces": ["sdk", "plugins/*", "tools/*"]
+  "workspaces": ["sdk", "plugins/*", "tools/*"],
+  "devDependencies": {
+    "@electron/packager": "^20.3.0"
+  }
 }
