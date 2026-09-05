@@ -49,3 +49,29 @@ jobs:
       - name: Run injection integration test
         shell: pwsh
         run: pwsh tests/integration.ps1
+
+  package:
+    runs-on: windows-latest
+    needs: integration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Stage plugin without node_modules
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "_pkg_stage"
+          New-Item -ItemType Directory -Force -Path "_pkg_stage" | Out-Null
+          Copy-Item -Recurse -Force -LiteralPath "plugins/hello-world" -Destination "_pkg_stage/hello-world"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "_pkg_stage/hello-world/node_modules"
+      - name: Pack hello-world plugin
+        run: cargo run -p tronhawk-package --bin pack -- _pkg_stage/hello-world hello-world.thx
+      - name: Validate .thx artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "hello-world.thx" -PathType Leaf)) { throw "hello-world.thx not found" }
+          if ((Get-Item -LiteralPath "hello-world.thx").Length -eq 0) { throw "hello-world.thx is empty" }
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "_thx_check"
+          Expand-Archive -LiteralPath "hello-world.thx" -DestinationPath "_thx_check"
+          if (-not (Test-Path -LiteralPath "_thx_check/manifest.json" -PathType Leaf)) { throw "manifest.json missing in hello-world.thx" }
+          Get-Content -LiteralPath "_thx_check/manifest.json" -Raw | ConvertFrom-Json | Out-Null
