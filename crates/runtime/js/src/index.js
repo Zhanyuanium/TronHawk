@@ -719,8 +719,8 @@ function capturePluginDeactivate(vm) {
 // Promise/thenable it awaits to completion (ADR 0008): a thenable result is drained — bounded by
 // DEACTIVATE_DRAIN_MS — so an async guest cleanup runs before disposal, but a timeout/rejection
 // never blocks disposal (fail-closed). A throwing or non-undefined synchronous result stays a
-// failed cleanup, logged, and never blocks disposal. `cleanups` is the main-plugin host-cleanup
-// array (null for renderer plugins).
+// failed cleanup, logged, and never blocks disposal. `cleanups` is the host-cleanup array (an empty
+// array when the plugin had no renderer/main async observers to tear down; never null).
 function deactivatePluginVM(vm, pluginId, label, lifecycle, cleanups) {
   if (lifecycle.deactivateExport) {
     const capture = { asyncResult: null };
@@ -865,6 +865,292 @@ function buildConfigApi(vm, pluginId, configObj) {
   set.dispose();
 
   return config;
+}
+
+// Build a QuickJS handle for a JSON-safe JS value (string/number/boolean/null/object of these).
+// Used to hand Core/host results to the guest. Arrays are not needed by the current surfaces
+// (NetworkResponse.headers is an object, DomElement is an object). Each returned handle is owned by
+// the caller (settleOp borrows + disposes it; the guest's deferred owns it after resolve).
+function handlesFromJson(vm, value) {
+  if (value === null || value === undefined) {
+    return vm.null;
+  }
+  const kind = typeof value;
+  if (kind === "string") {
+    return vm.newString(value);
+  }
+  if (kind === "number") {
+    return vm.newNumber(value);
+  }
+  if (kind === "boolean") {
+    return value ? vm.true : vm.false;
+  }
+  if (kind === "object") {
+    const obj = vm.newObject();
+    for (const [key, item] of Object.entries(value)) {
+      // Skip dangerous keys that could alter the new object's prototype/constructor semantics.
+      // The values are page-controlled (e.g. DomElement attrs), so never let them become special.
+      if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+      const itemHandle = handlesFromJson(vm, item);
+      vm.setProp(obj, key, itemHandle);
+      itemHandle.dispose();
+    }
+    return obj;
+  }
+  // Unknown scalar type (bigint/symbol/function): surface as undefined rather than leaking host.
+  return vm.undefined;
+}
+
+// `ctx.network.request(req)` — async host function bridging to the Core `networkRequest` RPC, which
+// performs the permissioned, domain-whitelisted fetch Core-side. Returns a QuickJS Promise the guest
+// awaits; the value/rejection is delivered by the in-process pending-job pump (ADR 0008).
+function buildNetworkApi(vm, pluginId) {
+  const network = vm.newObject();
+
+  const request = vm.newFunction("request", (reqHandle) => {
+    if (vm.typeof(reqHandle) !== "object") {
+      pluginLog(pluginId, "warn", "network.request: argument must be a request object");
+      return vm.undefined;
+    }
+    // Read the request fields as data (coercion runs under the enclosing operation's deadline).
+    const urlHandle = vm.getProp(reqHandle, "url");
+    const url = vm.typeof(urlHandle) === "string" ? vm.getString(urlHandle) : "";
+    urlHandle.dispose();
+    const methodHandle = vm.getProp(reqHandle, "method");
+    const method =
+      vm.typeof(methodHandle) === "string" ? vm.getString(methodHandle).toUpperCase() : "GET";
+    methodHandle.dispose();
+    // headers: object of string->string; body: string (default "").
+    const headers = {};
+    const headersHandle = vm.getProp(reqHandle, "headers");
+    if (vm.typeof(headersHandle) === "object") {
+      for (const key of Object.keys(vm.dump(headersHandle) || {})) {
+        if (typeof key !== "string") continue;
+        const valHandle = vm.getProp(headersHandle, key);
+        if (vm.typeof(valHandle) === "string") headers[key] = vm.getString(valHandle);
+        valHandle.dispose();
+      }
+    }
+    headersHandle.dispose();
+    const bodyHandle = vm.getProp(reqHandle, "body");
+    const body = vm.typeof(bodyHandle) === "string" ? vm.getString(bodyHandle) : "";
+    bodyHandle.dispose();
+
+    const { opId, handle } = newHostPromise(vm, pluginId, "network.request");
+    planRequest("networkRequest", { pluginId, url, method, headers, body }, { timeout: 30000 })
+      .then(({ id, envelope }) => {
+        const result = validatePlanEnvelope(envelope, id);
+        settleOp(opId, "resolve", () => handlesFromJson(vm, result));
+      })
+      .catch((e) => {
+        settleOp(opId, "reject", () => vm.newString(errorText(e)));
+      });
+    return handle;
+  });
+  vm.setProp(network, "request", request);
+  request.dispose();
+
+  return network;
+}
+
+// `ctx.storage` — renderer-only async host API bridging the target page's localStorage, with a
+// host-owned namespaced key (`tronhawk:<pluginId>:<key>`, pluginId is NEVER guest-supplied) so one
+// plugin cannot read another's keys. Each get/set is a QuickJS Promise delivered by the pump; the
+// page access is done via a host-owned, fixed `executeJavaScript` template that treats the key/value
+// as data (JSON-stringified). Requires the `renderer.storage` grant.
+function buildStorageApi(vm, pluginId, contents) {
+  const storage = vm.newObject();
+  const STORAGE_PREFIX = "tronhawk:" + pluginId + ":";
+
+  function storageSnippet(body) {
+    const prefix = JSON.stringify(STORAGE_PREFIX);
+    return `((function(){var p=${prefix};try{${body}}catch(e){return null}})())`;
+  }
+
+  const get = vm.newFunction("get", (keyHandle) => {
+    const key = vm.typeof(keyHandle) === "string" ? vm.getString(keyHandle) : "";
+    if (key === "") {
+      pluginLog(pluginId, "warn", "storage.get: invalid key");
+      return vm.undefined;
+    }
+    const { opId, handle } = newHostPromise(vm, pluginId, "storage.get");
+    const code = storageSnippet(
+      `var v=localStorage.getItem(p+${JSON.stringify(key)});return v===null?null:JSON.parse(v)`,
+    );
+    contents
+      .executeJavaScript(code)
+      .then((val) => settleOp(opId, "resolve", () => handlesFromJson(vm, val)))
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(storage, "get", get);
+  get.dispose();
+
+  const set = vm.newFunction("set", (keyHandle, valueHandle) => {
+    const key = vm.typeof(keyHandle) === "string" ? vm.getString(keyHandle) : "";
+    if (key === "") {
+      pluginLog(pluginId, "warn", "storage.set: invalid key");
+      return vm.undefined;
+    }
+    const value = vm.dump(valueHandle);
+    const valueJson = JSON.stringify(value === undefined ? null : value);
+    const { opId, handle } = newHostPromise(vm, pluginId, "storage.set");
+    const code = storageSnippet(
+      `localStorage.setItem(p+${JSON.stringify(key)},${JSON.stringify(valueJson)});return null`,
+    );
+    contents
+      .executeJavaScript(code)
+      .then(() => settleOp(opId, "resolve", () => vm.undefined))
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(storage, "set", set);
+  set.dispose();
+
+  return storage;
+}
+
+// Host-owned DOM snapshot template (ADR 0002): the query/selector is inserted ONLY as JSON data and
+// the snippet only reads a bounded snapshot of the matched element (never executes plugin JS).
+// Returns a JSON string that the host parses into a DomElement, or `null` when nothing matched.
+const DOM_QUERY_SNIPPET = (selector) =>
+  `(function(){var s=JSON.parse(${JSON.stringify(JSON.stringify(selector))});try{` +
+  `var e=document.querySelector(s);if(!e)return null;var st=e.tagName.toLowerCase();` +
+  `var id=e.getAttribute("id")||"";var cn=e.className&&String(e.className).slice(0,256)||"";` +
+  `var r=e.getBoundingClientRect();` +
+  `var tx=(e.textContent||"").slice(0,1024);var at={};` +
+  `for(var i=0;i<e.attributes.length&&i<64;i++){var n=e.attributes[i].name;at[n]=(e.getAttribute(n)||"").slice(0,256)}` +
+  `var o={tag:st,id:id,className:cn,attrs:at,text:tx,rect:{x:r.x,y:r.y,width:r.width,height:r.height}};` +
+  `if("value" in e)o.value=String(e.value).slice(0,256);if("checked" in e)o.checked=!!e.checked;` +
+  `if(o.tag==="a")o.href=(e.getAttribute("href")||"").slice(0,512);if(o.tag==="img")o.src=(e.getAttribute("src")||"").slice(0,512);` +
+  `return JSON.stringify(o);}catch(e){return null}})()`;
+
+// `ctx.dom` — renderer-only async host API (ADR 0008). `query(selector)` snapshots the first
+// matching element (serialized data, never a live DOM node); `observe(selector, cb)` polls and
+// re-delivers snapshots for matches, using a host-owned per-window timer, diffing the single current
+// match by a coarse stable key (tag+id+short text). Requires `renderer.dom`. Each cb fires under the
+// synchronous-undefined contract and is fail-closed: a throwing/over-deadline cb unregisters.
+function buildDomApi(vm, pluginId, contents, cleanupCallbacks) {
+  const dom = vm.newObject();
+  let nextNodeId = 1;
+  const nodeIds = new WeakMap(); // in the page world; here we re-derive via a stable map below.
+  const observers = new Map(); // selector -> { cbHandle, lastNodes: Map<string,{nodeId}> }
+  let pollTimer = null;
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+  function maybeStartPolling() {
+    if (pollTimer || observers.size === 0) return;
+    pollTimer = setInterval(() => {
+      if (contents.isDestroyed && contents.isDestroyed()) {
+        stopPolling();
+        return;
+      }
+      const selectors = [...observers.keys()];
+      for (const selector of selectors) {
+        const obs = observers.get(selector);
+        if (!obs) continue;
+        contents
+          .executeJavaScript(DOM_QUERY_SNIPPET(selector))
+          .then((json) => {
+            // Re-read the observer by selector: a disconnect()/revoke during the in-flight poll
+            // already removed it (and disposed its cbHandle), so we must not touch a stale entry.
+            const panel = observers.get(selector);
+            if (!panel) return;
+            const snapshot = typeof json === "string" ? JSON.parse(json) : json;
+            // Diff by a coarse stable key (tag+id+text hash) over the single match we poll.
+            const key = snapshot ? snapshot.tag + "|" + snapshot.id + "|" + (snapshot.text || "").slice(0, 40) : null;
+            if (snapshot && panel.lastKey !== key) {
+              panel.lastKey = key;
+              const nodeHandle = handlesFromJson(vm, { ...snapshot, nodeId: nextNodeId++ });
+              const ok = runQuickJSOperation(vm, pluginId, "dom.observe callback", () =>
+                vm.callFunction(panel.cbHandle, vm.undefined, nodeHandle),
+                true,
+              );
+              nodeHandle.dispose();
+              if (!ok) {
+                // Fail-closed: a throwing/over-deadline callback is unregistered so it never
+                // re-fires on a poisoned VM (matches the onCreated/subscribeLifecycle contract).
+                observers.delete(selector);
+                panel.cbHandle.dispose();
+                if (observers.size === 0) stopPolling();
+                pluginLog(pluginId, "warn", "dom.observe callback failed; observer unregistered");
+              }
+            }
+          })
+          .catch((e) => {
+            // A persistent page error is logged but the observer survives to retry (query failure
+            // is distinct from a callback failure, which is fail-closed above).
+            pluginLog(pluginId, "warn", "dom.observe poll failed: " + errorText(e));
+          });
+      }
+    }, 500);
+  }
+
+  const query = vm.newFunction("query", (selectorHandle) => {
+    const selector = vm.typeof(selectorHandle) === "string" ? vm.getString(selectorHandle) : "";
+    if (selector === "") {
+      return vm.undefined;
+    }
+    const { opId, handle } = newHostPromise(vm, pluginId, "dom.query");
+    contents
+      .executeJavaScript(DOM_QUERY_SNIPPET(selector))
+      .then((json) => {
+        const snapshot = typeof json === "string" ? JSON.parse(json) : json;
+        settleOp(opId, "resolve", () => (snapshot ? handlesFromJson(vm, { ...snapshot, nodeId: 0 }) : vm.null));
+      })
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(dom, "query", query);
+  query.dispose();
+
+  const observe = vm.newFunction("observe", (selectorHandle, cbHandle) => {
+    const selector = vm.typeof(selectorHandle) === "string" ? vm.getString(selectorHandle) : "";
+    if (selector === "") {
+      pluginLog(pluginId, "warn", "dom.observe: invalid selector");
+      return vm.undefined;
+    }
+    const callback = cbHandle.dup();
+    // Re-observing the same selector replaces the prior observer; dispose the old callback handle
+    // so it cannot outlive the subscription (and so the stale disconnect/cleanup closure no-ops on
+    // the entry it no longer owns — each closure only deletes the entry it created).
+    const prior = observers.get(selector);
+    if (prior) prior.cbHandle.dispose();
+    observers.set(selector, { cbHandle: callback, lastKey: null });
+    maybeStartPolling();
+
+    const disconnect = vm.newFunction("disconnect", () => {
+      const obs = observers.get(selector);
+      // Only the closure that still owns the current entry may delete it, so a stale disconnect
+      // from a replaced observer never removes the newer subscription.
+      if (obs && obs.cbHandle === callback) {
+        observers.delete(selector);
+        obs.cbHandle.dispose();
+      }
+      if (observers.size === 0) stopPolling();
+      return vm.undefined;
+    });
+    // Cleanup on revoke: dispose the observer's callback handle and stop the poller when idle.
+    const cleanup = () => {
+      const obs = observers.get(selector);
+      if (obs && obs.cbHandle === callback) {
+        observers.delete(selector);
+        obs.cbHandle.dispose();
+      }
+      if (observers.size === 0) stopPolling();
+    };
+    cleanupCallbacks.push(cleanup);
+    return disconnect;
+  });
+  vm.setProp(dom, "observe", observe);
+  observe.dispose();
+
+  return dom;
 }
 
 function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
@@ -1336,6 +1622,11 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
     const config = buildConfigApi(vm, plugin.id, plugin.config || {});
     vm.setProp(ctx, "config", config);
     config.dispose();
+    if (hasPermission(plugin.granted, "network.access")) {
+      const net = buildNetworkApi(vm, plugin.id);
+      vm.setProp(ctx, "network", net);
+      net.dispose();
+    }
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 
@@ -1401,7 +1692,8 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
         (candidate) =>
           candidate.id === plugin.id &&
           candidate.main &&
-          hasPermission(candidate.granted, "electron.window") &&
+          (hasPermission(candidate.granted, "electron.window") ||
+            hasPermission(candidate.granted, "network.access")) &&
           pluginFingerprint(candidate) === fingerprint,
       ) &&
       !abuseDisabledPlugins.has(plugin.id) &&
@@ -1513,11 +1805,28 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       vm.setProp(ctx, "script", script);
       script.dispose();
     }
-    // (ctx.dom.query / ctx.dom.observe need async host functions — future.)
+    // Host cleanup callbacks for this renderer plugin instance (e.g. dom.observe subscriptions),
+    // run on revoke/deactivate before the VM is disposed.
+    const cleanupCallbacks = [];
+    if (hasPermission(plugin.granted, "renderer.dom")) {
+      const dom = buildDomApi(vm, plugin.id, contents, cleanupCallbacks);
+      vm.setProp(ctx, "dom", dom);
+      dom.dispose();
+    }
     // ctx.config: read-only merged config for this plan snapshot (same surface as the main ctx).
     const config = buildConfigApi(vm, plugin.id, plugin.config || {});
     vm.setProp(ctx, "config", config);
     config.dispose();
+    if (hasPermission(plugin.granted, "network.access")) {
+      const net = buildNetworkApi(vm, plugin.id);
+      vm.setProp(ctx, "network", net);
+      net.dispose();
+    }
+    if (hasPermission(plugin.granted, "renderer.storage")) {
+      const storage = buildStorageApi(vm, plugin.id, contents);
+      vm.setProp(ctx, "storage", storage);
+      storage.dispose();
+    }
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 
@@ -1534,6 +1843,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
         vm.evalCode(plugin.renderer || ""),
       )
     ) {
+      cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
@@ -1566,6 +1876,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
           // Best effort.
         }
       }
+      cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
@@ -1578,7 +1889,10 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
         (candidate) =>
           candidate.id === plugin.id &&
           candidate.renderer &&
-          hasPermission(candidate.granted, "renderer.script") &&
+          (hasPermission(candidate.granted, "renderer.script") ||
+            hasPermission(candidate.granted, "network.access") ||
+            hasPermission(candidate.granted, "renderer.storage") ||
+            hasPermission(candidate.granted, "renderer.dom")) &&
           pluginFingerprint(candidate) === fingerprint,
       ) &&
       !abuseDisabledPlugins.has(plugin.id) &&
@@ -1591,6 +1905,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
           // Best effort.
         }
       }
+      cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
@@ -1605,7 +1920,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
     const deactivate = () => {
       if (deactivated) return;
       deactivated = true;
-      deactivatePluginVM(vm, plugin.id, "renderer plugin", lifecycle, null);
+      deactivatePluginVM(vm, plugin.id, "renderer plugin", lifecycle, cleanupCallbacks);
     };
     const entry = { vm, fingerprint, deactivate };
     rendererPlugins.set(key, entry);
@@ -1618,6 +1933,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
         (reason) => {
           if (rendererPlugins.get(key) !== entry) return; // stale: superseded or already removed
           rendererPlugins.delete(key);
+          cleanupAll(cleanupCallbacks);
           disposeVM(vm);
           pluginLog(plugin.id, "error", "renderer plugin activate rejected: " + reason);
         },
@@ -1626,6 +1942,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
     pluginLog(plugin.id, "info", "Renderer plugin loaded");
   }).catch((e) => {
     if (pendingRendererPlugins.get(key) === pending) pendingRendererPlugins.delete(key);
+    cleanupAll(cleanupCallbacks);
     if (vm) disposeVM(vm);
     pluginLog(plugin.id, "error", "QuickJS init failed: " + (e && e.message ? e.message : e));
   });
@@ -1635,7 +1952,7 @@ function reconcileRendererPlugins(w) {
   const contents = w.contents;
   const wanted = new Map();
   for (const p of currentPlan.plugins) {
-    if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe"))) {
+    if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access") || hasPermission(p.granted, "renderer.storage") || hasPermission(p.granted, "renderer.dom"))) {
       wanted.set(p.id, { plugin: p, fingerprint: pluginFingerprint(p) });
     }
   }
@@ -1691,7 +2008,7 @@ function cleanupRendererPlugins(contentsId) {
 function reconcileMainPlugins(app) {
   const wanted = new Map();
   for (const p of currentPlan.plugins) {
-    if (p.main && (hasPermission(p.granted, "electron.window") || hasPermission(p.granted, "runtime.unsafe"))) {
+    if (p.main && (hasPermission(p.granted, "electron.window") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access"))) {
       const fingerprint = pluginFingerprint(p);
       wanted.set(p.id, { plugin: p, fingerprint });
       const active = mainPlugins.get(p.id);

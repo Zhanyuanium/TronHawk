@@ -12,6 +12,7 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "renderer.css",
     "renderer.script",
     "renderer.dom",
+    "renderer.storage",
     "electron.window",
     "electron.webContents",
     "electron.session",

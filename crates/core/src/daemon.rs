@@ -31,6 +31,8 @@ const IMPLEMENTED_RENDERER_CAPABILITIES: &[&str] = &["renderer.css", "renderer.s
 const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] = &[
     "renderer.css",
     "renderer.script",
+    "renderer.dom",
+    "renderer.storage",
     "electron.window",
     "network.access",
 ];
@@ -39,6 +41,8 @@ const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] = &[
 const IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES: &[&str] = &[
     "renderer.css",
     "renderer.script",
+    "renderer.dom",
+    "renderer.storage",
     "electron.window",
     "network.access",
     "runtime.unsafe",
@@ -3485,16 +3489,15 @@ mod tests {
             )),
             -32602
         );
-        assert_eq!(
-            error_code(set_policy(
-                &service,
-                &control,
-                &two_id,
-                true,
-                &["renderer.dom"],
-            )),
-            -32602
-        );
+        // renderer.dom is a Level-2 capability (ADR 0008), so it is grantable at Level 2 even
+        // though it is unavailable at Level 1 (asserted above) and non-capability at Level 0.
+        ok(set_policy(
+            &service,
+            &control,
+            &two_id,
+            true,
+            &["renderer.dom"],
+        ));
         ok(set_policy(
             &service,
             &control,
