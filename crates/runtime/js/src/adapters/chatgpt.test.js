@@ -5,6 +5,7 @@ const adapters = require("../adapters");
 const chatgpt = require("./chatgpt");
 const example = require("./example");
 const obsidian = require("./obsidian");
+const wco = require("./wco");
 
 // Keep any adapter-selection warnings out of test output.
 adapters.init({ log: () => {} });
@@ -39,10 +40,10 @@ describe("chatgpt adapter matches()", () => {
 });
 
 describe("chatgpt adapter registration order", () => {
-  test("chatgpt selected for ChatGPT appInfo; example/obsidian unaffected", () => {
+  test("chatgpt selected for ChatGPT appInfo; wco/example/obsidian unaffected", () => {
     expect(adapters.select({ packageJsonName: "openai-codex-electron" })).toBe(chatgpt);
     expect(adapters.select({ exeBasename: "ChatGPT.exe" })).toBe(chatgpt);
-    expect(adapters.select({ packageJsonName: "tronhawk-test-app" })).toBe(example);
+    expect(adapters.select({ packageJsonName: "tronhawk-test-app" })).toBe(wco);
     expect(adapters.select({ packageJsonName: "obsidian" })).toBe(obsidian);
   });
 });

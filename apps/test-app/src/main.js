@@ -13,11 +13,11 @@ function createWindow() {
       // Deterministic, in-memory (non-persistent) session for integration tests.
       partition: "tronhawk-test",
     },
-    // Simulate a WCO application (same shape VS Code uses: titleBarStyle "hidden" + a
-    // titleBarOverlay with explicit color/symbolColor/height) so the runtime's vscode-compat
-    // mechanism — the adapter `onWindowOptions` BrowserWindow wrap that eliminates WCO — can be
-    // verified against this app (native overlay buttons disappear when the adapter drops the
-    // titleBarOverlay before the window is constructed).
+    // Simulate a WCO application (titleBarStyle "hidden" + a titleBarOverlay with explicit
+    // color/symbolColor/height — the same shape VS Code/WorkBuddy use on Windows) so the runtime's
+    // generic WCO-elimination mechanism (the adapter `onWindowOptions` BrowserWindow wrap) can be
+    // verified against this app: the native overlay buttons disappear when the adapter drops the
+    // titleBarOverlay before the window is constructed.
     ...(process.platform === "win32"
       ? { titleBarStyle: "hidden", titleBarOverlay: { color: "#2f3241", symbolColor: "#ffffff", height: 30 } }
       : {}),

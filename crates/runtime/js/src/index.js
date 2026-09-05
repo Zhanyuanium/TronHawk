@@ -11,6 +11,11 @@
 // reaching Electron only through permission-gated host functions
 // (docs/adr/0002-renderer-js-sandbox.md).
 const { BrowserWindow } = require("electron");
+// Original BrowserWindow constructor, captured before any adapter may wrap it (see the
+// onWindowOptions/WCO seam in start()). start() swaps require("electron").BrowserWindow for a
+// wrapper that routes window options through the selected adapter; this reference stays the real
+// constructor so the wrapper always constructs an actual window and re-wrapping is idempotent.
+const RealBrowserWindow = BrowserWindow;
 
 // Compat adapter (compat profile) loader — see src/adapters.js. Adapters are trusted runtime
 // substrate statically bundled into runtime.js (never loaded from disk, never installable), and
@@ -2174,6 +2179,45 @@ function start(app, sinks = {}) {
       };
       adapters.runOnBootstrap(adapter, ctx);
       log("adapter active: " + adapter.id);
+
+      // Generic Window Controls Overlay (WCO) elimination seam. When the selected adapter exposes
+      // onWindowOptions (currently wco, for apps that create their window with titleBarStyle
+      // "hidden" + titleBarOverlay), rewrite every LATER `new BrowserWindow(opts)` issued by the
+      // target main process so the adapter can drop the overlay. Only subsequent constructions are
+      // affected — no target file is touched and nothing is drawn. Fail-open: on any error log a
+      // warning and keep the original BrowserWindow working.
+      const adapterWindowOpts = adapter && typeof adapter.onWindowOptions === "function";
+      if (adapterWindowOpts) {
+        try {
+          // Function-wrapper + Object.setPrototypeOf keeps the constructor semantics and static
+          // members of the real class while funneling options through the adapter.
+          const WrappedBrowserWindow = function (...args) {
+            const opts = args[0] && typeof args[0] === "object" ? args[0] : {};
+            const next = adapters.applyWindowOptions(adapter, opts);
+            args[0] = next;
+            return new RealBrowserWindow(...args);
+          };
+          Object.setPrototypeOf(WrappedBrowserWindow, RealBrowserWindow);
+          WrappedBrowserWindow.prototype = RealBrowserWindow.prototype;
+          // Static method forwarding (fromId/getAllWindows etc.), avoiding breakage.
+          for (const k of Object.getOwnPropertyNames(RealBrowserWindow)) {
+            if (k === "length" || k === "name" || k === "prototype") continue;
+            try {
+              if (!(k in WrappedBrowserWindow)) WrappedBrowserWindow[k] = RealBrowserWindow[k];
+            } catch (_e) {
+              // non-writable static — skip
+            }
+          }
+          require("electron").BrowserWindow = WrappedBrowserWindow;
+          log("wco adapter active: BrowserWindow WCO overlay removal enabled");
+        } catch (e) {
+          log(
+            "BrowserWindow WCO overlay removal failed; continuing with original BrowserWindow: " +
+              (e && e.message ? e.message : e),
+            "warn",
+          );
+        }
+      }
     } else {
       log("no compat adapter matched", "warn");
     }
