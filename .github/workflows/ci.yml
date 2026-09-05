@@ -15,9 +15,10 @@ jobs:
         with:
           bun-version: "1.4.0"
       - name: Build runtime.js bundle
+        working-directory: crates/runtime/js
         run: |
-          bun install --cwd crates/runtime/js
-          bun --cwd crates/runtime/js run build
+          bun install
+          bun run build
       - name: Build core + injector
         run: cargo build -p tronhawk-core -p tronhawk-injector
       - name: Stage manager sidecar binaries
@@ -64,6 +65,9 @@ jobs:
         with:
           bun-version: "1.4.0"
       - name: Install workspace deps
+        run: bun install
+      - name: Install test-app deps
+        working-directory: apps/test-app
         run: bun install
       - name: Build injector + core
         run: cargo build -p tronhawk-injector -p tronhawk-core
