@@ -41,7 +41,34 @@ test("mock renderer context exposes renderer APIs", () => {
   expect(typeof ctx.dom.observe).toBe("function");
   expect(typeof ctx.script.setDocumentTitle).toBe("function");
   expect("execute" in ctx.script).toBe(false);
+  expect(typeof ctx.storage.get).toBe("function");
+  expect(typeof ctx.storage.set).toBe("function");
+  expect(typeof ctx.network.request).toBe("function");
   expect(typeof ctx.logger.info).toBe("function");
+});
+
+test("mock renderer async APIs resolve; observe returns a disconnect", async () => {
+  const ctx = createMockRendererContext();
+
+  const node = await ctx.dom.query("body");
+  expect(node).toBeNull();
+
+  const disconnect = ctx.dom.observe(".row", () => {});
+  expect(typeof disconnect).toBe("function");
+
+  expect(await ctx.storage.get("theme")).toBeNull();
+  expect(await ctx.storage.set("theme", "dark")).toBeUndefined();
+
+  const res = await ctx.network.request({ url: "https://example.test/data" });
+  expect(res.status).toBe(200);
+  expect(res.body).toBe("");
+});
+
+test("mock main context network request resolves a canned response", async () => {
+  const ctx = createMockMainContext();
+  const res = await ctx.network.request({ url: "https://example.test/data" });
+  expect(res.status).toBe(200);
+  expect(res.headers).toEqual({});
 });
 
 test("mock main context exposes main APIs with window handle params", () => {

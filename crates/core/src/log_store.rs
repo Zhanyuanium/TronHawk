@@ -394,7 +394,15 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
     }
     let valid_shape = match record.stream {
         LogStream::Runtime => record.code == "runtime.message" && record.plugin_id.is_none(),
-        LogStream::Plugin => record.code == "plugin.message" && record.plugin_id.is_some(),
+        LogStream::Plugin => {
+            // `plugin.message` is written by `appendPluginLogs`; `network.request` is Core's
+            // outbound-HTTP audit trail (Tier-2 `networkRequest`). Both are attributed to a
+            // plugin stream record carrying a plugin id.
+            matches!(
+                record.code.as_str(),
+                "plugin.message" | "network.request"
+            ) && record.plugin_id.is_some()
+        }
         LogStream::Core => {
             matches!(
                 record.code.as_str(),

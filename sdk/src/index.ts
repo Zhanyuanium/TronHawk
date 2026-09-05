@@ -38,7 +38,9 @@ export interface NetworkResponse {
   body: string;
 }
 
-/** Requires the `network.access` permission (and `network.proxy` for interception). */
+/** Requires the `network.access` permission. `request` runs a Core-side, domain-whitelisted fetch —
+ *  the plugin never opens a raw socket. The returned promise rejects with a catchable error when the
+ *  URL is outside the whitelist or the fetch itself fails. */
 export interface NetworkAPI {
   request(req: NetworkRequest): Promise<NetworkResponse>;
 }
@@ -64,10 +66,44 @@ export interface CssAPI {
   remove(id: string): void;
 }
 
+/** A serialized snapshot of a page element, captured host-side. This is NOT a live DOM node: a real
+ *  `Element` cannot cross the QuickJS sandbox boundary, so the host copies the fields below at
+ *  snapshot time. Later page mutations do not update an already-returned snapshot. */
+export interface DomElement {
+  /** Runtime-assigned ordinal identifying this node within the renderer's snapshot registry. */
+  nodeId: number;
+  /** Lowercased tag name, e.g. `"button"`. */
+  tag: string;
+  /** The element's `id` attribute (empty string when absent). */
+  id: string;
+  /** The element's `className` attribute (empty string when absent). */
+  className: string;
+  /** Other serialized attributes, e.g. `{ role: "dialog" }`. */
+  attrs: Record<string, string>;
+  /** The element's own text content (host-bounded length). */
+  text: string;
+  /** Layout rectangle relative to the viewport; present when the element is rendered. */
+  rect?: { x: number; y: number; width: number; height: number };
+  /** Present for form fields: the current `value`. */
+  value?: string;
+  /** Present for checkbox/radio inputs: the current checked state. */
+  checked?: boolean;
+  /** Present for `<a>` elements: the resolved `href`. */
+  href?: string;
+  /** Present for `<img>` / `<script>` / `<iframe>` elements: the resolved `src`. */
+  src?: string;
+}
+
 export interface DomAPI {
-  query(selector: string): Element | null;
-  /** Observe dynamic DOM (MutationObserver abstraction); returns a disconnect function. */
-  observe(selector: string, cb: (node: Element) => void): () => void;
+  /** Resolve the first element matching `selector` and return a host-serialized snapshot of it, or
+   *  `null` when no element matches. Requires `renderer.dom`. The resolved object is a snapshot copy,
+   *  not a live node; the promise rejects only on a query error (e.g. an invalid selector). */
+  query(selector: string): Promise<DomElement | null>;
+  /** Observe elements matching `selector`; `cb` is invoked with a serialized snapshot of each newly
+   *  observed node. The bridge polls on a ~100 ms cadence, so a snapshot lags live DOM by up to one
+   *  poll interval. Returns a disconnect function that stops the observation. Requires
+   *  `renderer.dom`. `cb` must complete synchronously and return `undefined`. */
+  observe(selector: string, cb: (node: DomElement) => void): () => void;
 }
 
 export interface ScriptAPI {
@@ -75,10 +111,23 @@ export interface ScriptAPI {
   setDocumentTitle(title: string): void;
 }
 
+/** Renderer-only host storage (requires `renderer.storage`). Keys and values are strings. Every entry
+ *  lives in the owning plugin's host-namespaced keyspace — the host stores it as
+ *  `tronhawk:<pluginId>:<key>` — so one plugin can never read or overwrite another plugin's (or
+ *  another app's view of the same plugin's) entries. Values are bounded by the host. */
+export interface StorageAPI {
+  /** Read the value stored under `key` in this plugin's namespace; resolves `null` when absent. */
+  get(key: string): Promise<string | null>;
+  /** Store `value` under `key` in this plugin's namespace. */
+  set(key: string, value: string): Promise<void>;
+}
+
 export interface RendererContext extends PluginContext {
   css: CssAPI;
   dom: DomAPI;
   script: ScriptAPI;
+  /** Renderer-only host-namespaced string storage. Requires the `renderer.storage` permission. */
+  storage: StorageAPI;
 }
 
 // --- Main context (MVP) ---
@@ -126,8 +175,13 @@ export interface MainContext extends PluginContext {
 // --- Plugin module lifecycle ---
 
 export type PluginModule<C extends PluginContext = PluginContext> = {
-  activate(ctx: C): undefined;
-  deactivate(ctx: C): undefined;
+  /** Runs when the plugin is activated. May complete synchronously (returning nothing / `undefined`)
+   *  or return a Promise; when it returns a Promise the runtime **drains** it before the plugin is
+   *  considered active. */
+  activate(ctx: C): void | Promise<void>;
+  /** Runs when the plugin is deactivated (disable, plan revision, app teardown). May complete
+   *  synchronously or return a Promise; the runtime drains a returned Promise before disposing the VM. */
+  deactivate(ctx: C): void | Promise<void>;
 };
 
 // --- Utilities ---
@@ -151,14 +205,13 @@ export function createMockRendererContext(
   return {
     logger: createLogger("mock"),
     network: {
-      request: async () => {
-        throw new Error("not implemented");
-      },
+      request: async () => ({ status: 200, headers: {}, body: "" }),
     },
     config: { get: () => undefined, set: () => {} },
     css: { insert: () => "mock-style", remove: () => {} },
-    dom: { query: () => null, observe: () => () => {} },
+    dom: { query: async () => null, observe: () => () => {} },
     script: { setDocumentTitle: () => {} },
+    storage: { get: async () => null, set: async () => {} },
     ...overrides,
   };
 }
@@ -169,9 +222,7 @@ export function createMockMainContext(
   return {
     logger: createLogger("mock"),
     network: {
-      request: async () => {
-        throw new Error("not implemented");
-      },
+      request: async () => ({ status: 200, headers: {}, body: "" }),
     },
     config: { get: () => undefined, set: () => {} },
     window: {

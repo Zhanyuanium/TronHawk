@@ -227,6 +227,132 @@ function getQuickJS() {
   return QuickJSPromise;
 }
 
+// --- Async-op job pump (Tier-2 primitives; ADR 0008 Option B) ---
+//
+// The sync QuickJS variant never runs promise jobs on its own, so an async host API (network
+// request, DOM snapshot, storage read — and, later, Promise-returning lifecycle) must be
+// *host-driven*. A host function that cannot answer synchronously creates a deferred via
+// newHostPromise() and registers it in pendingOps; when the underlying host operation completes it
+// calls settleOp() to resolve/reject the deferred, then drainPendingJobs() to let the plugin's
+// continuation run under the usual per-operation CPU deadline.
+//
+// Lifetime rules:
+//   * An op's deferred is disposed exactly once — in settleOp() after settlement, or in
+//     cleanupPendingOps() when its VM is disposed while the op is still pending.
+//   * settleOp() owns the QuickJS value handle produced by its `makeHandle` callback and disposes it
+//     after resolving/rejecting (resolve/reject only borrow the handle for the call).
+//   * A late settleOp() for an op torn down with its VM is a deliberate no-op: it never touches a
+//     disposed VM and never logs an error.
+//   * drainPendingJobs() is re-entrancy-guarded per VM (vmDrains): a settle that happens while a
+//     drain is already pumping that VM must not start a second nested pump loop.
+const MAX_JOBS_PER_SLICE = 1000;
+// Wall-clock cap (ms) for draining a thenable `deactivate` result before disposal proceeds. A guest
+// cleanup gets a bounded chance to run; a deactivate that never settles must never block disposal.
+const DEACTIVATE_DRAIN_MS = 2000;
+// opId -> { pluginId, vm, deferred, label } — in-flight host async ops awaiting settlement.
+const pendingOps = new Map();
+// vm -> { draining: true } — re-entrancy guard, true only while a drain is pumping this VM.
+const vmDrains = new WeakMap();
+let nextOpId = 1;
+// Test seam: number of drains that actually ran (guard passed). reset() clears it.
+let pumpDrainCount = 0;
+
+// Drain a VM's promise jobs until none remain (or a slice fails). Runs under runQuickJSOperation so
+// guest continuations execute inside the same per-operation CPU-deadline enforcement as every other
+// plugin turn (ADR 0002), and a failing slice stops the pump without spinning.
+function drainPendingJobs(vm, pluginId, label) {
+  if (vmDrains.get(vm)) {
+    // Already draining this VM (a settle happened from inside a guest job the current drain is
+    // executing). The running pump loop re-checks hasPendingJob() and picks the new job up, so a
+    // nested pump would only re-enter the same loop.
+    return;
+  }
+  vmDrains.set(vm, { draining: true });
+  pumpDrainCount += 1;
+  try {
+    while (vm.runtime.hasPendingJob()) {
+      const ok = runQuickJSOperation(vm, pluginId, label, () => {
+        const result = vm.runtime.executePendingJobs(MAX_JOBS_PER_SLICE);
+        if (result.error) {
+          // A job threw out of the engine: let runQuickJSOperation surface and dispose the error.
+          return result;
+        }
+        // executePendingJobs reports success as a job *count*, but runQuickJSOperation expects a
+        // disposable handle in result.value (it disposes the value after a clean run). Substitute
+        // the VM's undefined — a static handle whose dispose() is a no-op — so that bookkeeping is
+        // satisfied without inventing or leaking a real value.
+        result.dispose();
+        return { error: undefined, value: vm.undefined };
+      });
+      if (!ok) break;
+    }
+  } finally {
+    vmDrains.delete(vm);
+  }
+}
+
+// Settle a pending host op: resolve (mode "resolve") or reject (mode "reject") its deferred with the
+// QuickJS handle produced by `makeHandle`, dispose the deferred, and drain so the guest continuation
+// runs. Errors are logged via pluginLog and never thrown across the host boundary.
+function settleOp(id, mode, makeHandle) {
+  const op = pendingOps.get(id);
+  if (!op) {
+    // Already settled, or torn down with its VM (cleanupPendingOps). Late settles are no-ops.
+    return;
+  }
+  pendingOps.delete(id);
+  const label = op.label + " (op #" + id + ")";
+  try {
+    const value = makeHandle();
+    try {
+      if (mode === "reject") {
+        op.deferred.reject(value);
+      } else {
+        op.deferred.resolve(value);
+      }
+    } finally {
+      // makeHandle produced an owned handle; resolve/reject only borrowed it for the call.
+      if (value && typeof value.dispose === "function") {
+        try {
+          value.dispose();
+        } catch (_e) {
+          // Best effort — settlement already happened.
+        }
+      }
+    }
+    op.deferred.dispose();
+    drainPendingJobs(op.vm, op.pluginId, label + " drain");
+  } catch (e) {
+    pluginLog(op.pluginId, "error", label + " settle failed: " + errorText(e));
+  }
+}
+
+// Create a host-owned pending promise for an async host API. The returned handle is the promise the
+// guest `await`s (return it from the host function); settle it later via settleOp(opId, ...).
+function newHostPromise(vm, pluginId, label) {
+  const deferred = vm.newPromise();
+  const opId = nextOpId++;
+  pendingOps.set(opId, { pluginId, vm, deferred, label: label || "host op" });
+  return { opId, handle: deferred.handle };
+}
+
+// Dispose every pending op that belongs to `vm` and drop the VM's drain guard. Runs inside
+// disposeVM() so a VM parked on an unresolved host op is disposed without leaking its deferred's
+// QuickJS handles — and so a late settleOp for it can never touch the disposed VM.
+function cleanupPendingOps(vm) {
+  for (const [id, op] of pendingOps) {
+    if (op.vm === vm) {
+      pendingOps.delete(id);
+      try {
+        op.deferred.dispose();
+      } catch (_e) {
+        // Best effort — the VM is going away regardless.
+      }
+    }
+  }
+  vmDrains.delete(vm);
+}
+
 // pluginId -> { vm, deactivate }
 const mainPlugins = new Map();
 // pluginId -> { generation, fingerprint }
@@ -411,6 +537,139 @@ function runQuickJSOperation(vm, pluginId, label, operation, requireUndefined = 
   return ok;
 }
 
+// --- Async lifecycle (activate/deactivate may return a Promise; ADR 0008) ---
+//
+// The synchronous-void contract ("return undefined") still holds for lifecycle-*event* callbacks
+// (onCreated/onLoad/onRendererReady/onUnload/dom.observe — those call sites keep requireUndefined
+// unmodified). Only the module lifecycle hooks activate/deactivate may instead return a Promise
+// that the host drains. The helpers below implement that relaxation on top of the pump.
+
+// True when a QuickJS value has a callable `then` — the shape an async activate/deactivate returns.
+// The handle is borrowed; nothing is disposed.
+function isThenableResult(vm, valueHandle) {
+  const valueType = vm.typeof(valueHandle);
+  if (valueType !== "object" && valueType !== "function") return false;
+  const thenHandle = vm.getProp(valueHandle, "then");
+  try {
+    return vm.typeof(thenHandle) === "function";
+  } finally {
+    thenHandle.dispose();
+  }
+}
+
+// Best-effort guest error text for logging: prefer the `message` property (a plain string read that
+// runs no guest code), then fall back to a JSON dump.
+function guestErrorText(vm, errorHandle) {
+  try {
+    const messageHandle = vm.getProp(errorHandle, "message");
+    try {
+      if (vm.typeof(messageHandle) === "string") return vm.getString(messageHandle);
+    } finally {
+      messageHandle.dispose();
+    }
+  } catch (_e) {
+    // Fall through to the dump.
+  }
+  try {
+    const dumped = vm.dump(errorHandle);
+    if (typeof dumped === "string") return dumped;
+    return JSON.stringify(dumped);
+  } catch (_e) {
+    return String(errorHandle);
+  }
+}
+
+// Invoke a plugin lifecycle hook (activate/deactivate) under the CPU deadline. Returns false when
+// the call itself failed (threw, returned a QuickJS error, or — keeping the synchronous-void
+// contract — returned a non-undefined, non-thenable value). On success returns true; if the hook
+// returned a thenable, ownership of its promise handle is transferred into `capture.asyncResult`
+// (the caller disposes it) and the hook is presented to runQuickJSOperation as void-returning so
+// the shared requireUndefined enforcement does not reject it — the caller drains the continuation
+// instead. Every other call site's requireUndefined semantics are untouched.
+function runLifecycleHook(vm, pluginId, label, invoke, capture) {
+  return runQuickJSOperation(vm, pluginId, label, () => {
+    const result = invoke();
+    if (result.error) return result;
+    if (isThenableResult(vm, result.value)) {
+      capture.asyncResult = result.value;
+      return { error: undefined, value: vm.undefined };
+    }
+    return result;
+  }, true);
+}
+
+// Watch a pending async `activate` result on an already-registered plugin. Fulfillment is a no-op
+// (registration already happened); a rejection fails the plugin closed through `onRejected`, exactly
+// like a synchronous activate failure. Ownership of `thenableHandle` transfers here and it is
+// disposed once the guest promise has been assimilated (the guest keeps it alive through its own
+// reactions). Drains once so guest microtasks start moving.
+function watchAsyncActivate(vm, pluginId, label, thenableHandle, onRejected) {
+  const native = vm.resolvePromise(thenableHandle);
+  thenableHandle.dispose();
+  native.then(
+    (result) => {
+      if (result && result.error) {
+        const reason = guestErrorText(vm, result.error);
+        try {
+          result.dispose(); // disposes the dup'd error handle
+        } catch (_e) {
+          // Best effort.
+        }
+        onRejected(reason);
+      } else if (result && typeof result.dispose === "function") {
+        try {
+          result.dispose(); // disposes the dup'd resolved-value handle
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+    },
+    (error) => {
+      // resolvePromise resolves (never rejects) natively; this branch is defensive only.
+      onRejected(error && error.message ? String(error.message) : String(error));
+    },
+  );
+  drainPendingJobs(vm, pluginId, label);
+}
+
+// Drain a thenable `deactivate` result until it settles or `timeoutMs` elapses, so an async guest
+// cleanup gets a chance to run before the VM is disposed — bounded so disposal is never blocked
+// forever. Returns "fulfilled" / "rejected" / "timeout". Does not dispose `promiseHandle` (the
+// caller owns it). Internal settlement-state handles are disposed here.
+function drainThenableResult(vm, pluginId, label, promiseHandle, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    drainPendingJobs(vm, pluginId, label);
+    let state;
+    try {
+      state = vm.getPromiseState(promiseHandle);
+    } catch (_e) {
+      return "fulfilled"; // VM is going away; treat as settled so disposal proceeds.
+    }
+    if (state.type === "fulfilled") {
+      if (!state.notAPromise && state.value) {
+        try {
+          state.value.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+      return "fulfilled";
+    }
+    if (state.type === "rejected") {
+      if (state.error) {
+        try {
+          state.error.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+      return "rejected";
+    }
+    if (Date.now() >= deadline) return "timeout";
+  }
+}
+
 function pluginFingerprint(plugin) {
   return JSON.stringify(plugin);
 }
@@ -423,6 +682,9 @@ function cleanupAll(cleanups) {
 let vmDisposeCount = 0;
 
 function disposeVM(vm) {
+  // A VM parked on an unresolved async host op must not leak its pending deferred's QuickJS
+  // handles, and a late settleOp for one of those ops must become a no-op (see cleanupPendingOps).
+  cleanupPendingOps(vm);
   try {
     vm.dispose();
   } catch (_e) {
@@ -452,22 +714,56 @@ function capturePluginDeactivate(vm) {
   };
 }
 
-// Run the plugin's own module.exports.deactivate(ctx) synchronously — the same undefined-void
-// contract as activate (a throwing or non-undefined/Promise result is a failed cleanup, logged,
-// and never blocks disposal) — while the VM is still alive. Then run host cleanup and dispose the
-// VM. `cleanups` is the main-plugin host-cleanup array (null for renderer plugins).
+// Run the plugin's own module.exports.deactivate(ctx) while the VM is still alive, then run host
+// cleanup and dispose the VM. deactivate may return undefined (the synchronous contract) or a
+// Promise/thenable it awaits to completion (ADR 0008): a thenable result is drained — bounded by
+// DEACTIVATE_DRAIN_MS — so an async guest cleanup runs before disposal, but a timeout/rejection
+// never blocks disposal (fail-closed). A throwing or non-undefined synchronous result stays a
+// failed cleanup, logged, and never blocks disposal. `cleanups` is the host-cleanup array (an empty
+// array when the plugin had no renderer/main async observers to tear down; never null).
 function deactivatePluginVM(vm, pluginId, label, lifecycle, cleanups) {
   if (lifecycle.deactivateExport) {
-    const ok = runQuickJSOperation(vm, pluginId, label + " deactivate", () =>
-      vm.callFunction(lifecycle.deactivateExport, lifecycle.moduleExports, lifecycle.ctx),
-      true,
+    const capture = { asyncResult: null };
+    const ok = runLifecycleHook(
+      vm,
+      pluginId,
+      label + " deactivate",
+      () => vm.callFunction(lifecycle.deactivateExport, lifecycle.moduleExports, lifecycle.ctx),
+      capture,
     );
     if (!ok) {
+      if (capture.asyncResult) {
+        try {
+          capture.asyncResult.dispose(); // over-deadline edge: never reached the async path
+        } catch (_e) {
+          // Best effort.
+        }
+      }
       pluginLog(
         pluginId,
         "error",
         label + " deactivate failed or returned a non-undefined result; continuing with disposal",
       );
+    } else if (capture.asyncResult) {
+      const outcome = drainThenableResult(
+        vm,
+        pluginId,
+        label + " deactivate",
+        capture.asyncResult,
+        DEACTIVATE_DRAIN_MS,
+      );
+      try {
+        capture.asyncResult.dispose();
+      } catch (_e) {
+        // Best effort.
+      }
+      if (outcome !== "fulfilled") {
+        pluginLog(
+          pluginId,
+          "error",
+          label + " deactivate failed or timed out; continuing with disposal",
+        );
+      }
     }
   }
   for (const handle of [lifecycle.deactivateExport, lifecycle.ctx, lifecycle.moduleExports]) {
@@ -569,6 +865,292 @@ function buildConfigApi(vm, pluginId, configObj) {
   set.dispose();
 
   return config;
+}
+
+// Build a QuickJS handle for a JSON-safe JS value (string/number/boolean/null/object of these).
+// Used to hand Core/host results to the guest. Arrays are not needed by the current surfaces
+// (NetworkResponse.headers is an object, DomElement is an object). Each returned handle is owned by
+// the caller (settleOp borrows + disposes it; the guest's deferred owns it after resolve).
+function handlesFromJson(vm, value) {
+  if (value === null || value === undefined) {
+    return vm.null;
+  }
+  const kind = typeof value;
+  if (kind === "string") {
+    return vm.newString(value);
+  }
+  if (kind === "number") {
+    return vm.newNumber(value);
+  }
+  if (kind === "boolean") {
+    return value ? vm.true : vm.false;
+  }
+  if (kind === "object") {
+    const obj = vm.newObject();
+    for (const [key, item] of Object.entries(value)) {
+      // Skip dangerous keys that could alter the new object's prototype/constructor semantics.
+      // The values are page-controlled (e.g. DomElement attrs), so never let them become special.
+      if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+      const itemHandle = handlesFromJson(vm, item);
+      vm.setProp(obj, key, itemHandle);
+      itemHandle.dispose();
+    }
+    return obj;
+  }
+  // Unknown scalar type (bigint/symbol/function): surface as undefined rather than leaking host.
+  return vm.undefined;
+}
+
+// `ctx.network.request(req)` — async host function bridging to the Core `networkRequest` RPC, which
+// performs the permissioned, domain-whitelisted fetch Core-side. Returns a QuickJS Promise the guest
+// awaits; the value/rejection is delivered by the in-process pending-job pump (ADR 0008).
+function buildNetworkApi(vm, pluginId) {
+  const network = vm.newObject();
+
+  const request = vm.newFunction("request", (reqHandle) => {
+    if (vm.typeof(reqHandle) !== "object") {
+      pluginLog(pluginId, "warn", "network.request: argument must be a request object");
+      return vm.undefined;
+    }
+    // Read the request fields as data (coercion runs under the enclosing operation's deadline).
+    const urlHandle = vm.getProp(reqHandle, "url");
+    const url = vm.typeof(urlHandle) === "string" ? vm.getString(urlHandle) : "";
+    urlHandle.dispose();
+    const methodHandle = vm.getProp(reqHandle, "method");
+    const method =
+      vm.typeof(methodHandle) === "string" ? vm.getString(methodHandle).toUpperCase() : "GET";
+    methodHandle.dispose();
+    // headers: object of string->string; body: string (default "").
+    const headers = {};
+    const headersHandle = vm.getProp(reqHandle, "headers");
+    if (vm.typeof(headersHandle) === "object") {
+      for (const key of Object.keys(vm.dump(headersHandle) || {})) {
+        if (typeof key !== "string") continue;
+        const valHandle = vm.getProp(headersHandle, key);
+        if (vm.typeof(valHandle) === "string") headers[key] = vm.getString(valHandle);
+        valHandle.dispose();
+      }
+    }
+    headersHandle.dispose();
+    const bodyHandle = vm.getProp(reqHandle, "body");
+    const body = vm.typeof(bodyHandle) === "string" ? vm.getString(bodyHandle) : "";
+    bodyHandle.dispose();
+
+    const { opId, handle } = newHostPromise(vm, pluginId, "network.request");
+    planRequest("networkRequest", { pluginId, url, method, headers, body }, { timeout: 30000 })
+      .then(({ id, envelope }) => {
+        const result = validatePlanEnvelope(envelope, id);
+        settleOp(opId, "resolve", () => handlesFromJson(vm, result));
+      })
+      .catch((e) => {
+        settleOp(opId, "reject", () => vm.newString(errorText(e)));
+      });
+    return handle;
+  });
+  vm.setProp(network, "request", request);
+  request.dispose();
+
+  return network;
+}
+
+// `ctx.storage` — renderer-only async host API bridging the target page's localStorage, with a
+// host-owned namespaced key (`tronhawk:<pluginId>:<key>`, pluginId is NEVER guest-supplied) so one
+// plugin cannot read another's keys. Each get/set is a QuickJS Promise delivered by the pump; the
+// page access is done via a host-owned, fixed `executeJavaScript` template that treats the key/value
+// as data (JSON-stringified). Requires the `renderer.storage` grant.
+function buildStorageApi(vm, pluginId, contents) {
+  const storage = vm.newObject();
+  const STORAGE_PREFIX = "tronhawk:" + pluginId + ":";
+
+  function storageSnippet(body) {
+    const prefix = JSON.stringify(STORAGE_PREFIX);
+    return `((function(){var p=${prefix};try{${body}}catch(e){return null}})())`;
+  }
+
+  const get = vm.newFunction("get", (keyHandle) => {
+    const key = vm.typeof(keyHandle) === "string" ? vm.getString(keyHandle) : "";
+    if (key === "") {
+      pluginLog(pluginId, "warn", "storage.get: invalid key");
+      return vm.undefined;
+    }
+    const { opId, handle } = newHostPromise(vm, pluginId, "storage.get");
+    const code = storageSnippet(
+      `var v=localStorage.getItem(p+${JSON.stringify(key)});return v===null?null:JSON.parse(v)`,
+    );
+    contents
+      .executeJavaScript(code)
+      .then((val) => settleOp(opId, "resolve", () => handlesFromJson(vm, val)))
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(storage, "get", get);
+  get.dispose();
+
+  const set = vm.newFunction("set", (keyHandle, valueHandle) => {
+    const key = vm.typeof(keyHandle) === "string" ? vm.getString(keyHandle) : "";
+    if (key === "") {
+      pluginLog(pluginId, "warn", "storage.set: invalid key");
+      return vm.undefined;
+    }
+    const value = vm.dump(valueHandle);
+    const valueJson = JSON.stringify(value === undefined ? null : value);
+    const { opId, handle } = newHostPromise(vm, pluginId, "storage.set");
+    const code = storageSnippet(
+      `localStorage.setItem(p+${JSON.stringify(key)},${JSON.stringify(valueJson)});return null`,
+    );
+    contents
+      .executeJavaScript(code)
+      .then(() => settleOp(opId, "resolve", () => vm.undefined))
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(storage, "set", set);
+  set.dispose();
+
+  return storage;
+}
+
+// Host-owned DOM snapshot template (ADR 0002): the query/selector is inserted ONLY as JSON data and
+// the snippet only reads a bounded snapshot of the matched element (never executes plugin JS).
+// Returns a JSON string that the host parses into a DomElement, or `null` when nothing matched.
+const DOM_QUERY_SNIPPET = (selector) =>
+  `(function(){var s=JSON.parse(${JSON.stringify(JSON.stringify(selector))});try{` +
+  `var e=document.querySelector(s);if(!e)return null;var st=e.tagName.toLowerCase();` +
+  `var id=e.getAttribute("id")||"";var cn=e.className&&String(e.className).slice(0,256)||"";` +
+  `var r=e.getBoundingClientRect();` +
+  `var tx=(e.textContent||"").slice(0,1024);var at={};` +
+  `for(var i=0;i<e.attributes.length&&i<64;i++){var n=e.attributes[i].name;at[n]=(e.getAttribute(n)||"").slice(0,256)}` +
+  `var o={tag:st,id:id,className:cn,attrs:at,text:tx,rect:{x:r.x,y:r.y,width:r.width,height:r.height}};` +
+  `if("value" in e)o.value=String(e.value).slice(0,256);if("checked" in e)o.checked=!!e.checked;` +
+  `if(o.tag==="a")o.href=(e.getAttribute("href")||"").slice(0,512);if(o.tag==="img")o.src=(e.getAttribute("src")||"").slice(0,512);` +
+  `return JSON.stringify(o);}catch(e){return null}})()`;
+
+// `ctx.dom` — renderer-only async host API (ADR 0008). `query(selector)` snapshots the first
+// matching element (serialized data, never a live DOM node); `observe(selector, cb)` polls and
+// re-delivers snapshots for matches, using a host-owned per-window timer, diffing the single current
+// match by a coarse stable key (tag+id+short text). Requires `renderer.dom`. Each cb fires under the
+// synchronous-undefined contract and is fail-closed: a throwing/over-deadline cb unregisters.
+function buildDomApi(vm, pluginId, contents, cleanupCallbacks) {
+  const dom = vm.newObject();
+  let nextNodeId = 1;
+  const nodeIds = new WeakMap(); // in the page world; here we re-derive via a stable map below.
+  const observers = new Map(); // selector -> { cbHandle, lastNodes: Map<string,{nodeId}> }
+  let pollTimer = null;
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+  function maybeStartPolling() {
+    if (pollTimer || observers.size === 0) return;
+    pollTimer = setInterval(() => {
+      if (contents.isDestroyed && contents.isDestroyed()) {
+        stopPolling();
+        return;
+      }
+      const selectors = [...observers.keys()];
+      for (const selector of selectors) {
+        const obs = observers.get(selector);
+        if (!obs) continue;
+        contents
+          .executeJavaScript(DOM_QUERY_SNIPPET(selector))
+          .then((json) => {
+            // Re-read the observer by selector: a disconnect()/revoke during the in-flight poll
+            // already removed it (and disposed its cbHandle), so we must not touch a stale entry.
+            const panel = observers.get(selector);
+            if (!panel) return;
+            const snapshot = typeof json === "string" ? JSON.parse(json) : json;
+            // Diff by a coarse stable key (tag+id+text hash) over the single match we poll.
+            const key = snapshot ? snapshot.tag + "|" + snapshot.id + "|" + (snapshot.text || "").slice(0, 40) : null;
+            if (snapshot && panel.lastKey !== key) {
+              panel.lastKey = key;
+              const nodeHandle = handlesFromJson(vm, { ...snapshot, nodeId: nextNodeId++ });
+              const ok = runQuickJSOperation(vm, pluginId, "dom.observe callback", () =>
+                vm.callFunction(panel.cbHandle, vm.undefined, nodeHandle),
+                true,
+              );
+              nodeHandle.dispose();
+              if (!ok) {
+                // Fail-closed: a throwing/over-deadline callback is unregistered so it never
+                // re-fires on a poisoned VM (matches the onCreated/subscribeLifecycle contract).
+                observers.delete(selector);
+                panel.cbHandle.dispose();
+                if (observers.size === 0) stopPolling();
+                pluginLog(pluginId, "warn", "dom.observe callback failed; observer unregistered");
+              }
+            }
+          })
+          .catch((e) => {
+            // A persistent page error is logged but the observer survives to retry (query failure
+            // is distinct from a callback failure, which is fail-closed above).
+            pluginLog(pluginId, "warn", "dom.observe poll failed: " + errorText(e));
+          });
+      }
+    }, 500);
+  }
+
+  const query = vm.newFunction("query", (selectorHandle) => {
+    const selector = vm.typeof(selectorHandle) === "string" ? vm.getString(selectorHandle) : "";
+    if (selector === "") {
+      return vm.undefined;
+    }
+    const { opId, handle } = newHostPromise(vm, pluginId, "dom.query");
+    contents
+      .executeJavaScript(DOM_QUERY_SNIPPET(selector))
+      .then((json) => {
+        const snapshot = typeof json === "string" ? JSON.parse(json) : json;
+        settleOp(opId, "resolve", () => (snapshot ? handlesFromJson(vm, { ...snapshot, nodeId: 0 }) : vm.null));
+      })
+      .catch((e) => settleOp(opId, "reject", () => vm.newString(errorText(e))));
+    return handle;
+  });
+  vm.setProp(dom, "query", query);
+  query.dispose();
+
+  const observe = vm.newFunction("observe", (selectorHandle, cbHandle) => {
+    const selector = vm.typeof(selectorHandle) === "string" ? vm.getString(selectorHandle) : "";
+    if (selector === "") {
+      pluginLog(pluginId, "warn", "dom.observe: invalid selector");
+      return vm.undefined;
+    }
+    const callback = cbHandle.dup();
+    // Re-observing the same selector replaces the prior observer; dispose the old callback handle
+    // so it cannot outlive the subscription (and so the stale disconnect/cleanup closure no-ops on
+    // the entry it no longer owns — each closure only deletes the entry it created).
+    const prior = observers.get(selector);
+    if (prior) prior.cbHandle.dispose();
+    observers.set(selector, { cbHandle: callback, lastKey: null });
+    maybeStartPolling();
+
+    const disconnect = vm.newFunction("disconnect", () => {
+      const obs = observers.get(selector);
+      // Only the closure that still owns the current entry may delete it, so a stale disconnect
+      // from a replaced observer never removes the newer subscription.
+      if (obs && obs.cbHandle === callback) {
+        observers.delete(selector);
+        obs.cbHandle.dispose();
+      }
+      if (observers.size === 0) stopPolling();
+      return vm.undefined;
+    });
+    // Cleanup on revoke: dispose the observer's callback handle and stop the poller when idle.
+    const cleanup = () => {
+      const obs = observers.get(selector);
+      if (obs && obs.cbHandle === callback) {
+        observers.delete(selector);
+        obs.cbHandle.dispose();
+      }
+      if (observers.size === 0) stopPolling();
+    };
+    cleanupCallbacks.push(cleanup);
+    return disconnect;
+  });
+  vm.setProp(dom, "observe", observe);
+  observe.dispose();
+
+  return dom;
 }
 
 function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
@@ -1040,6 +1622,11 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
     const config = buildConfigApi(vm, plugin.id, plugin.config || {});
     vm.setProp(ctx, "config", config);
     config.dispose();
+    if (hasPermission(plugin.granted, "network.access")) {
+      const net = buildNetworkApi(vm, plugin.id);
+      vm.setProp(ctx, "network", net);
+      net.dispose();
+    }
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 
@@ -1063,16 +1650,22 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
     }
 
     // Call module.exports.activate(ctx) if present. Read `module.exports` (not the stale
-    // `global.exports`) because the plugin assigns `module.exports = {...}`.
+    // `global.exports`) because the plugin assigns `module.exports = {...}`. activate may return
+    // undefined (synchronous, the historic contract) or a Promise/thenable it awaits to completion
+    // (ADR 0008); a thenable is registered immediately and drained — see watchAsyncActivate.
     const moduleHandle = vm.getProp(vm.global, "module");
     const exportsHandle = vm.getProp(moduleHandle, "exports");
     const activate = vm.getProp(exportsHandle, "activate");
     const ctxHandle = vm.getProp(vm.global, "ctx");
+    const activationCapture = { asyncResult: null };
     let activated = true;
     if (vm.typeof(activate) === "function") {
-      activated = runQuickJSOperation(vm, plugin.id, "main plugin activate", () =>
-        vm.callFunction(activate, exportsHandle, ctxHandle),
-        true,
+      activated = runLifecycleHook(
+        vm,
+        plugin.id,
+        "main plugin activate",
+        () => vm.callFunction(activate, exportsHandle, ctxHandle),
+        activationCapture,
       );
     }
     activate.dispose();
@@ -1081,6 +1674,13 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
     moduleHandle.dispose();
 
     if (!activated) {
+      if (activationCapture.asyncResult) {
+        try {
+          activationCapture.asyncResult.dispose(); // over-deadline edge: never reached async path
+        } catch (_e) {
+          // Best effort.
+        }
+      }
       cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
@@ -1092,20 +1692,29 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
         (candidate) =>
           candidate.id === plugin.id &&
           candidate.main &&
-          hasPermission(candidate.granted, "electron.window") &&
+          (hasPermission(candidate.granted, "electron.window") ||
+            hasPermission(candidate.granted, "network.access")) &&
           pluginFingerprint(candidate) === fingerprint,
       ) &&
       !abuseDisabledPlugins.has(plugin.id) &&
       !mainPlugins.has(plugin.id);
     if (!stillPending) {
+      if (activationCapture.asyncResult) {
+        try {
+          activationCapture.asyncResult.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+      }
       cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
 
-    // Store the vm for later deactivate/disposal. First deactivation runs the plugin's own
-    // module.exports.deactivate(ctx) synchronously while the VM is still alive, then host cleanup,
-    // then VM disposal. The guard ensures a stale double revoke never calls guest deactivate twice.
+    // Register now — immediately, even while an async activate is still in flight. First
+    // deactivation runs the plugin's own module.exports.deactivate(ctx) while the VM is still
+    // alive, then host cleanup, then VM disposal. The guard ensures a stale double revoke never
+    // calls guest deactivate twice.
     const lifecycle = capturePluginDeactivate(vm);
     let deactivated = false;
     const deactivate = () => {
@@ -1113,7 +1722,27 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
       deactivated = true;
       deactivatePluginVM(vm, plugin.id, "main plugin", lifecycle, cleanupCallbacks);
     };
-    mainPlugins.set(plugin.id, { vm, deactivate, fingerprint });
+    const entry = { vm, deactivate, fingerprint };
+    mainPlugins.set(plugin.id, entry);
+    if (activationCapture.asyncResult) {
+      // Async activate: watch the returned promise. Fulfillment needs no action (already
+      // registered); a rejection fails the plugin closed exactly like a synchronous activate
+      // failure, but is identity-guarded so a stale late rejection (the instance was superseded or
+      // revoked by a plan revision) can never tear down a newer VM or dispose a VM twice.
+      watchAsyncActivate(
+        vm,
+        plugin.id,
+        "main plugin activate",
+        activationCapture.asyncResult,
+        (reason) => {
+          if (mainPlugins.get(plugin.id) !== entry) return; // stale: superseded or already removed
+          mainPlugins.delete(plugin.id);
+          cleanupAll(cleanupCallbacks);
+          disposeVM(vm);
+          pluginLog(plugin.id, "error", "main plugin activate rejected: " + reason);
+        },
+      );
+    }
     pluginLog(plugin.id, "info", "Main plugin loaded");
   }).catch((e) => {
     if (pendingMainPlugins.get(plugin.id) === pending) pendingMainPlugins.delete(plugin.id);
@@ -1176,11 +1805,28 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       vm.setProp(ctx, "script", script);
       script.dispose();
     }
-    // (ctx.dom.query / ctx.dom.observe need async host functions — future.)
+    // Host cleanup callbacks for this renderer plugin instance (e.g. dom.observe subscriptions),
+    // run on revoke/deactivate before the VM is disposed.
+    const cleanupCallbacks = [];
+    if (hasPermission(plugin.granted, "renderer.dom")) {
+      const dom = buildDomApi(vm, plugin.id, contents, cleanupCallbacks);
+      vm.setProp(ctx, "dom", dom);
+      dom.dispose();
+    }
     // ctx.config: read-only merged config for this plan snapshot (same surface as the main ctx).
     const config = buildConfigApi(vm, plugin.id, plugin.config || {});
     vm.setProp(ctx, "config", config);
     config.dispose();
+    if (hasPermission(plugin.granted, "network.access")) {
+      const net = buildNetworkApi(vm, plugin.id);
+      vm.setProp(ctx, "network", net);
+      net.dispose();
+    }
+    if (hasPermission(plugin.granted, "renderer.storage")) {
+      const storage = buildStorageApi(vm, plugin.id, contents);
+      vm.setProp(ctx, "storage", storage);
+      storage.dispose();
+    }
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 
@@ -1197,6 +1843,7 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
         vm.evalCode(plugin.renderer || ""),
       )
     ) {
+      cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
@@ -1205,11 +1852,15 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
     const exportsHandle = vm.getProp(moduleHandle, "exports");
     const activate = vm.getProp(exportsHandle, "activate");
     const ctxHandle = vm.getProp(vm.global, "ctx");
+    const activationCapture = { asyncResult: null };
     let activated = true;
     if (vm.typeof(activate) === "function") {
-      activated = runQuickJSOperation(vm, plugin.id, "renderer plugin activate", () =>
-        vm.callFunction(activate, exportsHandle, ctxHandle),
-        true,
+      activated = runLifecycleHook(
+        vm,
+        plugin.id,
+        "renderer plugin activate",
+        () => vm.callFunction(activate, exportsHandle, ctxHandle),
+        activationCapture,
       );
     }
     activate.dispose();
@@ -1218,6 +1869,14 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
     moduleHandle.dispose();
 
     if (!activated) {
+      if (activationCapture.asyncResult) {
+        try {
+          activationCapture.asyncResult.dispose(); // over-deadline edge: never reached async path
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+      cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
@@ -1230,30 +1889,60 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
         (candidate) =>
           candidate.id === plugin.id &&
           candidate.renderer &&
-          hasPermission(candidate.granted, "renderer.script") &&
+          (hasPermission(candidate.granted, "renderer.script") ||
+            hasPermission(candidate.granted, "network.access") ||
+            hasPermission(candidate.granted, "renderer.storage") ||
+            hasPermission(candidate.granted, "renderer.dom")) &&
           pluginFingerprint(candidate) === fingerprint,
       ) &&
       !abuseDisabledPlugins.has(plugin.id) &&
       !rendererPlugins.has(key);
     if (!stillWanted) {
+      if (activationCapture.asyncResult) {
+        try {
+          activationCapture.asyncResult.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+      cleanupAll(cleanupCallbacks);
       disposeVM(vm);
       return;
     }
 
     // Same lifecycle contract as main plugins: deactivation first runs the plugin's own
-    // module.exports.deactivate(ctx) synchronously while the VM is still alive, then disposes the
-    // VM. Guarded so a stale double revoke never calls guest deactivate twice.
+    // module.exports.deactivate(ctx) while the VM is still alive, then disposes the VM. Guarded so
+    // a stale double revoke never calls guest deactivate twice. Register immediately, even while an
+    // async activate is still in flight (a rejection fails the plugin closed, identity-guarded so a
+    // stale late rejection never tears down a newer VM).
     const lifecycle = capturePluginDeactivate(vm);
     let deactivated = false;
     const deactivate = () => {
       if (deactivated) return;
       deactivated = true;
-      deactivatePluginVM(vm, plugin.id, "renderer plugin", lifecycle, null);
+      deactivatePluginVM(vm, plugin.id, "renderer plugin", lifecycle, cleanupCallbacks);
     };
-    rendererPlugins.set(key, { vm, fingerprint, deactivate });
+    const entry = { vm, fingerprint, deactivate };
+    rendererPlugins.set(key, entry);
+    if (activationCapture.asyncResult) {
+      watchAsyncActivate(
+        vm,
+        plugin.id,
+        "renderer plugin activate",
+        activationCapture.asyncResult,
+        (reason) => {
+          if (rendererPlugins.get(key) !== entry) return; // stale: superseded or already removed
+          rendererPlugins.delete(key);
+          cleanupAll(cleanupCallbacks);
+          disposeVM(vm);
+          pluginLog(plugin.id, "error", "renderer plugin activate rejected: " + reason);
+        },
+      );
+    }
     pluginLog(plugin.id, "info", "Renderer plugin loaded");
   }).catch((e) => {
     if (pendingRendererPlugins.get(key) === pending) pendingRendererPlugins.delete(key);
+    cleanupAll(cleanupCallbacks);
     if (vm) disposeVM(vm);
     pluginLog(plugin.id, "error", "QuickJS init failed: " + (e && e.message ? e.message : e));
   });
@@ -1263,7 +1952,7 @@ function reconcileRendererPlugins(w) {
   const contents = w.contents;
   const wanted = new Map();
   for (const p of currentPlan.plugins) {
-    if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe"))) {
+    if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access") || hasPermission(p.granted, "renderer.storage") || hasPermission(p.granted, "renderer.dom"))) {
       wanted.set(p.id, { plugin: p, fingerprint: pluginFingerprint(p) });
     }
   }
@@ -1319,7 +2008,7 @@ function cleanupRendererPlugins(contentsId) {
 function reconcileMainPlugins(app) {
   const wanted = new Map();
   for (const p of currentPlan.plugins) {
-    if (p.main && (hasPermission(p.granted, "electron.window") || hasPermission(p.granted, "runtime.unsafe"))) {
+    if (p.main && (hasPermission(p.granted, "electron.window") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access"))) {
       const fingerprint = pluginFingerprint(p);
       wanted.set(p.id, { plugin: p, fingerprint });
       const active = mainPlugins.get(p.id);
@@ -1574,6 +2263,15 @@ function reset() {
   abuseDisabledPlugins.clear();
   vmDisposeCount = 0;
   quickJSGetCount = 0;
+  // Async-op pump state: drop drain guards for any VM that still has pending ops, then clear the
+  // registry and counters so a later harness test starts from a clean slate. (WeakMap entries for
+  // VMs already disposed via disposeVM were removed by cleanupPendingOps.)
+  for (const op of pendingOps.values()) {
+    vmDrains.delete(op.vm);
+  }
+  pendingOps.clear();
+  nextOpId = 1;
+  pumpDrainCount = 0;
   loadCallbacks.clear();
   rendererReadyCallbacks.clear();
   unloadCallbacks.clear();
@@ -1605,5 +2303,20 @@ module.exports = {
     setWindowResolver: (resolver) => {
       windowResolver = typeof resolver === "function" ? resolver : (id) => BrowserWindow.fromId(id);
     },
+    // Async-op pump seams for the bun harness (src/async-pump.test.js): the harness spawns a real
+    // QuickJS context, registers host functions backed by newHostPromise, settles ops through
+    // settleOp/disposeVM, and asserts on the live pump state. These exist only so the feature tests
+    // stay hermetic; the whole __testing object is inert in the bundled runtime (the public contract
+    // stays { start, applyPlan }).
+    getQuickJS: () => getQuickJS(),
+    newHostPromise: (vm, pluginId, label) => newHostPromise(vm, pluginId, label),
+    settleOp: (id, mode, makeHandle) => settleOp(id, mode, makeHandle),
+    drainPendingJobs: (vm, pluginId, label) => drainPendingJobs(vm, pluginId, label),
+    disposeVM: (vm) => disposeVM(vm),
+    pendingOps: () => pendingOps,
+    vmDrains: () => vmDrains,
+    pendingOpsSize: () => pendingOps.size,
+    drainCount: () => pumpDrainCount,
+    quickJSInterruptCount: (vm) => quickJSInterruptCounts.get(vm) || 0,
   },
 };
