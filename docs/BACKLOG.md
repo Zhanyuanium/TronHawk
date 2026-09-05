@@ -6,21 +6,30 @@ completed or superseded are no longer listed.
 
 ## Phase 3 — QuickJS sandbox (functionally complete; these remain)
 
-- [ ] `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) — needs async host functions; current
-      sync QuickJS variant cannot drain pending jobs nor host async APIs. Exits: switch to the
-      `asyncify` variant (single in-flight async per WASM module, size/speed cost) or run the sync
-      VM on a `worker_thread`/`utilityProcess` and bridge over IPC. No decision yet.
-- [ ] Once async host APIs land (`ctx.dom`, `ctx.network`, …), guide normal plugins back to the
-      sandboxed APIs — raw host execution (`ctx.raw`, `runtime.unsafe`, ADR 0007) is the
-      developer-mode interim, not the target surface. `ctx.config` is now available in the sandbox;
-      only async host APIs (dom/network) remain.
-- [ ] MainContext `setVibrancy` / `setMica` (true glass effect) — not wired; only
-      `setOpacity` / `setSize` / `setPosition` are implemented.
+- [x] Async host functions (`ctx.dom`, `ctx.network`, `ctx.storage`, async lifecycle) — resolved
+      (ADR 0008): the synchronous QuickJS VM stays in-process and the runtime adds a host-driven
+      pending-job pump (`vm.newPromise()` + `executePendingJobs()`). `ctx.dom.query` returns a
+      Promise of a serialized `DomElement` snapshot (the old synchronous `Element | null` is
+      re-specified — a real DOM `Element` cannot cross the QuickJS boundary), `ctx.dom.observe` is a
+      ~100 ms polling bridge delivering snapshots, `ctx.network.request` is a Core-side
+      domain-whitelisted fetch with a catchable rejection, `ctx.storage` is renderer-only
+      host-namespaced storage (`tronhawk:<pluginId>:<key>`), and `activate`/`deactivate` may return
+      a Promise the runtime drains. Lifecycle-event and `observe` callbacks stay synchronous
+      `undefined`. SDK 0.5.0.
+- [x] Guide normal plugins back to the sandboxed APIs — resolved (ADR 0008): `ctx.dom`,
+      `ctx.network`, `ctx.storage`, and async lifecycle now run inside the sandbox. Raw host
+      execution (`ctx.raw`, `runtime.unsafe`, ADR 0007) remains the documented developer-mode
+      interim only for capability beyond the sandboxed surface.
+- [x] MainContext `setVibrancy` / `setMica` (true glass effect) — resolved: the runtime wires both
+      host functions (macOS `setVibrancy`, Windows 11 `setBackgroundMaterial`; structured-log no-op
+      elsewhere); SDK + docs mark them implemented.
 - [x] Plugin `deactivate(ctx)` lifecycle — resolved: the runtime now invokes the plugin's exported
-      `deactivate` (synchronously, returning `undefined` enforced, double-revoke guarded) before
-      disposing the VM, for both main and renderer plugins.
-- [ ] QuickJS pending-job draining — required before lifecycle hooks may return promises; the
-      SDK contract currently enforces synchronous `void` (do not broaden until this lands).
+      `deactivate` (double-revoke guarded) before disposing the VM, for both main and renderer
+      plugins; a returned Promise is drained (ADR 0008).
+- [x] QuickJS pending-job draining — resolved (ADR 0008): the runtime now drains pending jobs
+      (`executePendingJobs()`) around host-async operations and at `activate`/`deactivate`, so the
+      SDK contract broadens from synchronous `void` to `void | Promise<void>` for lifecycle hooks
+      only. Event/`observe` callbacks remain synchronous (never drained).
 - [ ] Real-target compatibility — generic **compat adapter** interface landed (Phase A,
       `crates/runtime/js/src/adapters`, ADR 0003); Obsidian's blocker root-caused and fixed at the
       injection layer (ADR 0004: merged asar, so `app.getAppPath()`/module resolution serve real
@@ -102,6 +111,15 @@ completed or superseded are no longer listed.
       vendored electron-hook).
 - [ ] **ChatGPT/Codex** — MSIX + a custom "owl" Electron fork; GUI does not start under raw-exe
       Detours launch (needs AUMID). Application-profile concern.
+- [ ] **WCO elimination mechanism (generic `onWindowOptions` seam + `vscode` adapter)** — new
+      adapter hook where the runtime rewrites every later `new BrowserWindow(opts)` in the target
+      main process (drop `titleBarOverlay`, force `titleBarStyle: "hidden"`), so native Window
+      Controls Overlay buttons are not drawn. VS Code is an **unpacked** app (`resources/app/`, no
+      `app.asar`) so the ASAR-remap injection path cannot target it yet (same gap as the VS Code row
+      in SPEC §8); the mechanism is first validated against `apps/test-app`'s WCO window
+      simulation (VS Code's exact `titleBarStyle`/`titleBarOverlay` shape), and real-VS-Code
+      validation is deferred until the unpacked-app injection problem is solved (see ADR 0001/0008
+      related items).
 
 ## Newly tracked / observations
 

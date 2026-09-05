@@ -135,9 +135,17 @@ data, or `entry.css` file) for CSS-only themes, `entry.{renderer,main}`, and `pe
 Execution contexts:
 - **Renderer** (Chromium/V8): CSS is data-only; plugin JS runs in QuickJS with one-second evaluation
   and callback CPU deadlines. `renderer.script` only allows the host-owned document-title setter
-  (ADR 0002); `renderer.dom` query/observe is future; localStorage / IndexedDB (future).
+  (ADR 0002); `renderer.dom` query/observe is implemented as async host functions returning
+  serialized `DomElement` snapshots (ADR 0008); renderer-only `ctx.storage` is host-namespaced per
+  plugin (`tronhawk:<pluginId>:<key>`); raw localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
   Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
+- **Async host functions** (ADR 0008): `ctx.network.request` (main + renderer), `ctx.dom.query`
+  (renderer), and `ctx.storage` (renderer) are real Promise APIs backed by an **in-process
+  host-driven pending-job pump** over the synchronous QuickJS VM (`vm.newPromise()` +
+  `executePendingJobs()`). `activate`/`deactivate` may return a Promise the runtime drains.
+  Lifecycle-**event** callbacks (`onCreated`/`onLoad`/`onRendererReady`/`onUnload`) and
+  `ctx.dom.observe` callbacks stay **synchronous `undefined`** — the runtime never drains them.
 - **`ctx.config`** (main + renderer): per-application × per-plugin config carried into the plan
   snapshot; `get(key)` reads synchronously from that snapshot, `set(key, value)` is a no-op for
   sandboxed plugins — config is persisted only via the Manager settings form.
@@ -146,8 +154,11 @@ Execution contexts:
   injected app (arbitrary code execution, outside the QuickJS sandbox).
 
 Lifecycle: install → enable → load → app start → runtime hooks → unload → disable.
+`activate`/`deactivate` may complete synchronously or return a Promise that the runtime drains before
+the plugin is considered activated/deactivated (ADR 0008).
 Events (MVP): `onLoad`, `onUnload`, `onRendererReady`, `onWindowCreated`;
-(future) `onSessionCreated`, `onIPCMessage`, `onNetworkRequest`.
+(future) `onSessionCreated`, `onIPCMessage`, `onNetworkRequest`. Event callbacks stay synchronous
+`undefined`-returning; the runtime never drains a callback return value.
 
 API principles: capability-based (`ctx.window.setVibrancy()`, never `electron.BrowserWindow()`);
 explicit per-context types (`RendererContext` / `MainContext` / `NetworkContext`); stable abstraction
@@ -155,7 +166,8 @@ explicit per-context types (`RendererContext` / `MainContext` / `NetworkContext`
 
 Dependencies: npm-style, bundled into `.thx` at publish.
 Network: plugins cannot `fetch()` directly — must use `ctx.network.request()` → Core permission check
-+ domain whitelist + logging/audit.
++ domain whitelist + logging/audit. Implemented (ADR 0008): the fetch runs **Core-side** against the
+domain whitelist and the returned promise rejects with a catchable error outside it.
 Plugin-to-plugin communication: forbidden in MVP (future: service API).
 
 ## 10. Permissions
@@ -167,12 +179,13 @@ privileged API verifies permission first.
 |---|---|---|
 | `renderer.css` | inject CSS | low |
 | `renderer.script` | set `document.title` through a host-owned setter | medium |
-| `renderer.dom` | modify DOM | medium |
+| `renderer.dom` | read DOM via serialized `DomElement` snapshots (`query`/`observe`) | medium |
+| `renderer.storage` | read/write this plugin's own host-namespaced storage (strings, bounded) | low |
 | `electron.window` | modify window (`setOpacity`, `setVibrancy`) | high |
 | `electron.webContents` | page load, DevTools | — |
 | `electron.session` | UA, proxy, cookies | — |
 | `electron.ipc` | observe / intercept IPC | high |
-| `network.access` | internet access (domain whitelist) | — |
+| `network.access` | internet access (Core-side domain-whitelisted fetch via `ctx.network.request`) | — |
 | `network.proxy` | modify requests | high |
 | `runtime.unsafe` | raw Node / Electron (developer mode) | critical (opt-in, developer mode) |
 
@@ -223,7 +236,7 @@ Scaffolding CLI: `create-tronhawk-plugin`. Full API in `PLUGIN-SDK.md`.
 | 0 Foundation | Rust workspace, Tauri shell, SDK, test app | skeleton builds |
 | 1 Injection | electron-hook, IFEO, launcher fallback | launch test app → auto-inject → hello-world plugin runs |
 | 2 Renderer plugins | `.thx`, manifest, CSS+JS injection, CSS hot reload | ✅ CSS + hot reload; JS injection landed in Phase 3 |
-| 3 Main plugins | BrowserWindow API, window mod, permissions | ✅ window mod (setOpacity); glass (vibrancy/mica) is future |
+| 3 Main plugins | BrowserWindow API, window mod, permissions | ✅ window mod (setOpacity/setPosition/setSize) + glass (vibrancy/mica) |
 | 4 Manager UI | install, enable/disable, logs, permissions | usable manager — install/register, enable/disable, redacted control plane, three-stream logs |
 | 5 OSS prep | docs, examples, contribution guide | public-ready |
 

@@ -3,6 +3,7 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,14 +28,19 @@ const TOKEN_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// Clock-skew tolerance for launch-token `issued_at` (accept at most 5s in the future).
 const TOKEN_FUTURE_TOLERANCE_SECS: u64 = 5;
 const IMPLEMENTED_RENDERER_CAPABILITIES: &[&str] = &["renderer.css", "renderer.script"];
-const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] =
-    &["renderer.css", "renderer.script", "electron.window"];
+const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] = &[
+    "renderer.css",
+    "renderer.script",
+    "electron.window",
+    "network.access",
+];
 /// Level-2 capability set while Developer mode is enabled: the normal Level-2 set plus
 /// `runtime.unsafe`. Developer mode never bypasses the support level — Level 0/1 are unchanged.
 const IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES: &[&str] = &[
     "renderer.css",
     "renderer.script",
     "electron.window",
+    "network.access",
     "runtime.unsafe",
 ];
 const APPLICATION_ID_PREFIX: &str = "winexe-v1:";
@@ -43,6 +49,149 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_MAX_EVENTS: usize = 120;
 /// A log-rate entry idle for this long has its budget reset on the next event.
 const RATE_IDLE_RESET: Duration = Duration::from_secs(600);
+
+// --- Tier-2 `networkRequest` capability limits (all enforced Core-side) ----------------------
+/// Total wall-clock bound for one outbound request (connect + write + read, per hop).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of redirect hops Core follows; every hop is re-checked against the plugin's
+/// `network.domains` whitelist before it is attempted.
+const MAX_REDIRECTS: usize = 5;
+/// Maximum request body a plugin may send (bytes). The IPC frame cap is far smaller today, but
+/// this bound stays correct if the transport cap ever grows.
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+/// Maximum response body Core will read or return (bytes).
+const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+/// Maximum request headers a plugin may send.
+const MAX_REQUEST_HEADERS: usize = 64;
+/// Maximum response headers Core will relay back to the plugin.
+const MAX_RESPONSE_HEADERS: usize = 128;
+/// Maximum length of a single request header name/value and response header value (bytes).
+const MAX_HEADER_NAME_BYTES: usize = 128;
+const MAX_HEADER_VALUE_BYTES: usize = 8192;
+/// HTTP methods a plugin may ask Core to perform.
+const ALLOWED_REQUEST_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+/// Headers the transport must own; a plugin may not override them.
+const CORE_CONTROLLED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+];
+
+/// One outbound HTTP request Core performs on behalf of a plugin. The plugin never sees a
+/// socket; every field has already passed capability/whitelist/cap enforcement.
+struct OutboundRequest {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// The response Core relays back to the plugin as data (`status`, `headers`, `body`).
+struct OutboundResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// Test seam: Core performs HTTP through this single-shot (no redirect-following) transport.
+/// The production implementation is [`UreqTransport`]; tests substitute a fake so authorization,
+/// whitelisting, redirect re-checks, caps, and audit behavior are exercised deterministically
+/// without a real network. Transport errors are `Err(String)`; any HTTP status (including
+/// 4xx/5xx) is returned as data in `Ok`.
+trait HttpTransport: Send + Sync {
+    fn execute(&self, request: &OutboundRequest) -> Result<OutboundResponse, String>;
+}
+
+/// Production transport: `ureq` 2.x blocking client with a per-hop 30s timeout, automatic
+/// redirects disabled (Core re-checks each redirect target against the whitelist itself), gzip
+/// off (bodies stay verbatim), and the cookie feature off (no cookie jar).
+struct UreqTransport {
+    agent: ureq::Agent,
+}
+
+impl UreqTransport {
+    fn new() -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(REQUEST_TIMEOUT)
+            .redirects(0)
+            .user_agent(concat!("tronhawk-core/", env!("CARGO_PKG_VERSION")))
+            .build();
+        Self { agent }
+    }
+}
+
+impl HttpTransport for UreqTransport {
+    fn execute(&self, request: &OutboundRequest) -> Result<OutboundResponse, String> {
+        let mut http = self.agent.request(&request.method, &request.url);
+        for (name, value) in &request.headers {
+            http = http.set(name, value);
+        }
+        let response = if request.body.is_empty() {
+            http.call()
+        } else {
+            http.send_bytes(&request.body)
+        };
+        let response = match response {
+            Ok(response) => response,
+            // HTTP status codes (including 4xx/5xx) are data, not transport failures.
+            Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(transport)) => {
+                return Err(sanitize_transport_error(&transport.to_string()));
+            }
+        };
+        let status = response.status();
+        let header_names = response.headers_names();
+        let headers = header_names
+            .iter()
+            .filter_map(|name| {
+                // Keep the first value for a name; duplicates (e.g. multiple Set-Cookie) are
+                // collapsed when the response is relayed as a JSON header object anyway.
+                response
+                    .all(name)
+                    .into_iter()
+                    .next()
+                    .map(|value| (name.clone(), value.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let mut reader = response.into_reader();
+        let mut body = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = reader
+                .read(&mut chunk)
+                .map_err(|error| format!("read outbound response: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..count]);
+            if body.len() > MAX_RESPONSE_BODY_BYTES {
+                // Drop the reader without draining; the connection is abandoned (never pooled).
+                return Err(format!(
+                    "response body exceeds the {} MiB limit",
+                    MAX_RESPONSE_BODY_BYTES / (1024 * 1024)
+                ));
+            }
+        }
+        Ok(OutboundResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// A transport error may embed addresses but never secrets we hold; clamp it to a single line
+/// so a pathological message cannot inject control characters into a JSON error payload.
+fn sanitize_transport_error(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -157,6 +306,9 @@ pub struct CoreService {
     /// token. Deleting `launch.key` is a manual rotation: all previously minted launch tokens
     /// stop verifying, so every running target must relaunch to acquire a fresh one.
     launch_key: String,
+    /// Outbound HTTP client used by the Tier-2 `networkRequest` capability. Always Core-side:
+    /// plugins only ever send a URL + params over IPC and receive the response back.
+    http: Box<dyn HttpTransport>,
     inner: Mutex<ServiceInner>,
     logs: Mutex<LogStore>,
     /// HKLM IFEO registration backend (elevated write through the co-located injector launcher).
@@ -197,6 +349,7 @@ impl CoreService {
             control_token_path,
             control_token,
             launch_key,
+            http: Box::new(UreqTransport::new()),
             logs: Mutex::new(logs),
             inner: Mutex::new(ServiceInner {
                 state,
@@ -271,6 +424,12 @@ impl CoreService {
         }
 
         let application_id = claims.application_id;
+        // `networkRequest` performs outbound I/O (up to 30s per hop). Dispatch it before taking
+        // the request lock so a slow fetch can never stall plan/log/control requests on the same
+        // application; authorization takes the lock only briefly, then releases it for I/O.
+        if request.method == "networkRequest" {
+            return self.network_request(request, &application_id);
+        }
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return rpc_error(request.id, -32603, "internal error"),
@@ -371,7 +530,7 @@ impl CoreService {
             "appendRuntimeLogs" | "appendPluginLogs" => {
                 return rpc_error(request.id, -32003, "forbidden")
             }
-            "getExecutionPlan" | "renewSession" => {
+            "getExecutionPlan" | "renewSession" | "networkRequest" => {
                 return rpc_error(request.id, -32003, "forbidden")
             }
             _ => return rpc_error(request.id, -32601, "method not found"),
@@ -555,6 +714,371 @@ impl CoreService {
             request.id,
             serde_json::json!({ "accepted": params.events.len() }),
         )
+    }
+
+    /// Handle the Tier-2 `networkRequest` RPC (launch-token only). Authorization is derived from
+    /// the app's CURRENT execution plan (a plugin must be enabled right now with a granted
+    /// `network.access`, so a policy revoke or support-level change takes effect immediately),
+    /// and the request URL is checked against the plugin manifest's `network.domains` whitelist
+    /// (exact host / `*.` subdomain, port-aware). Only then does Core perform the HTTP(S)
+    /// request; the plugin never sees a socket. Redirects are followed Core-side, each re-checked
+    /// against the whitelist, up to [`MAX_REDIRECTS`].
+    fn network_request(
+        &self,
+        request: tronhawk_ipc::Request,
+        application_id: &str,
+    ) -> tronhawk_ipc::Response {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Params {
+            plugin_id: String,
+            url: String,
+            #[serde(default)]
+            method: Option<String>,
+            #[serde(default)]
+            headers: Option<BTreeMap<String, String>>,
+            #[serde(default)]
+            body: Option<String>,
+        }
+        let params: Params = match parse_params(request.params) {
+            Ok(params) => params,
+            Err(_) => return rpc_error(request.id, -32602, "invalid params"),
+        };
+
+        // Authorize under a brief lock: derive the current plan, require a live `network.access`
+        // grant, and clone the plugin manifest's domain whitelist. The lock is released before
+        // any network I/O so a slow fetch cannot stall other requests.
+        let whitelist = {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return rpc_error(request.id, -32603, "internal error"),
+            };
+            match self.authorize_network_request(
+                &mut inner,
+                application_id,
+                &params.plugin_id,
+                request.id,
+            ) {
+                Ok(whitelist) => whitelist,
+                Err(response) => return response,
+            }
+        };
+
+        if params.url.len() > 16 * 1024 {
+            return rpc_error(request.id, -32602, "url is too long");
+        }
+        let url = match url::Url::parse(&params.url) {
+            Ok(url) => url,
+            Err(_) => {
+                return rpc_error(
+                    request.id,
+                    -32602,
+                    "url must be an absolute http:// or https:// URL",
+                )
+            }
+        };
+        let (host, port, url) = match validate_request_url(url) {
+            Ok(triple) => triple,
+            Err((code, message)) => return rpc_error(request.id, code, message),
+        };
+        if !domain_allows(&host, port, &whitelist) {
+            return rpc_error(
+                request.id,
+                -32003,
+                format!(
+                    "host `{host}` is not allowed by plugin `{}` network.domains",
+                    params.plugin_id
+                ),
+            );
+        }
+
+        // Method / body / header validation (request-side caps -> invalid params).
+        let method = params.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+        if !ALLOWED_REQUEST_METHODS.contains(&method.as_str()) {
+            return rpc_error(
+                request.id,
+                -32602,
+                format!(
+                    "unsupported method `{method}` (allowed: GET, HEAD, POST, PUT, PATCH, DELETE)"
+                ),
+            );
+        }
+        let mut body = Vec::new();
+        if let Some(body_text) = &params.body {
+            if body_text.len() > MAX_REQUEST_BODY_BYTES {
+                return rpc_error(
+                    request.id,
+                    -32602,
+                    format!(
+                        "request body exceeds the {} MiB limit",
+                        MAX_REQUEST_BODY_BYTES / (1024 * 1024)
+                    ),
+                );
+            }
+            if (method == "GET" || method == "HEAD") && !body_text.is_empty() {
+                return rpc_error(
+                    request.id,
+                    -32602,
+                    "request bodies are not allowed for GET or HEAD",
+                );
+            }
+            body = body_text.as_bytes().to_vec();
+        }
+        let headers = params.headers.unwrap_or_default();
+        if headers.len() > MAX_REQUEST_HEADERS {
+            return rpc_error(
+                request.id,
+                -32602,
+                format!("too many request headers (limit {MAX_REQUEST_HEADERS})"),
+            );
+        }
+        for (name, value) in &headers {
+            if name.is_empty() || name.len() > MAX_HEADER_NAME_BYTES || !valid_header_name(name) {
+                return rpc_error(
+                    request.id,
+                    -32602,
+                    format!("invalid request header name `{name}`"),
+                );
+            }
+            let lower = name.to_ascii_lowercase();
+            if CORE_CONTROLLED_HEADERS.contains(&lower.as_str()) {
+                return rpc_error(
+                    request.id,
+                    -32602,
+                    format!("header `{name}` is controlled by Core"),
+                );
+            }
+            if value.len() > MAX_HEADER_VALUE_BYTES || value.contains('\r') || value.contains('\n') {
+                return rpc_error(
+                    request.id,
+                    -32602,
+                    format!("invalid request header value for `{name}`"),
+                );
+            }
+        }
+        let header_pairs: Vec<(String, String)> = headers.into_iter().collect();
+
+        // Perform the request Core-side, following redirects manually so each hop is re-checked
+        // against the whitelist. `current_host` drives cross-host header stripping and the audit.
+        let mut current_url = url;
+        let mut current_host = (host.clone(), port);
+        let mut method = method;
+        // Header set for the next hop; on a cross-host redirect, credential headers the plugin
+        // attached for the original host are dropped so they never leak to a different host.
+        let mut hop_headers = header_pairs.clone();
+        let mut redirects_followed = 0usize;
+        let response = loop {
+            let outbound = OutboundRequest {
+                url: current_url.to_string(),
+                method: method.clone(),
+                headers: hop_headers.clone(),
+                body: body.clone(),
+            };
+            let response = match self.http.execute(&outbound) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.append_network_audit(
+                        application_id,
+                        &params.plugin_id,
+                        &current_host.0,
+                        0,
+                        0,
+                    );
+                    return rpc_error(request.id, -32004, format!("network request failed: {error}"));
+                }
+            };
+            if !is_redirect_status(response.status) {
+                break response;
+            }
+            let Some(location) = response_header(&response.headers, "location") else {
+                // A 3xx without a Location header is a final response (data).
+                break response;
+            };
+            if redirects_followed >= MAX_REDIRECTS {
+                self.append_network_audit(
+                    application_id,
+                    &params.plugin_id,
+                    &current_host.0,
+                    0,
+                    0,
+                );
+                return rpc_error(
+                    request.id,
+                    -32004,
+                    format!("too many redirects (limit {MAX_REDIRECTS})"),
+                );
+            }
+            let next_url = match current_url.join(location) {
+                Ok(next) => next,
+                Err(_) => {
+                    return rpc_error(
+                        request.id,
+                        -32004,
+                        "redirect location could not be resolved",
+                    )
+                }
+            };
+            let (next_host, next_port, next_url) = match validate_request_url(next_url) {
+                Ok(triple) => triple,
+                Err((code, message)) => return rpc_error(request.id, code, message),
+            };
+            if !domain_allows(&next_host, next_port, &whitelist) {
+                return rpc_error(
+                    request.id,
+                    -32003,
+                    format!(
+                        "redirect target host `{next_host}` is not allowed by plugin `{}` \
+                         network.domains",
+                        params.plugin_id
+                    ),
+                );
+            }
+            // RFC 7231/7230 redirect semantics: 303 forces GET (HEAD stays HEAD); 301/302
+            // downgrade other methods to GET and drop the body; 307/308 resend the same method
+            // and body. Credential headers are not forwarded across hosts.
+            if response.status == 303 {
+                if method != "HEAD" {
+                    method = "GET".into();
+                }
+                body.clear();
+            } else if matches!(response.status, 301 | 302)
+                && method != "GET"
+                && method != "HEAD"
+            {
+                method = "GET".into();
+                body.clear();
+            }
+            let _ = response; // not used again; next hop is a fresh request
+            redirects_followed += 1;
+            if next_host != current_host.0 {
+                hop_headers.retain(|(name, _)| {
+                    let lower = name.to_ascii_lowercase();
+                    lower != "authorization" && lower != "cookie"
+                });
+            }
+            current_url = next_url;
+            current_host = (next_host, next_port);
+        };
+
+        // Response-side caps -> resource-limit rejections (HTTP status is always data).
+        if response.headers.len() > MAX_RESPONSE_HEADERS {
+            return rpc_error(
+                request.id,
+                -32004,
+                format!("response has too many headers (limit {MAX_RESPONSE_HEADERS})"),
+            );
+        }
+        for (name, value) in &response.headers {
+            if name.len() > MAX_HEADER_NAME_BYTES || value.len() > MAX_HEADER_VALUE_BYTES {
+                return rpc_error(request.id, -32004, "response headers exceed the size limits");
+            }
+        }
+        if response.body.len() > MAX_RESPONSE_BODY_BYTES {
+            return rpc_error(
+                request.id,
+                -32004,
+                format!(
+                    "response body exceeds the {} MiB limit",
+                    MAX_RESPONSE_BODY_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+        self.append_network_audit(
+            application_id,
+            &params.plugin_id,
+            &current_host.0,
+            response.status,
+            response.body.len(),
+        );
+        let header_map: BTreeMap<String, String> = response.headers.iter().cloned().collect();
+        let body_text = String::from_utf8_lossy(&response.body).into_owned();
+        rpc_ok(
+            request.id,
+            serde_json::json!({
+                "status": response.status,
+                "headers": header_map,
+                "body": body_text,
+            }),
+        )
+    }
+
+    /// Verify that `plugin_id` is in the CURRENT execution plan for `application_id` with a
+    /// granted `network.access`, then return the plugin manifest's (lowercased) `network.domains`
+    /// whitelist. A plugin that is not in the plan, is not granted the capability, or declares no
+    /// whitelist is rejected fail-closed with a structured error response.
+    fn authorize_network_request(
+        &self,
+        inner: &mut ServiceInner,
+        application_id: &str,
+        plugin_id: &str,
+        request_id: u64,
+    ) -> Result<Vec<String>, tronhawk_ipc::Response> {
+        let plan = match self.execution_plan(inner, application_id) {
+            Ok(plan) => plan,
+            Err(_) => return Err(rpc_error(request_id, -32603, "internal error")),
+        };
+        let Some(grant) = plan.plugins.iter().find(|plugin| plugin.id == plugin_id) else {
+            return Err(rpc_error(
+                request_id,
+                -32003,
+                format!("plugin `{plugin_id}` is not in the current execution plan"),
+            ));
+        };
+        if !grant.granted.iter().any(|capability| capability == "network.access") {
+            return Err(rpc_error(
+                request_id,
+                -32003,
+                format!("plugin `{plugin_id}` is not granted `network.access`"),
+            ));
+        }
+        // The plan derives from the same installed-plugin snapshot, so the manifest is present.
+        let installed = match self.installed_plugins(inner) {
+            Ok(plugins) => plugins,
+            Err(_) => return Err(rpc_error(request_id, -32603, "internal error")),
+        };
+        let Some(plugin) = installed.iter().find(|plugin| plugin.id == plugin_id) else {
+            return Err(rpc_error(request_id, -32603, "internal error"));
+        };
+        let whitelist = plugin
+            .network
+            .as_ref()
+            .map(|network| network.domains.clone())
+            .unwrap_or_default();
+        if whitelist.is_empty() {
+            return Err(rpc_error(
+                request_id,
+                -32003,
+                format!(
+                    "plugin `{plugin_id}` declares no `network.domains`; the domain whitelist is empty"
+                ),
+            ));
+        }
+        Ok(whitelist)
+    }
+
+    /// Best-effort plugin-stream audit record for a Core-performed `network.request` (host,
+    /// status, bytes). A failed exchange is recorded with status 0 and bytes 0 so attempts are
+    /// accountable even when the upstream never answered. Never includes the URL query, the
+    /// request headers, or the response body.
+    fn append_network_audit(
+        &self,
+        application_id: &str,
+        plugin_id: &str,
+        host: &str,
+        status: u16,
+        bytes: usize,
+    ) {
+        if let Ok(mut logs) = self.logs.lock() {
+            let message = format!("network.request host={host} status={status} bytes={bytes}");
+            let _ = logs.append(NewLogRecord {
+                stream: LogStream::Plugin,
+                level: LogLevel::Info,
+                code: "network.request",
+                application_id,
+                plugin_id: Some(plugin_id),
+                message: &message,
+            });
+        }
     }
 
     fn register_application(
@@ -1505,6 +2029,97 @@ fn capabilities_for_support_level(level: u8, developer_mode: bool) -> &'static [
     }
 }
 
+/// Validate an http(s) URL for the `networkRequest` capability. Returns `(lowercased_host,
+/// effective_port, url)`, or a `(code, message)` rejection. `http`/`https` schemes only, no
+/// credentials, no IPv6 literals (the manifest whitelist cannot contain them), and a real host.
+fn validate_request_url(
+    url: url::Url,
+) -> Result<(String, u16, url::Url), (i32, String)> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
+            -32003,
+            "only http:// and https:// URLs may be requested".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err((-32003, "URLs containing credentials are not allowed".into()));
+    }
+    if matches!(url.host(), Some(url::Host::Ipv6(_))) {
+        return Err((
+            -32003,
+            "IPv6 literal hosts cannot match a network.domains whitelist".into(),
+        ));
+    }
+    let Some(raw_host) = url.host_str() else {
+        return Err((-32003, "url must include a host".into()));
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return Err((-32003, "url must include a port".into()));
+    };
+    let host = raw_host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err((-32003, "url must include a host".into()));
+    }
+    Ok((host, port, url))
+}
+
+/// Whether `host:port` is allowed by the plugin's lowercased `network.domains` whitelist: an
+/// entry without a port matches any effective port of that host; an entry `host:port` must match
+/// the effective port exactly; a leading `*.` entry matches the base host and any of its
+/// subdomains (never the bare base).
+fn domain_allows(host: &str, port: u16, whitelist: &[String]) -> bool {
+    whitelist
+        .iter()
+        .any(|entry| domain_entry_allows(entry, host, port))
+}
+
+fn domain_entry_allows(entry: &str, host: &str, port: u16) -> bool {
+    let (entry_host, entry_port) = split_domain_entry(entry);
+    if let Some(expected) = entry_port {
+        if expected != port {
+            return false;
+        }
+    }
+    match entry_host.strip_prefix("*.") {
+        Some(base) => {
+            // host is a strict subdomain of `base` (there is a label boundary before `base`).
+            host.len() > base.len()
+                && host.ends_with(base)
+                && host.as_bytes()[host.len() - base.len() - 1] == b'.'
+        }
+        None => entry_host == host,
+    }
+}
+
+/// Split a validated `network.domains` entry (`host` or `host:port`, wildcard preserved) into
+/// its lowercased host part and optional port. Entries are canonicalized by manifest validation,
+/// so this cannot encounter IPv6 or empty ports.
+fn split_domain_entry(entry: &str) -> (&str, Option<u16>) {
+    match entry.rfind(':') {
+        Some(index) => (&entry[..index], entry[index + 1..].parse().ok()),
+        None => (entry, None),
+    }
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    (300..400).contains(&status)
+}
+
+fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// HTTP/1.1 token characters (RFC 7230): ASCII letters/digits plus `!#$%&'*+-.^_`|~`.
+fn valid_header_name(name: &str) -> bool {
+    name.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+    })
+}
+
 /// Create `config_root` and verify it is a real directory that is not a symlink/reparse
 /// point, mirroring the log directory hardening. `create_dir_all` alone follows symlinks, so
 /// a pre-planted symlink at the config path would otherwise redirect state/token writes.
@@ -2178,6 +2793,38 @@ mod tests {
                     "main": "main.js"
                 },
                 "config": config,
+            });
+            std::fs::write(
+                source.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let package = self.0.join(format!("{directory}.thx"));
+            tronhawk_package::pack(&source, &package).unwrap();
+            package
+        }
+
+        /// A fixture like [`package`] whose manifest declares the `network.access` permission
+        /// (plus `renderer.css`, so a policy can put the plugin in a plan without granting
+        /// `network.access` — for grant-rejection tests) and a `network.domains` allowlist.
+        fn package_with_network(
+            &self,
+            directory: &str,
+            id: &str,
+            version: &str,
+            domains: &[&str],
+        ) -> PathBuf {
+            let source = self.0.join(directory);
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("renderer.js"), "renderer source").unwrap();
+            let manifest = serde_json::json!({
+                "id": id,
+                "name": "Daemon test plugin",
+                "version": version,
+                "author": "Test",
+                "tronhawk": "^0.1",
+                "permissions": ["renderer.css", "network.access"],
+                "network": { "domains": domains },
             });
             std::fs::write(
                 source.join("manifest.json"),
@@ -5402,5 +6049,587 @@ mod tests {
             !legacy.0.exists(),
             "the legacy root must be removed after a successful migration"
         );
+    }
+
+    // --- Tier-2 networkRequest (manifest network.domains whitelist) --------------------------
+
+    /// Deterministic transport seam: returns a scripted sequence of responses and records every
+    /// request URL it is asked to fetch, so redirect re-checks are observable without a network.
+    struct FakeTransport {
+        responses: std::sync::Mutex<VecDeque<Result<OutboundResponse, String>>>,
+        requests: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: Vec<Result<OutboundResponse, String>>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requested_urls(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl HttpTransport for std::sync::Arc<FakeTransport> {
+        fn execute(&self, request: &OutboundRequest) -> Result<OutboundResponse, String> {
+            self.requests.lock().unwrap().push(request.url.clone());
+            match self.responses.lock().unwrap().pop_front() {
+                Some(response) => response,
+                None => Err("no fake response queued".to_string()),
+            }
+        }
+    }
+
+    fn http_response(status: u16, headers: &[(&str, &str)], body: &str) -> OutboundResponse {
+        OutboundResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// Register a Level-2 app, install the network plugin, enable it with the given grants, mint
+    /// a launch token, and swap in `fake` as the transport.
+    fn network_env(
+        temp: &TempRoot,
+        domains: &[&str],
+        grants: &[&str],
+        fake: std::sync::Arc<FakeTransport>,
+    ) -> (CoreService, String) {
+        let executable = temp.executable("Network.exe");
+        let package =
+            temp.package_with_network("net-plugin", "com.example.daemon", "1.0.0", domains);
+        let (mut service, control) = service(temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            grants,
+        ));
+        service.http = Box::new(fake);
+        let token = launch_token(&service, &control, &executable);
+        (service, token)
+    }
+
+    fn network_request_params(
+        url: &str,
+        extra: Option<(&str, serde_json::Value)>,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({
+            "pluginId": "com.example.daemon",
+            "url": url,
+        });
+        if let Some((key, value)) = extra {
+            params[key] = value;
+        }
+        params
+    }
+
+    #[test]
+    fn network_request_is_launch_token_only_and_validates_params() {
+        let temp = TempRoot::new("network-routing");
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            FakeTransport::new(vec![Ok(http_response(200, &[], "ok"))]),
+        );
+
+        // Control tokens are forbidden from the launch-only RPC.
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        assert_eq!(
+            error_code(call(
+                &service,
+                &control,
+                "networkRequest",
+                network_request_params("https://api.example.com/", None),
+            )),
+            -32003
+        );
+
+        // Launch token routes to the handler: params problems are -32602, not a route miss.
+        for params in [
+            serde_json::json!({ "url": "https://api.example.com/" }), // missing pluginId
+            serde_json::json!({ "pluginId": "com.example.daemon" }), // missing url
+            network_request_params("https://api.example.com/", Some(("extra", serde_json::json!(1)))), // unknown field
+            network_request_params("https://api.example.com/", Some(("pluginId", serde_json::json!(7)))), // wrong type
+        ] {
+            assert_eq!(
+                error_code(call(&service, &token, "networkRequest", params)),
+                -32602
+            );
+        }
+        // An unparseable URL is an invalid-param rejection.
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("not a url at all", None),
+        );
+        assert_eq!(error_code(response.clone()), -32602);
+        assert!(error_message(response).contains("absolute"));
+    }
+
+    #[test]
+    fn network_request_rejects_unknown_plugins_and_missing_grants() {
+        let temp = TempRoot::new("network-grants");
+        let fake = FakeTransport::new(vec![Ok(http_response(200, &[], "ok"))]);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            fake.clone(),
+        );
+
+        // A plugin id that is not installed / not in the plan is rejected fail-closed.
+        let unknown = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params(
+                "https://api.example.com/",
+                Some(("pluginId", serde_json::json!("com.example.ghost"))),
+            ),
+        );
+        assert_eq!(error_code(unknown.clone()), -32003);
+        assert!(error_message(unknown).contains("not in the current execution plan"));
+        assert!(fake.requested_urls().is_empty(), "no fetch may occur");
+    }
+
+    #[test]
+    fn network_request_requires_a_live_network_access_grant() {
+        let temp = TempRoot::new("network-not-granted");
+        let fake = FakeTransport::new(vec![Ok(http_response(200, &[], "ok"))]);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["renderer.css"], // plugin IS in the plan, but without network.access
+            fake.clone(),
+        );
+
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        let message = error_message(response);
+        assert!(message.contains("not granted"), "{message}");
+        assert!(message.contains("network.access"), "{message}");
+        assert!(fake.requested_urls().is_empty());
+
+        // Disabling the policy removes the plugin from the current plan entirely.
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        let app = service
+            .inner
+            .lock()
+            .unwrap()
+            .state
+            .applications
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        ok(call(
+            &service,
+            &control,
+            "setApplicationPluginPolicy",
+            serde_json::json!({
+                "applicationId": app,
+                "pluginId": "com.example.daemon",
+                "enabled": false,
+                "grants": [],
+            }),
+        ));
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        assert!(error_message(response).contains("not in the current execution plan"));
+    }
+
+    #[test]
+    fn network_request_whitelist_match_returns_data_and_emits_audit_log() {
+        let temp = TempRoot::new("network-success");
+        let fake = FakeTransport::new(vec![
+            Ok(http_response(
+                200,
+                &[("content-type", "application/json")],
+                "{\"ok\":true}",
+            )),
+            Ok(http_response(
+                200,
+                &[("content-type", "application/json")],
+                "{\"ok\":true}",
+            )),
+            Ok(http_response(204, &[], "")),
+        ]);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com", "*.example.org", "127.0.0.1:8080"],
+            &["network.access"],
+            fake.clone(),
+        );
+
+        // Exact host match.
+        let result = ok(call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/v1/data?q=1", None),
+        ));
+        assert_eq!(result["status"], 200);
+        assert_eq!(result["headers"]["content-type"], "application/json");
+        assert_eq!(result["body"], "{\"ok\":true}");
+        assert_eq!(
+            fake.requested_urls(),
+            vec!["https://api.example.com/v1/data?q=1".to_string()]
+        );
+
+        // A wildcard subdomain and an IPv4+port entry also match (each is a fresh request).
+        ok(call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://deep.api.example.org/x", None),
+        ));
+        ok(call(
+            &service,
+            &token,
+            "networkRequest",
+            serde_json::json!({
+                "pluginId": "com.example.daemon",
+                "url": "http://127.0.0.1:8080/health",
+                "method": "GET",
+            }),
+        ));
+        assert_eq!(fake.requested_urls().len(), 3);
+
+        // Every performed exchange is audited on the plugin stream with domain/status/bytes.
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        let logs = query_logs(&service, &control);
+        let audits: Vec<&serde_json::Value> = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["code"] == "network.request")
+            .collect();
+        assert_eq!(audits.len(), 3);
+        assert!(audits.iter().all(|event| {
+            event["stream"] == "plugin"
+                && event["pluginId"] == "com.example.daemon"
+                && event["applicationId"].is_string()
+        }));
+        let first = audits
+            .iter()
+            .find(|event| {
+                event["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("host=api.example.com")
+            })
+            .expect("audit must name the requested domain");
+        let message = first["message"].as_str().unwrap();
+        assert!(message.contains("status=200"), "{message}");
+        assert!(message.contains("bytes=11"), "{message}");
+    }
+
+    #[test]
+    fn network_request_rejects_mismatched_hosts_and_url_forms() {
+        let temp = TempRoot::new("network-whitelist");
+        let fake = FakeTransport::new(Vec::new());
+        let (service, token) = network_env(
+            &temp,
+            &["good.example.com", "*.example.org"],
+            &["network.access"],
+            fake.clone(),
+        );
+
+        // Exact mismatched host.
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://evil.example.net/x", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        assert!(error_message(response).contains("not allowed"));
+        // The `*.` wildcard matches subdomains but never the bare base host.
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://example.org/", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        assert!(error_message(response).contains("not allowed"));
+        // Non-http(s) scheme and credentials are policy rejections, not fetches.
+        for (url, needle) in [
+            ("ftp://good.example.com/x", "http:// and https://"),
+            ("https://user:pass@good.example.com/x", "credentials"),
+            ("http://[::1]:8080/x", "IPv6"),
+        ] {
+            let response = call(
+                &service,
+                &token,
+                "networkRequest",
+                network_request_params(url, None),
+            );
+            assert_eq!(error_code(response.clone()), -32003, "url: {url}");
+            assert!(error_message(response).contains(needle), "url: {url}");
+        }
+        // None of the rejected URLs may have reached the transport.
+        assert!(fake.requested_urls().is_empty());
+    }
+
+    #[test]
+    fn network_request_matches_ported_whitelist_entries_exactly() {
+        let temp = TempRoot::new("network-whitelist-port");
+        let fake = FakeTransport::new(vec![Ok(http_response(204, &[], ""))]);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com:8443"],
+            &["network.access"],
+            fake.clone(),
+        );
+
+        // The same host on the default port does not match a ported entry.
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        assert!(error_message(response).contains("not allowed"));
+        assert!(fake.requested_urls().is_empty());
+
+        // An explicit matching port is allowed and 204 is relayed as data.
+        let result = ok(call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("http://api.example.com:8443/", None),
+        ));
+        assert_eq!(result["status"], 204);
+        assert_eq!(fake.requested_urls(), vec!["http://api.example.com:8443/".to_string()]);
+    }
+
+    #[test]
+    fn network_request_fails_closed_when_domain_whitelist_is_empty() {
+        let temp = TempRoot::new("network-whitelist-empty");
+        let empty_fake = FakeTransport::new(vec![Ok(http_response(200, &[], "unused"))]);
+        let (service, token) = network_env(&temp, &[], &["network.access"], empty_fake.clone());
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        assert!(error_message(response).contains("whitelist is empty"));
+        assert!(empty_fake.requested_urls().is_empty());
+    }
+
+    #[test]
+    fn network_request_enforces_request_caps() {
+        let temp = TempRoot::new("network-request-caps");
+        let fake = FakeTransport::new(Vec::new());
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            fake.clone(),
+        );
+
+        // More than 64 request headers.
+        let many_headers: BTreeMap<String, String> = (0..65)
+            .map(|i| (format!("x-header-{i:02}"), "v".to_string()))
+            .collect();
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", Some(("headers", serde_json::to_value(&many_headers).unwrap()))),
+        );
+        assert_eq!(error_code(response.clone()), -32602);
+        assert!(error_message(response).contains("64"));
+
+        // Invalid / transport-controlled header names and newline injection.
+        for bad_name in ["bad name", "hdr:colon", "connection", "HoSt"] {
+            let params = serde_json::json!({
+                "pluginId": "com.example.daemon",
+                "url": "https://api.example.com/",
+                "headers": { bad_name: "v" },
+            });
+            assert_eq!(
+                error_code(call(&service, &token, "networkRequest", params)),
+                -32602,
+                "header `{bad_name}` must be rejected"
+            );
+        }
+        let params = serde_json::json!({
+            "pluginId": "com.example.daemon",
+            "url": "https://api.example.com/",
+            "headers": { "x-test": "a\r\nb" },
+        });
+        assert_eq!(error_code(call(&service, &token, "networkRequest", params)), -32602);
+
+        // Request body > 1 MiB, and a body on GET.
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", Some(("body", serde_json::json!("x".repeat(1024 * 1024 + 1))))),
+        );
+        assert_eq!(error_code(response.clone()), -32602);
+        assert!(error_message(response).contains("1 MiB"));
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", Some(("body", serde_json::json!("x")))),
+        );
+        assert_eq!(error_code(response.clone()), -32602);
+        assert!(error_message(response).contains("GET or HEAD"));
+
+        // Unsupported method.
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", Some(("method", serde_json::json!("TRACE")))),
+        );
+        assert_eq!(error_code(response.clone()), -32602);
+        assert!(fake.requested_urls().is_empty());
+    }
+
+    #[test]
+    fn network_request_enforces_response_and_redirect_caps() {
+        // Response body over 1 MiB is rejected (-32004) without leaking the body.
+        let temp = TempRoot::new("network-response-cap");
+        let fake = FakeTransport::new(vec![Ok(OutboundResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![0_u8; 1024 * 1024 + 1],
+        })]);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            fake.clone(),
+        );
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/", None),
+        );
+        assert_eq!(error_code(response.clone()), -32004);
+        assert!(error_message(response).contains("1 MiB"));
+
+        // More than 5 redirects is rejected after the 6th redirect is seen.
+        let temp = TempRoot::new("network-redirect-cap");
+        let many_redirects = (0..6)
+            .map(|i| Ok(http_response(302, &[("location", &format!("/r{i}"))], "")))
+            .collect();
+        let fake = FakeTransport::new(many_redirects);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            fake.clone(),
+        );
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/start", None),
+        );
+        assert_eq!(error_code(response.clone()), -32004);
+        assert!(error_message(response).contains("too many redirects"));
+        assert_eq!(fake.requested_urls().len(), 6);
+
+        // A redirect to a host outside the whitelist is rejected and never fetched.
+        let temp = TempRoot::new("network-redirect-host");
+        let fake = FakeTransport::new(vec![Ok(http_response(
+            302,
+            &[("location", "https://evil.example.net/steal")],
+            "",
+        ))]);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            fake.clone(),
+        );
+        let response = call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/start", None),
+        );
+        assert_eq!(error_code(response.clone()), -32003);
+        assert!(error_message(response).contains("redirect target host"));
+        assert_eq!(fake.requested_urls().len(), 1);
+    }
+
+    #[test]
+    fn network_request_follows_up_to_five_redirects_within_the_whitelist() {
+        let temp = TempRoot::new("network-redirect-ok");
+        let mut responses = (0..5)
+            .map(|i| Ok(http_response(302, &[("location", &format!("/hop{i}"))], "")))
+            .collect::<Vec<_>>();
+        responses.push(Ok(http_response(200, &[("x-final", "yes")], "done")));
+        let fake = FakeTransport::new(responses);
+        let (service, token) = network_env(
+            &temp,
+            &["api.example.com"],
+            &["network.access"],
+            fake.clone(),
+        );
+
+        let result = ok(call(
+            &service,
+            &token,
+            "networkRequest",
+            network_request_params("https://api.example.com/start", None),
+        ));
+        assert_eq!(result["status"], 200);
+        assert_eq!(result["body"], "done");
+        // Five redirects -> six requests, each hop on the whitelisted host.
+        let urls = fake.requested_urls();
+        assert_eq!(urls.len(), 6);
+        assert_eq!(urls[0], "https://api.example.com/start");
+        assert_eq!(urls[1], "https://api.example.com/hop0");
+        assert_eq!(urls[5], "https://api.example.com/hop4");
+
+        // The successful exchange is audited once with the final hop's status/bytes.
+        let control = std::fs::read_to_string(service.control_token_path()).unwrap();
+        let logs = query_logs(&service, &control);
+        let audits: Vec<&serde_json::Value> = logs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["code"] == "network.request")
+            .collect();
+        assert_eq!(audits.len(), 1);
+        let message = audits[0]["message"].as_str().unwrap();
+        assert!(message.contains("host=api.example.com"), "{message}");
+        assert!(message.contains("status=200"), "{message}");
+        assert!(message.contains("bytes=4"), "{message}");
     }
 }

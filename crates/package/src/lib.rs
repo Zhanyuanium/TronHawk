@@ -83,6 +83,21 @@ pub struct ConfigField {
     pub label: Option<String>,
 }
 
+/// The optional `network` allowlist a plugin declares for the `network.access` permission:
+/// `"network": { "domains": ["example.com", "*.example.org:8443"] }`.
+///
+/// Every domain is a hostname or `host[:port]` (an explicitly-listed IPv4 is allowed; IPv6
+/// literals, schemes, and paths are not), with an optional leading `*.` wildcard on a hostname
+/// label. Entries are lowercased during manifest validation so Core's matching is
+/// case-insensitive without any runtime normalization. A plugin granted `network.access` whose
+/// manifest declares no `network` (or an empty `domains` list) is rejected at request time —
+/// Core fails closed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkManifest {
+    pub domains: Vec<String>,
+}
+
 /// A parsed plugin manifest and its execution plan (MVP: declared == granted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plugin {
@@ -103,6 +118,10 @@ pub struct Plugin {
     /// `ctx.config`; the Manager renders a settings form from this schema.
     #[serde(default)]
     pub config: BTreeMap<String, ConfigField>,
+    /// Optional `network.domains` outbound allowlist backing the `network.access` permission.
+    /// `#[serde(default)]` keeps manifests written before the field existed loadable.
+    #[serde(default)]
+    pub network: Option<NetworkManifest>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -121,6 +140,8 @@ struct Manifest {
     entry: Option<Entry>,
     #[serde(default)]
     config: serde_json::Value,
+    #[serde(default)]
+    network: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -172,6 +193,14 @@ pub fn validate_manifest_schema_for_host(
     // carried in typed [`Plugin::config`] form by [`validate_manifest_for_host`].
     if !m.config.is_null() {
         validate_config_schema(&m.config)?;
+    }
+
+    // `network`: the optional `network.domains` outbound allowlist for `network.access`.
+    // Raw-value validation (before any typed parse) so each rejection carries a precise message
+    // naming the offending entry. The JSON value is carried in typed [`Plugin::network`] form by
+    // [`validate_manifest_for_host`].
+    if !m.network.is_null() {
+        validate_network_schema(&m.network)?;
     }
 
     // Permissions: known + no duplicates.
@@ -389,6 +418,228 @@ fn validate_config_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the raw `manifest.json` `network` value (the `network.domains` allowlist). Rules:
+/// `network` must be an object whose only key is `domains`, `domains` must be an array of at
+/// most [`MAX_NETWORK_DOMAINS`] strings, each entry must be a valid lowercase hostname,
+/// `host[:port]`, IPv4, or leading-`*.`-wildcard hostname (no scheme, path, credentials, IPv6
+/// literal, or bare `*`), and no two entries may be equal after case-folding. An absent or
+/// `null` `network` is fine (older manifests); plugins that then request `network.access` are
+/// rejected at request time because their whitelist is empty (fail closed).
+const MAX_NETWORK_DOMAINS: usize = 64;
+
+fn validate_network_schema(network: &serde_json::Value) -> Result<(), String> {
+    let object = network
+        .as_object()
+        .ok_or_else(|| "`network` must be an object with a `domains` array".to_string())?;
+    for key in object.keys() {
+        if key != "domains" {
+            return Err(format!(
+                "`network` has an unknown key `{key}` (allowed: `domains`)"
+            ));
+        }
+    }
+    let domains = object
+        .get("domains")
+        .ok_or_else(|| "`network` requires a `domains` array".to_string())?;
+    let domains = domains
+        .as_array()
+        .ok_or_else(|| "`network.domains` must be an array of hostname strings".to_string())?;
+    if domains.len() > MAX_NETWORK_DOMAINS {
+        return Err(format!(
+            "`network.domains` declares {} entries; the maximum is {MAX_NETWORK_DOMAINS}",
+            domains.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in domains {
+        let entry = entry
+            .as_str()
+            .ok_or_else(|| "`network.domains` entries must be strings".to_string())?;
+        let normalized = normalize_network_domain(entry)?;
+        if !seen.insert(normalized) {
+            return Err(format!(
+                "`network.domains` contains a duplicate entry `{entry}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `network.domains` entry and return its canonical lowercased form (`host` or
+/// `host:port`, wildcard preserved). Rejects schemes, paths, credentials (`@`), IPv6
+/// literals / bare IP-literal brackets, and anything that is not a hostname / wildcard
+/// hostname / IPv4 with an optional decimal port.
+fn normalize_network_domain(entry: &str) -> Result<String, String> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err("`network.domains` entry must not be empty".to_string());
+    }
+    if entry.contains("://") {
+        return Err(format!(
+            "`network.domains` entry `{entry}` must not include a scheme (e.g. `http://`)"
+        ));
+    }
+    if entry.contains('/') {
+        return Err(format!(
+            "`network.domains` entry `{entry}` must not include a path"
+        ));
+    }
+    if entry.contains('@') {
+        return Err(format!(
+            "`network.domains` entry `{entry}` must not contain credentials"
+        ));
+    }
+    if entry.starts_with('[') {
+        return Err(format!(
+            "`network.domains` entry `{entry}` must not be an IP-literal; use a hostname, a \
+             leading `*.` wildcard, or a plain IPv4 address"
+        ));
+    }
+    // At most one `:` (the port separator). More colons mean IPv6, which is not allowed.
+    let mut segments = entry.split(':');
+    let host = segments.next().unwrap_or("");
+    let port = segments.next();
+    if segments.next().is_some() {
+        return Err(format!(
+            "`network.domains` entry `{entry}` must not use IPv6 literal syntax"
+        ));
+    }
+    if host.is_empty() {
+        return Err(format!("`network.domains` entry `{entry}` has an empty host"));
+    }
+    let host = host.to_ascii_lowercase();
+    let host = normalize_network_host(&host)
+        .map_err(|message| format!("`network.domains` entry `{entry}`: {message}"))?;
+    if let Some(port) = port {
+        if port.is_empty() {
+            return Err(format!(
+                "`network.domains` entry `{entry}` has an empty port"
+            ));
+        }
+        if port.len() > 5 || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!(
+                "`network.domains` entry `{entry}` has an invalid port (must be 1-65535)"
+            ));
+        }
+        let number: u16 = port.parse().map_err(|_| {
+            format!("`network.domains` entry `{entry}` has an invalid port (must be 1-65535)")
+        })?;
+        if number == 0 {
+            return Err(format!(
+                "`network.domains` entry `{entry}` has an invalid port (must be 1-65535)"
+            ));
+        }
+        return Ok(format!("{host}:{port}"));
+    }
+    Ok(host)
+}
+
+/// Validate the host part of a domain entry: a lowercased hostname (or leading-`*.` wildcard of
+/// one) or an explicitly-listed IPv4 address. Returns it unchanged on success.
+fn normalize_network_host(host: &str) -> Result<String, String> {
+    let wildcard = host.starts_with("*.");
+    let base = if wildcard { &host[2..] } else { host };
+    if base.contains('*') {
+        return Err("`*` is only allowed as a leading `*.` wildcard (e.g. `*.example.com`)".into());
+    }
+    if wildcard {
+        if base.is_empty() {
+            return Err("a `*.` wildcard must be followed by a hostname".into());
+        }
+        if !base.contains('.') {
+            return Err(format!(
+                "a `*.` wildcard must cover a full multi-label hostname, not a bare label \
+                 (`*.{base}`)"
+            ));
+        }
+    }
+    // A dotted string made only of digits and dots must be a well-formed IPv4 address; reject
+    // anything that merely looks numeric (5-label "1.2.3.4.5", octets over 255, ...) so no
+    // ambiguous near-IP string slips into the allowlist.
+    let ipv4_candidate = !wildcard
+        && base.contains('.')
+        && base
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.');
+    if ipv4_candidate {
+        let octets: Vec<&str> = base.split('.').collect();
+        if octets.len() != 4 {
+            return Err(format!("`{base}` is not a valid IPv4 address (needs four octets)"));
+        }
+        for octet in &octets {
+            if octet.is_empty() || octet.len() > 3 || !octet.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("`{base}` is not a valid IPv4 address"));
+            }
+            octet
+                .parse::<u8>()
+                .map_err(|_| format!("`{base}` is not a valid IPv4 address"))?;
+        }
+        return Ok(host.to_string());
+    }
+    validate_hostname_labels(base)?;
+    Ok(host.to_string())
+}
+
+/// Validate that `host` is a plain hostname: total length <= 253, every label 1-63 chars of
+/// ASCII letters/digits/hyphens, no label starting or ending with a hyphen, and no empty or
+/// leading/trailing labels.
+fn validate_hostname_labels(host: &str) -> Result<(), String> {
+    if host.len() > 253 {
+        return Err("hostname must be at most 253 characters".into());
+    }
+    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return Err("hostname must not contain empty labels".into());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("hostname must not contain empty labels".into());
+        }
+        if label.len() > 63 {
+            return Err(format!("hostname label `{label}` is longer than 63 characters"));
+        }
+        let bytes = label.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+            return Err(format!(
+                "hostname label `{label}` must start and end with an alphanumeric character"
+            ));
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err(format!(
+                "hostname label `{label}` contains an invalid character \
+                 (letters, digits, and hyphens only)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a validated raw `network` JSON value into its typed form. Only call after
+/// [`validate_network_schema`] succeeded, so the typed parse cannot fail. `null` (and absence)
+/// map to `None`, matching the schema-validation gate.
+fn parse_network_manifest(
+    network: Option<&serde_json::Value>,
+) -> Result<Option<NetworkManifest>, String> {
+    match network {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => {
+            let mut manifest: NetworkManifest = serde_json::from_value(value.clone())
+                .map_err(|e| format!("manifest network: {e}"))?;
+            // Validation guaranteed well-formed entries; lowercase them so Core's allowlist
+            // matching is case-insensitive without normalizing at request time.
+            for domain in &mut manifest.domains {
+                *domain = domain.to_ascii_lowercase();
+            }
+            Ok(Some(manifest))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Parse a validated raw `config` JSON value into its typed per-key schema
 /// ([`ConfigField`] map). Only call after [`validate_config_schema`] succeeded, so the typed
 /// parse cannot fail.
@@ -467,6 +718,7 @@ fn validate_manifest_for_host(
     };
 
     let config = parse_plugin_config(manifest.get("config"))?;
+    let network = parse_network_manifest(manifest.get("network"))?;
 
     Ok(Plugin {
         id,
@@ -479,6 +731,7 @@ fn validate_manifest_for_host(
         renderer,
         main,
         config,
+        network,
     })
 }
 
@@ -1537,6 +1790,159 @@ mod tests {
         assert_eq!(
             plugin.config["title"].default.as_ref().unwrap(),
             &serde_json::json!("hi")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // --- `network` schema ------------------------------------------------------
+
+    fn manifest_with_network(domains: serde_json::Value) -> serde_json::Value {
+        let mut manifest = manifest_json("^0.1");
+        manifest["network"] = serde_json::json!({ "domains": domains });
+        manifest
+    }
+
+    #[test]
+    fn network_schema_accepts_valid_domains() {
+        // Plain hostnames, subdomains, leading `*.` wildcards (with or without a port), an
+        // explicitly-listed IPv4, and mixed-case entries all pass.
+        let m = manifest_with_network(serde_json::json!([
+            "example.com",
+            "sub.example.com",
+            "api.example.com:8443",
+            "*.example.org",
+            "*.deep.sub.example.net:443",
+            "192.168.0.1",
+            "10.0.0.1:8080",
+            "UPPER.example.com",
+        ]));
+        validate_manifest_schema(&m).unwrap();
+        // An empty `domains` array is schema-valid (Core rejects requests at runtime: fail
+        // closed), and an absent `network` is valid for older manifests.
+        validate_manifest_schema(&manifest_with_network(serde_json::json!([]))).unwrap();
+        validate_manifest_schema(&manifest_json("^0.1")).unwrap();
+        // Exactly 64 entries is the boundary; 64 is fine.
+        let many: Vec<String> = (0..64).map(|i| format!("host{i:02}.example.com")).collect();
+        validate_manifest_schema(&manifest_with_network(serde_json::json!(many))).unwrap();
+    }
+
+    #[test]
+    fn network_schema_rejects_invalid_domains() {
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("scheme", serde_json::json!("https://example.com")),
+            ("scheme", serde_json::json!("ftp://example.com")),
+            ("path", serde_json::json!("example.com/path")),
+            ("path", serde_json::json!("*.example.com/x")),
+            ("credentials", serde_json::json!("user@example.com")),
+            ("IP-literal", serde_json::json!("[::1]")),
+            ("IPv6", serde_json::json!("2001:db8::1")),
+            ("IPv6", serde_json::json!("2001:db8::1:8080")),
+            ("wildcard", serde_json::json!("*")),
+            ("wildcard", serde_json::json!("*.com")),
+            ("wildcard", serde_json::json!("foo*bar.com")),
+            ("hostname", serde_json::json!("-bad.com")),
+            ("hostname", serde_json::json!("bad-.com")),
+            ("hostname", serde_json::json!("under_score.com")),
+            ("hostname", serde_json::json!("exa mple.com")),
+            ("empty labels", serde_json::json!("a..b.com")),
+            ("empty labels", serde_json::json!(".example.com")),
+            ("IPv4", serde_json::json!("1.2.3.999")),
+            ("IPv4", serde_json::json!("1.2.3.4.5")),
+            ("port", serde_json::json!("example.com:")),
+            ("port", serde_json::json!("example.com:0")),
+            ("port", serde_json::json!("example.com:65536")),
+            ("port", serde_json::json!("example.com:abc")),
+            ("port", serde_json::json!("example.com:8080.5")),
+        ];
+        for (needle, entry) in cases {
+            let m = manifest_with_network(serde_json::json!([entry]));
+            let err = validate_manifest_schema(&m).unwrap_err();
+            assert!(
+                err.contains(needle),
+                "entry `{entry}` should be rejected with `{needle}`, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_schema_rejects_duplicates_and_oversized_lists() {
+        // Case-folded duplicates are duplicates.
+        let dup = manifest_with_network(serde_json::json!([
+            "example.com",
+            "EXAMPLE.com",
+        ]));
+        let err = validate_manifest_schema(&dup).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        // Identical duplicates and duplicate wildcards are duplicates too.
+        let dup2 = manifest_with_network(serde_json::json!([
+            "*.example.com",
+            "*.EXAMPLE.com",
+        ]));
+        let err2 = validate_manifest_schema(&dup2).unwrap_err();
+        assert!(err2.contains("duplicate"), "{err2}");
+        // A wildcard and its concrete host are distinct entries and do not collide.
+        let distinct = manifest_with_network(serde_json::json!([
+            "example.com",
+            "*.example.com",
+        ]));
+        validate_manifest_schema(&distinct).unwrap();
+        // More than 64 entries is rejected.
+        let many: Vec<String> = (0..65).map(|i| format!("host{i:02}.example.com")).collect();
+        let oversized = manifest_with_network(serde_json::json!(many));
+        let err3 = validate_manifest_schema(&oversized).unwrap_err();
+        assert!(err3.contains("maximum is 64"), "{err3}");
+    }
+
+    #[test]
+    fn network_schema_rejects_malformed_network_objects() {
+        for (network, needle) in [
+            (serde_json::json!("not-an-object"), "must be an object"),
+            (serde_json::json!({ "domains": "x" }), "must be an array"),
+            (serde_json::json!({ "domains": [42] }), "must be strings"),
+            (serde_json::json!({ "bogus": [] }), "unknown key"),
+            (serde_json::json!({}), "requires a `domains` array"),
+            (
+                serde_json::json!({ "domains": ["example.com"], "extra": [] }),
+                "unknown key",
+            ),
+        ] {
+            let mut m = manifest_json("^0.1");
+            m["network"] = network;
+            let err = validate_manifest_schema(&m).unwrap_err();
+            assert!(err.contains(needle), "expected `{needle}` in: {err}");
+        }
+    }
+
+    #[test]
+    fn plugin_dir_with_network_carries_lowercased_domains_on_the_plugin() {
+        let dir = tmp_ws().join("network-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "com.example.network",
+                "name": "Network plugin",
+                "version": "1.0.0",
+                "author": "A",
+                "tronhawk": "^0.1",
+                "permissions": ["network.access"],
+                "network": {
+                    "domains": ["api.Example.com", "*.example.org:8443", "192.168.0.1"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let plugin = load_plugin_dir(&dir).unwrap();
+        let network = plugin.network.expect("network manifest must be carried on the Plugin");
+        assert_eq!(
+            network.domains,
+            vec![
+                "api.example.com".to_string(),
+                "*.example.org:8443".to_string(),
+                "192.168.0.1".to_string(),
+            ],
+            "domains must be lowercased for Core matching"
         );
         std::fs::remove_dir_all(dir).ok();
     }

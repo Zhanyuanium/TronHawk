@@ -19,20 +19,24 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | renderer | `ctx.script.setDocumentTitle` (`renderer.script`) | Implemented — host-owned fixed assignment; input is data, never JS source |
 | main | `ctx.window.onCreated` / `setOpacity` / `setSize` / `setPosition` (`electron.window`) | Implemented |
 | main | `ctx.onLoad` / `ctx.onRendererReady` / `ctx.onUnload` (`electron.window`) | Implemented — main-context lifecycle events: `onLoad` fires once at app ready (a late subscription fires immediately), `onRendererReady` per window per load/navigation (a late subscription replays already-loaded windows), `onUnload` per window webContents destroy; synchronous `undefined` callbacks invoked under the CPU-deadline contract, fail-closed unregister on throw/timeout/non-void |
-| renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Future — needs async host functions (the sync QuickJS variant cannot drain pending jobs) |
+| both | async `activate` / `deactivate` (module lifecycle) | Implemented — a hook may return `undefined` synchronously or a Promise the runtime **drains** before the plugin is considered activated/deactivated (ADR 0008); lifecycle-event callbacks stay synchronous `undefined` |
+| renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Implemented — async host functions (ADR 0008): `query` returns a Promise of a serialized `DomElement` snapshot (never a live node), `observe` polls on a ~100 ms cadence and delivers snapshots to a synchronous callback |
+| renderer | `ctx.storage.get` / `ctx.storage.set` (`renderer.storage`) | Implemented — renderer-only, host-namespaced string storage (`tronhawk:<pluginId>:<key>`), values host-bounded (ADR 0008) |
 | main | `ctx.window.setVibrancy` / `setMica` (`electron.window`) | Implemented — macOS vibrancy via `setVibrancy`, Windows 11 Mica via `setBackgroundMaterial`; structured-log no-op on other platforms or when the Electron API is absent |
 | main | `ctx.webContents.*` | Future |
 | both | `ctx.session.*` | Future |
 | both | `ctx.ipc.*` | Future |
-| both | `ctx.network.request` (`network.access`) | Future — typed, but Core permission + domain-whitelist enforcement is not wired yet |
+| both | `ctx.network.request` (`network.access`) | Implemented — Core-side domain-whitelisted fetch (ADR 0008); the promise rejects with a catchable error on a non-whitelisted URL or network failure |
 | both | `ctx.config.get` / `ctx.config.set` | Implemented — get reads the per-app-per-plugin config snapshot (schema defaults overlaid with stored values); set is a no-op for sandboxed plugins (config is persisted only through the Manager settings form) |
 | both | `ctx.raw` (`runtime.unsafe`, developer mode) | Implemented — raw host execution while developer mode is on + `runtime.unsafe` granted |
 
-**Lifecycle contract (binding):** `activate`, `deactivate`, the main-context lifecycle-event
-callbacks (`ctx.onLoad` / `ctx.onRendererReady` / `ctx.onUnload`), and window callbacks must
-complete **synchronously** and return JavaScript `undefined`. The runtime rejects any other result,
-including a Promise/thenable. Async (Promise-returning) lifecycle is future — it requires
-QuickJS pending-job draining and a `deactivate(ctx)` call that is not yet invoked.
+**Lifecycle contract (binding):** `activate` / `deactivate` may return JavaScript `undefined`
+(synchronously) **or a Promise** that resolves to nothing — when a hook returns a Promise the runtime
+**drains** it (via QuickJS pending-job execution) before the plugin is considered activated /
+deactivated (ADR 0008). Lifecycle-event and window callbacks (`ctx.onLoad` / `ctx.onRendererReady` /
+`ctx.onUnload` / `ctx.window.onCreated`, and `ctx.dom.observe` callbacks) stay **synchronous** and
+must return JavaScript `undefined` — the runtime never drains their return value and unregisters any
+callback that throws, exceeds its CPU deadline, or returns a non-`undefined` value.
 
 ## Plugin structure
 
@@ -72,11 +76,12 @@ NOT the SDK npm version.
 | `renderer.css` | `ctx.css.insert()` / `ctx.css.remove()` | low |
 | `renderer.script` | `ctx.script.setDocumentTitle()` | medium |
 | `renderer.dom` | `ctx.dom.query()` / `ctx.dom.observe()` | medium |
+| `renderer.storage` | `ctx.storage.get()` / `set()` — renderer-only, host-namespaced per-plugin keyspace | low |
 | `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` / `setMica()` | high |
 | `electron.webContents` | DevTools, navigation, preload | — |
 | `electron.session` | User-Agent, proxy, cookies (future) | — |
 | `electron.ipc` | observe / intercept IPC (future) | high |
-| `network.access` | `ctx.network.request()` (domain whitelist) | — |
+| `network.access` | `ctx.network.request()` (Core-side domain-whitelisted fetch) | — |
 | `network.proxy` | request interception / modification | high |
 | `runtime.unsafe` | `ctx.raw` (Electron / Node) | critical (dev only) |
 
@@ -89,25 +94,36 @@ export default {
 }
 ```
 
-`activate` / `deactivate` must complete synchronously and return JavaScript `undefined` (a normal
-function with no `return` statement does this). The runtime rejects any other result, including a
-Promise/thenable, and does not activate that plugin. Async lifecycle hooks are not supported until
-the QuickJS runtime implements pending-job draining.
+`activate` / `deactivate` may complete **synchronously** (a normal function with no `return`
+statement returns `undefined`) **or return a Promise**; when a hook returns a Promise the runtime
+**drains** it (ADR 0008) before the plugin is considered activated / deactivated — e.g.
+`async activate(ctx) { await ctx.dom.query("..."); }` is valid. A returned Promise must resolve to
+nothing; a Promise resolving with a value is rejected. Lifecycle-**event** callbacks and
+`ctx.dom.observe` callbacks are **not** drained — they stay synchronous `undefined`-returning (see
+"Main lifecycle events").
 
 ## Renderer API (`RendererContext`)
 
 ```ts
-interface RendererContext extends PluginContext { css; dom; script; }
+interface RendererContext extends PluginContext { css; dom; script; storage; }
 ```
 
 - `ctx.css.insert(css)` / `ctx.css.remove(id)` — stylesheets carry owner plugin id + unique id
   (`tronhawk://glass-ui/style-1`) to avoid conflicts between plugins.
-- `ctx.dom.query(selector)`; `ctx.dom.observe(selector, cb)` — MutationObserver abstraction, for
-  React/Vue dynamic DOM.
+- `ctx.dom.query(selector)` returns `Promise<DomElement | null>`; `ctx.dom.observe(selector, cb)`
+  returns a disconnect function — for React/Vue dynamic DOM. Requires `renderer.dom`.
+- `DomElement` is a **serialized snapshot, not a live node**: a real DOM `Element` cannot cross the
+  QuickJS sandbox boundary, so the host copies `nodeId`, `tag`, `id`, `className`, `attrs`, `text`,
+  and — when present — `rect`, `value`, `checked`, `href`, `src` at snapshot time. Later page
+  mutations do not update an already-returned snapshot; re-query to refresh. `query` resolves the
+  first element matching `selector`, or `null`. `observe` is a **polling** bridge (~100 ms cadence),
+  so a delivered snapshot can lag live DOM by up to one poll interval; each newly observed node is
+  delivered once to `cb` (as a snapshot), and `cb` must complete synchronously and return
+  `undefined`. There is no synchronous `dom.query` — a snapshot is inherently async to capture.
 - `ctx.script.setDocumentTitle(title)` — requires `renderer.script`; sets only `document.title`.
   The host serializes the title as data and does not execute plugin-provided JavaScript source.
-- (future) `ctx.storage.get()/set()` — unified access to localStorage/IndexedDB (do NOT touch raw
-  `localStorage`).
+- `ctx.storage.get(key)` / `ctx.storage.set(key, value)` — requires `renderer.storage`; renderer-only
+  host-namespaced string storage. See [Storage](#storage).
 
 ## Main API (`MainContext`)
 
@@ -162,8 +178,20 @@ Emit semantics:
   cannot override the plugin identity or add arbitrary event fields. Non-string values are ignored.
   Messages are bounded client-side and validated again by Core. `console.log()` is not captured and
   is not formal logging.
-- Network only via `await ctx.network.request({ url, method })` (requires `network.access`); Core
-  enforces permission + domain whitelist + logging/blocking. Interception requires `network.proxy`.
+- Network only via `await ctx.network.request({ url, method })` (requires `network.access`);
+  implemented (ADR 0008): Core enforces permission + a **domain whitelist** and the fetch runs
+  Core-side, so the plugin never opens a raw socket. The returned promise **rejects with a catchable
+  error** when the URL is outside the whitelist or the fetch fails — always `try/catch` around
+  `await ctx.network.request(...)`. Interception requires `network.proxy`.
+
+## Storage
+
+`ctx.storage` is renderer-only host storage (requires `renderer.storage`). Keys and values are
+strings. Every entry is stored host-side under the owning plugin's keyspace and namespaced by the
+host as `tronhawk:<pluginId>:<key>` — a plugin can only read and write its **own** entries, never
+another plugin's, and never the page's raw `localStorage`/IndexedDB (do not touch those from a
+sandboxed plugin). Values are host-bounded. `get(key)` resolves the stored value, or `null` when
+absent; `set(key, value)` persists it. This is per-install plugin state, not a page-data bridge.
 
 ## Config
 

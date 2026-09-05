@@ -11,6 +11,11 @@ serde_json = "1"
 rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
+# Tier-2 `networkRequest` capability: a small blocking HTTP(S) client. `ureq` 2.x is
+# dependency-light (rustls with the `ring` provider; no async runtime, no cookie jar when the
+# `cookies` feature is off). gzip is disabled so response bodies stay verbatim and bounded.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
