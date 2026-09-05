@@ -16,8 +16,10 @@ jobs:
           bun-version: "1.4.0"
       - name: Build runtime.js bundle
         working-directory: crates/runtime/js
+        shell: pwsh
         run: |
           bun install
+          New-Item -ItemType Directory -Force -Path ../assets | Out-Null
           bun run build
       - name: Build core + injector
         run: cargo build -p tronhawk-core -p tronhawk-injector

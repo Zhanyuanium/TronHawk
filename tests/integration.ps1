@@ -150,6 +150,7 @@ try {
 
     Push-Location (Join-Path $repo "crates\runtime\js")
     try {
+        New-Item -ItemType Directory -Force -Path (Join-Path $repo "crates\runtime\assets") | Out-Null
         bun install 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "runtime dependency installation failed with exit code $LASTEXITCODE" }
         bun run build 2>&1 | Out-Null
