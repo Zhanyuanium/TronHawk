@@ -420,6 +420,7 @@ fn validate_record(record: &LogRecord) -> Result<(), String> {
                     | "core.iefo.registered"
                     | "core.iefo.unregistered"
                     | "core.iefo.write_failed"
+                    | "core.renderer.script_required"
             )
         }
     };

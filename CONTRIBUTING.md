@@ -9,6 +9,14 @@ changes — especially the **module ownership boundaries** below — and use
 `docs/SPEC.md` for requirements/decisions and `docs/PLUGIN-SDK.md` for the
 public plugin API.
 
+> Standalone plugin development uses the `@tronhawk/sdk` types + testing helpers
+> and the standalone `@tronhawk/cli` (`tronhawk` binary) with the same-version
+> `tronhawk-pack` engine — no TronHawk checkout needed (see `docs/PLUGIN-SDK.md`
+> and `tools/create-tronhawk-plugin/README.md`). This guide covers developing
+> TronHawk itself inside this monorepo (build, test, pack, bundle); the
+> `cargo run -p` monorepo pack flow is a contributors-only alternative (from the
+> repo root only).
+
 ## Prerequisites
 
 - Windows 10/11 x64 with the MSVC C++ build tools

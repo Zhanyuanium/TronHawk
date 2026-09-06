@@ -74,8 +74,10 @@ shape:
 does **not** extract or read the referenced file. At least one of `main` (Electron main process),
 `renderer` (Chromium renderer), or `css` (declared CSS-as-data theme) must be present.
 
-> In the workspace examples the entry path is the source file (e.g. `src/main.ts`) because there is no
-> build step yet; in a published `.thx` the path is whatever the package ships (typically compiled JS).
+> Workspace example plugins point `entry` at executable CommonJS `.js` files
+> (e.g. `src/main.js`); TypeScript sources may be kept alongside for
+> type-checking but are never the runtime entry. In a published `.thx` the
+> path is whatever the package ships.
 
 ### `config` surface
 
@@ -84,7 +86,7 @@ It is optional and must match the package manifest exactly. Example (entry + mat
 
 ```json
 {
-  "entry": { "main": "main.ts" },
+  "entry": { "main": "main.js" },
   "config": { "opacity": { "type": "number", "default": 0.9 } }
 }
 ```
@@ -141,7 +143,7 @@ Two entries, matching the workspace example plugins `window-effects` (main) and 
       "author": "Example",
       "tronhawk": "^0.1",
       "description": "Softens each new window to 90% opacity as the host creates it.",
-      "entry": { "main": "src/main.ts" },
+      "entry": { "main": "src/main.js" },
       "permissions": ["electron.window"],
       "tags": ["windows", "opacity", "effect"],
       "homepage": "https://example.tronhawk.dev/window-effects",
@@ -162,7 +164,7 @@ Two entries, matching the workspace example plugins `window-effects` (main) and 
       "author": "Example",
       "tronhawk": "^0.1",
       "description": "Recolors the page selection highlight and renames the window title.",
-      "entry": { "css": "style.css", "renderer": "src/renderer.ts" },
+      "entry": { "css": "style.css", "renderer": "src/renderer.js" },
       "permissions": ["renderer.css", "renderer.script"],
       "tags": ["renderer", "css", "title"],
       "apps": [

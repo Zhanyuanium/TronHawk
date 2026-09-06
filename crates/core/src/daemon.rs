@@ -294,6 +294,13 @@ struct ServiceInner {
     state: DaemonState,
     plugin_cache: Option<PluginCache>,
     log_rates: HashMap<String, LogRate>,
+    /// Edge-triggered record of renderer-gate drop events already emitted, keyed by
+    /// `(application_id, plugin_id)` with the effective-grant fingerprint as the value.
+    /// `execution_plan` is recomputed on every ~2s runtime poll (plus log/network
+    /// authorization recomputes), so the `core.renderer.script_required` drop event is
+    /// recorded only on state entry or an effective-grant change for the pair — repeats
+    /// with identical effective grants are side-effect free and stay out of the log.
+    renderer_gate_drops: HashMap<(String, String), String>,
     /// Autostart Run-entry backend. Swappable so daemon tests can inject a fake; production
     /// always uses the Windows `reg`-backed [`RunKeyAutostart`].
     autostart: Arc<dyn AutostartStore>,
@@ -370,6 +377,7 @@ impl CoreService {
                 state,
                 plugin_cache: None,
                 log_rates: HashMap::new(),
+                renderer_gate_drops: HashMap::new(),
                 autostart: Arc::new(RunKeyAutostart),
             }),
             iefo_writer: Arc::new(LauncherIefoWriter),
@@ -1176,6 +1184,12 @@ impl CoreService {
         next.applications.remove(&params.application_id);
         write_state(&self.state_path, &next).map_err(RouterError::Internal)?;
         inner.state = next;
+        // Drop this application's renderer-gate edge state so a later re-registration of
+        // the same executable path (same deterministic application id) re-logs the first
+        // drop instead of inheriting the pre-removal fingerprint.
+        inner
+            .renderer_gate_drops
+            .retain(|key, _| key.0 != params.application_id);
         self.append_core_event(
             &params.application_id,
             None,
@@ -1907,10 +1921,19 @@ impl CoreService {
         application_id: &str,
     ) -> Result<ExecutionPlan, RouterError> {
         let Some(application) = inner.state.applications.get(application_id) else {
+            // Unknown application: no drops are active, so forget any edge state for it
+            // (e.g. after `removeApplication`) — a future re-registration re-logs once.
+            inner
+                .renderer_gate_drops
+                .retain(|key, _| key.0 != application_id);
             return Ok(empty_plan());
         };
         let application = application.clone();
         if application.support_level == 0 {
+            // Level 0 serves an empty plan: same edge-state reset as above.
+            inner
+                .renderer_gate_drops
+                .retain(|key, _| key.0 != application_id);
             return Ok(empty_plan());
         }
         let supported = capabilities_for_support_level(
@@ -1918,6 +1941,10 @@ impl CoreService {
             inner.state.global.developer_mode,
         );
         let mut grants = Vec::new();
+        // (application, plugin) pairs whose renderer payload is dropped by this computation.
+        // Survivors prune stale edge state below so a plugin that leaves the plan (disabled /
+        // policy removed / no effective grants) re-logs once if it is dropped again later.
+        let mut active_drops: HashSet<(String, String)> = HashSet::new();
         for mut plugin in self.installed_plugins(inner)? {
             let Some(policy) = application.plugins.get(&plugin.id) else {
                 continue;
@@ -1944,12 +1971,59 @@ impl CoreService {
             {
                 plugin.css = None;
             }
-            if !plugin
+            // 0.1 unified contract, two layers (mirrors `tronhawk-package` manifest
+            // validation): pack-time — `entry.renderer` MUST declare `renderer.script`;
+            // runtime — the effective grant must contain `renderer.script` or the
+            // Developer-mode `runtime.unsafe` escape hatch. `renderer.dom` /
+            // `renderer.storage` / `renderer.css` are additional capabilities only and never
+            // substitute for the gate at either layer. Without the gate the renderer payload
+            // is dropped here and never runs.
+            //
+            // The drop event is edge-triggered: this function is recomputed on every ~2s
+            // runtime poll (plus log/network authorization recomputes), so
+            // `core.renderer.script_required` is recorded only on state entry or an
+            // effective-grant change for the (application, plugin) pair — repeats with
+            // identical effective grants are side-effect free.
+            let has_renderer_payload = plugin.renderer.is_some();
+            let has_renderer_gate = plugin
                 .permissions
                 .iter()
-                .any(|grant| grant == "renderer.script" || grant == "runtime.unsafe")
-            {
+                .any(|grant| grant == "renderer.script" || grant == "runtime.unsafe");
+            if !has_renderer_gate && has_renderer_payload {
+                let key = (application_id.to_owned(), plugin.id.clone());
+                // Effective grants were already intersected above, so their join is the
+                // transition fingerprint: a policy/revision change re-arms the event once.
+                let fingerprint = plugin.permissions.join("\x1f");
+                active_drops.insert(key.clone());
+                if inner.renderer_gate_drops.get(&key) != Some(&fingerprint) {
+                    let plugin_id = plugin.id.clone();
+                    let message = format!(
+                        "renderer payload dropped for plugin `{plugin_id}`: effective grants lack \
+                         both `renderer.script` and `runtime.unsafe` (`renderer.script` is the \
+                         execution gate for renderer JS, `runtime.unsafe` is the Developer-mode \
+                         escape hatch that unlocks it at runtime; pack-time rule `tronhawk-package` \
+                         still requires `entry.renderer` to declare `renderer.script`; \
+                         `renderer.dom`/`renderer.storage`/`renderer.css` are additional \
+                         capabilities only)"
+                    );
+                    self.append_core_event(
+                        application_id,
+                        Some(&plugin_id),
+                        "core.renderer.script_required",
+                        &message,
+                    );
+                    inner.renderer_gate_drops.insert(key, fingerprint);
+                }
                 plugin.renderer = None;
+            } else {
+                if !has_renderer_gate {
+                    plugin.renderer = None;
+                }
+                // Gate satisfied, or nothing to drop: leave the edge state so a future
+                // re-drop logs again.
+                inner
+                    .renderer_gate_drops
+                    .remove(&(application_id.to_owned(), plugin.id.clone()));
             }
             if !plugin
                 .permissions
@@ -1967,6 +2041,13 @@ impl CoreService {
             grant.config = config;
             grants.push(grant);
         }
+        // Prune only this application's stale drop state: a plugin that left this
+        // application's plan this round keeps no edge state (see `active_drops`),
+        // while other applications' entries survive interleaved polls (A→B→A with an
+        // unchanged fingerprint must not re-log).
+        inner
+            .renderer_gate_drops
+            .retain(|key, _| key.0 != application_id || active_drops.contains(key));
         Ok(ExecutionPlan {
             revision: hash_json(&grants),
             plugins: grants,
@@ -3557,6 +3638,295 @@ mod tests {
             serde_json::json!(["electron.window"])
         );
         assert_eq!(two_plan["plugins"][0]["main"], "main source");
+    }
+
+    #[test]
+    fn execution_plan_drops_renderer_without_script_gate_and_logs_event() {
+        // 0.1 unified contract, two layers: pack-time `entry.renderer` must declare
+        // `renderer.script`; runtime needs an effective `renderer.script` grant or the
+        // `runtime.unsafe` escape hatch. A plugin whose effective grants lack both (here
+        // only `renderer.dom`, an additional capability) keeps its plan slot but ships a
+        // nulled renderer payload, plus a `core.renderer.script_required` event so the drop
+        // is observable via `queryLogs`. Mirrors the `tronhawk-package` pack-time rule that
+        // rejects `entry.renderer` without `renderer.script`.
+        let temp = TempRoot::new("renderer-gate");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        // The fixture manifest declares `renderer.script`, so granting only `renderer.dom`
+        // is a valid policy that exercises the runtime gate (e.g. a legacy or
+        // policy-stripped plugin that passed install but cannot run renderer JS).
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.dom"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        let execution = plan(&service, &token);
+        assert_eq!(
+            execution["plugins"][0]["granted"],
+            serde_json::json!(["renderer.dom"])
+        );
+        assert!(
+            execution["plugins"][0]["renderer"].is_null(),
+            "renderer payload without the `renderer.script` gate must be nulled, got: {execution}"
+        );
+
+        let logs = query_logs(&service, &control);
+        let event = logs["events"].as_array().unwrap().iter().find(|event| {
+            event["code"] == "core.renderer.script_required"
+                && event["pluginId"] == "com.example.daemon"
+        });
+        let event = event.unwrap_or_else(|| {
+            panic!(
+                "expected a `core.renderer.script_required` event for the dropped renderer, got: {logs}"
+            )
+        });
+        assert_eq!(event["stream"], "core");
+        assert_eq!(event["applicationId"], application_id);
+        let message = event["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("renderer.script"),
+            "event must name the required gate, got: {message}"
+        );
+        assert!(
+            message.contains("runtime.unsafe"),
+            "event must name the escape hatch that is also missing, got: {message}"
+        );
+        assert!(
+            message.contains("tronhawk-package"),
+            "event must reference the pack-time rule, got: {message}"
+        );
+    }
+
+    #[test]
+    fn execution_plan_renderer_gate_drop_logs_once_per_effective_grants() {
+        // Gate 1 Finding 1: `execution_plan` is recomputed on every ~2s runtime poll (plus
+        // log/network authorization recomputes), so the `core.renderer.script_required`
+        // drop event must be edge-triggered per (application, plugin, effective grants):
+        // repeats with identical effective grants stay side-effect free, while an
+        // effective-grant change or a re-drop after recovery logs exactly once more.
+        let temp = TempRoot::new("renderer-gate-dedup");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.dom"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        let gate_events = || -> Vec<serde_json::Value> {
+            query_logs(&service, &control)["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event["code"] == "core.renderer.script_required"
+                        && event["pluginId"] == "com.example.daemon"
+                })
+                .cloned()
+                .collect()
+        };
+        // Poll storm with identical effective grants: payload stays nulled, one event total.
+        for _ in 0..3 {
+            let execution = plan(&service, &token);
+            assert!(
+                execution["plugins"][0]["renderer"].is_null(),
+                "renderer payload without the gate must stay nulled, got: {execution}"
+            );
+        }
+        assert_eq!(
+            gate_events().len(),
+            1,
+            "repeated plans with identical effective grants must not duplicate the event"
+        );
+        // A different gateless effective policy is a new transition: exactly one more event,
+        // and repeats of it stay quiet.
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.css"],
+        ));
+        assert!(plan(&service, &token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
+        assert!(plan(&service, &token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
+        // Granting the gate recovers (payload runs, no new event) and clears the edge state,
+        // so dropping again afterwards logs once more.
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.script"],
+        ));
+        let execution = plan(&service, &token);
+        assert_eq!(
+            execution["plugins"][0]["renderer"],
+            serde_json::json!("renderer source"),
+            "renderer payload must run once the gate is granted, got: {execution}"
+        );
+        assert_eq!(gate_events().len(), 2);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.dom"],
+        ));
+        assert!(plan(&service, &token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 3);
+        assert!(plan(&service, &token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 3);
+    }
+
+    #[test]
+    fn execution_plan_renderer_gate_drop_survives_interleaved_application_polls() {
+        // Gate 1 Finding 1 (multi-app scope): `active_drops` only covers the application
+        // under computation, so pruning must stay scoped to it. A→B→A polls with an
+        // unchanged fingerprint log exactly twice total (once per application) and the
+        // interleaved repeats stay side-effect free.
+        let temp = TempRoot::new("renderer-gate-interleaved");
+        let app_a = temp.executable("A.exe");
+        let app_b = temp.executable("B.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let app_a_id = register(&service, &control, &app_a, 2);
+        let app_b_id = register(&service, &control, &app_b, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &app_a_id,
+            true,
+            &["renderer.dom"],
+        ));
+        ok(set_policy(
+            &service,
+            &control,
+            &app_b_id,
+            true,
+            &["renderer.dom"],
+        ));
+        let token_a = launch_token(&service, &control, &app_a);
+        let token_b = launch_token(&service, &control, &app_b);
+        let gate_events = || -> Vec<serde_json::Value> {
+            query_logs(&service, &control)["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event["code"] == "core.renderer.script_required"
+                        && event["pluginId"] == "com.example.daemon"
+                })
+                .cloned()
+                .collect()
+        };
+        // A logs its first drop.
+        assert!(plan(&service, &token_a)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 1);
+        // B logs its own first drop without wiping A's edge state.
+        assert!(plan(&service, &token_b)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
+        // Alternating repeats with identical fingerprints add nothing.
+        assert!(plan(&service, &token_a)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
+        assert!(plan(&service, &token_b)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
+        assert!(plan(&service, &token_a)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
+        // One drop event per application.
+        let events = gate_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["applicationId"] == app_a_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["applicationId"] == app_b_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn remove_application_clears_renderer_gate_edge_state() {
+        // Gate 1 Finding 1 (remove scope): removing an application drops its
+        // renderer-gate edge state, so re-registering the same executable path (same
+        // deterministic application id) re-logs the first drop afterwards.
+        let temp = TempRoot::new("renderer-gate-remove");
+        let executable = temp.executable("App.exe");
+        let package = temp.package("plugin", "com.example.daemon", "1.0.0");
+        let (service, control) = service(&temp);
+        let application_id = register(&service, &control, &executable, 2);
+        install_package(&service, &control, &package);
+        ok(set_policy(
+            &service,
+            &control,
+            &application_id,
+            true,
+            &["renderer.dom"],
+        ));
+        let token = launch_token(&service, &control, &executable);
+        let gate_events = || -> Vec<serde_json::Value> {
+            query_logs(&service, &control)["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event["code"] == "core.renderer.script_required"
+                        && event["pluginId"] == "com.example.daemon"
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(plan(&service, &token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 1);
+        assert_eq!(
+            ok(call(
+                &service,
+                &control,
+                "removeApplication",
+                serde_json::json!({ "applicationId": application_id }),
+            )),
+            serde_json::json!({ "removed": true })
+        );
+        // Re-registering the same path yields the same application id; no plan is
+        // requested while removed so only `removeApplication` itself can clear the edge
+        // state under test.
+        let re_registered = register(&service, &control, &executable, 2);
+        assert_eq!(re_registered, application_id);
+        ok(set_policy(
+            &service,
+            &control,
+            &re_registered,
+            true,
+            &["renderer.dom"],
+        ));
+        let re_token = launch_token(&service, &control, &executable);
+        assert!(plan(&service, &re_token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(
+            gate_events().len(),
+            2,
+            "re-registered application must re-log its first drop after removal"
+        );
+        assert!(plan(&service, &re_token)["plugins"][0]["renderer"].is_null());
+        assert_eq!(gate_events().len(), 2);
     }
 
     #[test]

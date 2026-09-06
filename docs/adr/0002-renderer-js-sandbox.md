@@ -2,6 +2,17 @@
 
 Status: **Accepted** (implemented in Phase 3)
 
+> **Note (0.1 execution-gate contract):** the pre-0.1 `renderer.dom`-only
+> wording below has been superseded by the `renderer.script` execution-gate
+> contract — an `entry.renderer` requires the `renderer.script` permission at
+> pack time (`tronhawk-package` rejects without it); `renderer.dom` /
+> `renderer.storage` / `renderer.css` are additional capabilities only and
+> never substitute for the gate. At runtime Core `execution_plan` drops the
+> renderer payload without `renderer.script` (or `runtime.unsafe` in developer
+> mode) and records `core.renderer.script_required`. See
+> `docs/THX-FORMAT.md` §2, `docs/PLUGIN-SDK.md` (Manifest / Permissions
+> reference), and `crates/package` / `crates/core`.
+
 ## Context
 
 Plugins may declare `renderer.script` for narrowly defined page operations and `renderer.dom`

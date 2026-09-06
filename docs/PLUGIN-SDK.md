@@ -20,7 +20,7 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | main | `ctx.window.onCreated` / `setOpacity` / `setSize` / `setPosition` (`electron.window`) | Implemented |
 | main | `ctx.onLoad` / `ctx.onRendererReady` / `ctx.onUnload` (`electron.window`) | Implemented — main-context lifecycle events: `onLoad` fires once at app ready (a late subscription fires immediately), `onRendererReady` per window per load/navigation (a late subscription replays already-loaded windows), `onUnload` per window webContents destroy; synchronous `undefined` callbacks invoked under the CPU-deadline contract, fail-closed unregister on throw/timeout/non-void |
 | both | async `activate` / `deactivate` (module lifecycle) | Implemented — a hook may return `undefined` synchronously or a Promise the runtime **drains** before the plugin is considered activated/deactivated (ADR 0008); lifecycle-event callbacks stay synchronous `undefined` |
-| renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Implemented — async host functions (ADR 0008): `query` returns a Promise of a serialized `DomElement` snapshot (never a live node), `observe` polls on a ~100 ms cadence and delivers snapshots to a synchronous callback |
+| renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Implemented — async host functions (ADR 0008): `query` returns a Promise of a serialized `DomElement` snapshot (never a live node), `observe` polls on a 500 ms cadence and delivers snapshots to a synchronous callback |
 | renderer | `ctx.storage.get` / `ctx.storage.set` (`renderer.storage`) | Implemented — renderer-only, host-namespaced string storage (`tronhawk:<pluginId>:<key>`), values host-bounded (ADR 0008) |
 | main | `ctx.window.setVibrancy` / `setMica` (`electron.window`) | Implemented — macOS vibrancy via `setVibrancy`, Windows 11 Mica via `setBackgroundMaterial`; structured-log no-op on other platforms or when the Electron API is absent |
 | main | `ctx.webContents.*` | Future |
@@ -31,7 +31,7 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | both | `ctx.raw` (`runtime.unsafe`, developer mode) | Implemented — raw host execution while developer mode is on + `runtime.unsafe` granted |
 
 **Lifecycle contract (binding):** `activate` / `deactivate` may return JavaScript `undefined`
-(synchronously) **or a Promise** that resolves to nothing — when a hook returns a Promise the runtime
+(synchronously) **or a Promise** (whose resolve value is ignored) — when a hook returns a Promise the runtime
 **drains** it (via QuickJS pending-job execution) before the plugin is considered activated /
 deactivated (ADR 0008). Lifecycle-event and window callbacks (`ctx.onLoad` / `ctx.onRendererReady` /
 `ctx.onUnload` / `ctx.window.onCreated`, and `ctx.dom.observe` callbacks) stay **synchronous** and
@@ -44,7 +44,7 @@ callback that throws, exceeds its CPU deadline, or returns a non-`undefined` val
 my-plugin/
 ├── package.json
 ├── manifest.json
-└── src/{renderer.ts, main.ts}
+└── src/{renderer.js, main.js}   # executable CommonJS entries (see "Runtime entry format")
 ```
 
 ## Manifest
@@ -53,6 +53,18 @@ Required: `id`, `name`, `version`, `author`, `tronhawk` (host runtime protocol v
 Optional: `css` (inline CSS string, or `entry.css` file) for CSS-only themes,
 `entry.{renderer,main}` (renderer → Chromium renderer, main → Electron main process),
 `permissions[]`, `config{}`. A CSS-only theme declares its CSS as **data** (never executed as JS).
+
+**Renderer execution gate (binding):** an `entry.renderer` requires the
+`renderer.script` permission in `permissions[]` — this is a pack/install-time
+**declaration gate** enforced by `tronhawk-package`
+(`validate_manifest_schema` rejects `entry.renderer` without
+`renderer.script`). `renderer.dom` / `renderer.storage` / `renderer.css` are
+**additional capabilities only** and never substitute for the gate; neither
+does `runtime.unsafe` at declaration time. At runtime Core `execution_plan`
+unlocks the renderer payload when the effective grants include
+`renderer.script` **or** `runtime.unsafe` (the developer-mode escape hatch);
+otherwise the payload is dropped before it ever runs and the drop is recorded
+as `core.renderer.script_required` (observable via `queryLogs`).
 
 The `tronhawk` field declares the TronHawk **runtime protocol version** the plugin targets — it is
 NOT the SDK npm version.
@@ -85,20 +97,28 @@ NOT the SDK npm version.
 | `network.proxy` | request interception / modification | high |
 | `runtime.unsafe` | `ctx.raw` (Electron / Node) | critical (dev only) |
 
+`renderer.script` is the **execution gate** for renderer JS, not just the
+`ctx.script.setDocumentTitle()` capability: without it in the effective grants
+the renderer payload never runs (Core drops it and records
+`core.renderer.script_required`). `renderer.dom` / `renderer.storage` /
+`renderer.css` grant only their own host APIs on top of a gated renderer entry
+and never unlock execution by themselves; `runtime.unsafe` unlocks the payload
+at runtime in developer mode but does **not** waive the pack-time declaration
+gate (`entry.renderer` must still declare `renderer.script`).
+
 ## Lifecycle
 
-```ts
-export default {
+```js
+module.exports = {
   activate(ctx) { /* load, register hooks */ },
   deactivate(ctx) { /* cleanup */ },
-}
+};
 ```
 
 `activate` / `deactivate` may complete **synchronously** (a normal function with no `return`
 statement returns `undefined`) **or return a Promise**; when a hook returns a Promise the runtime
 **drains** it (ADR 0008) before the plugin is considered activated / deactivated — e.g.
-`async activate(ctx) { await ctx.dom.query("..."); }` is valid. A returned Promise must resolve to
-nothing; a Promise resolving with a value is rejected. Lifecycle-**event** callbacks and
+`async activate(ctx) { await ctx.dom.query("..."); }` is valid. The resolve value of a fulfilled Promise is ignored — only a rejection fails the hook. Lifecycle-**event** callbacks and
 `ctx.dom.observe` callbacks are **not** drained — they stay synchronous `undefined`-returning (see
 "Main lifecycle events").
 
@@ -116,7 +136,7 @@ interface RendererContext extends PluginContext { css; dom; script; storage; }
   QuickJS sandbox boundary, so the host copies `nodeId`, `tag`, `id`, `className`, `attrs`, `text`,
   and — when present — `rect`, `value`, `checked`, `href`, `src` at snapshot time. Later page
   mutations do not update an already-returned snapshot; re-query to refresh. `query` resolves the
-  first element matching `selector`, or `null`. `observe` is a **polling** bridge (~100 ms cadence),
+  first element matching `selector`, or `null`. `observe` is a **polling** bridge (500 ms cadence),
   so a delivered snapshot can lag live DOM by up to one poll interval; each newly observed node is
   delivered once to `cb` (as a snapshot), and `cb` must complete synchronously and return
   `undefined`. There is no synchronous `dom.query` — a snapshot is inherently async to capture.
@@ -128,7 +148,7 @@ interface RendererContext extends PluginContext { css; dom; script; storage; }
 ## Main API (`MainContext`)
 
 ```ts
-interface MainContext extends PluginContext { window; webContents; onLoad; onRendererReady; onUnload; }
+interface MainContext extends PluginContext { window; onLoad; onRendererReady; onUnload; }
 ```
 
 - `ctx.window.onCreated(cb)` — `cb` receives an opaque `WindowHandle`; every window mutation takes
@@ -139,7 +159,7 @@ interface MainContext extends PluginContext { window; webContents; onLoad; onRen
   vibrancy (`BrowserWindow#setVibrancy`) and Windows 11 Mica (`BrowserWindow#setBackgroundMaterial`);
   on other platforms, or when the Electron API is absent, each is a no-op that emits a structured
   log instead of throwing.
-- `ctx.webContents.openDevTools(win)` / `reload(win)`.
+- (future) `ctx.webContents.*` — not mounted in the host runtime; do not build on it.
 - (future) `ctx.session.modify()` (User-Agent, proxy, request interception).
 - (future) `ctx.ipc.on()/send()/intercept()` — high privilege.
 
@@ -238,9 +258,90 @@ developer mode is turned off** — the runtime cannot undo what raw code already
 Raw execution is only for plugins you write and trust. A sandboxed plugin never sees `ctx.raw`; it is
 present only with the `runtime.unsafe` grant while developer mode is on.
 
-## Build
+## Build and pack
 
-Dev: `npm install` + `npm run dev`. Prod: `npm run build` → `plugin.thx`.
+Standalone toolchain (works outside any TronHawk checkout). The
+`@tronhawk/cli` devDependency (the `tronhawk` binary) drives
+`create` → `build` → `test --sandbox` → `pack` → `inspect`. Authoritative
+checks always run in the same-version Rust engine (`tronhawk-pack`); a
+passing `build` / `test` never substitutes for `validate`:
+
+```sh
+create-tronhawk-plugin my-plugin --type renderer
+cd my-plugin && bun install
+bun run build            # tronhawk build .: bundle entries to dist/ (CSS-only: no build step, style.css ships as data)
+bun test                 # starter smoke test against @tronhawk/sdk mocks (no host)
+tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
+tronhawk validate .      # authoritative dir check (writes nothing)
+tronhawk pack . my-plugin.thx   # build -> staging -> Rust pack (CSS-only: staging with no build -> Rust pack)
+tronhawk inspect my-plugin.thx  # passthrough to the Rust engine (behavior defined by Rust)
+```
+
+- Type-check only: `bun install` + `bun run typecheck` (`tsc --noEmit`).
+  This checks types; it does not bundle or pack anything.
+- `tronhawk pack` is the unified pack command for every type: JS entries go
+  `build` (isolated) → `smoke` (isolated) → minimal staging, then a single
+  Rust `pack` (temp + same-crate round-trip + atomic rename inside Rust).
+  CSS-only plugins skip `build` with an explicit notice but still run staging
+  and the same-version Rust/SHA path. Never invoke the engine binary
+  directly: only `tronhawk pack` enforces the expected-engine version,
+  digest, and snapshot guarantees.
+- Engine setup: set `TRONHAWK_PACK_BIN` to the same-version `tronhawk-pack`
+  release binary (explicit, highest priority), configure `tronhawk.packBin`,
+  or build it inside a TronHawk checkout (`cargo build -p tronhawk-package
+  --release`, resolved from `target/{release,debug}/tronhawk-pack`). The
+  CLI's `tronhawk.engineVersion` must exactly match `tronhawk-pack
+  --version`; a missing binary, digest mismatch, or version mismatch
+  hard-fails with install guidance — there is no TypeScript fallback packer
+  and no PATH search for the engine.
+
+Alternative (contributors inside a TronHawk monorepo checkout, from the repo
+root only — the working directory must be the monorepo root because
+`cargo run -p` resolves the `tronhawk-package` target through the Cargo
+workspace context):
+
+```sh
+cargo run -p tronhawk-package --bin tronhawk-pack -- validate <path-to-plugin>
+cargo run -p tronhawk-package --bin tronhawk-pack -- pack <path-to-plugin> <out.thx>
+```
+
+The packer validates `manifest.json` and its entry files, then packs every
+file in the plugin directory. It **refuses symlinks**, so remove
+`node_modules` before packing and re-install afterwards if you keep
+developing (the CLI staging does this selection automatically). See
+`docs/THX-FORMAT.md` for the `.thx` layout, manifest schema,
+and file-safety rules.
+
+## Runtime entry format (binding)
+
+The QuickJS host loads plugin entries as **CommonJS**: the source is evaluated
+with `module` / `exports` scaffolding and the runtime reads
+`module.exports.activate` / `module.exports.deactivate`.
+
+```js
+module.exports = {
+  activate(ctx) { /* ... */ },
+  deactivate(ctx) { /* ... */ },
+};
+```
+
+TypeScript ESM (`import` / `export default`) is **never executed directly** —
+an entry file containing `export default plugin` without a `module.exports`
+assignment exports nothing the runtime recognizes, so `activate` never runs.
+Point `entry.renderer` / `entry.main` at an executable `.js` file (the
+scaffolder generates `src/renderer.js` / `src/main.js`); TypeScript sources may
+be kept alongside as a type-checking source, but they are not the runtime
+entry. CSS entries (`css` / `entry.css`) are **data** injected via
+`insertCSS`, never executed.
+
+## `tronhawk` manifest field
+
+The manifest `tronhawk` field (e.g. `"^0.1"`) is the **host runtime protocol
+version** the plugin targets, expressed as a semver range over the host
+protocol (`HOST_PROTOCOL_VERSION`, currently `0.1.0`). It is **not** the
+`@tronhawk/sdk` npm version. A plugin whose range does not match the running
+host is rejected before install/load; the SDK version and the protocol version
+evolve independently.
 
 ## Examples
 

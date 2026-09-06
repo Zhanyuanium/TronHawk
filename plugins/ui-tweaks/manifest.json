@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "author": "Example",
   "tronhawk": "^0.1",
-  "entry": { "css": "style.css", "renderer": "src/renderer.ts" },
+  "entry": { "css": "style.css", "renderer": "src/renderer.js" },
   "permissions": ["renderer.css", "renderer.script"]
 }
