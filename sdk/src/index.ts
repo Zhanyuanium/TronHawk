@@ -1,8 +1,10 @@
 // Public plugin API for TronHawk. This file is the stable public contract.
 // See docs/PLUGIN-SDK.md. Any breaking change requires a doc update + version bump.
 
-/** Opaque window handle assigned by the runtime. Plugins must treat it as opaque. */
-export type WindowHandle = string;
+/** Opaque window handle assigned by the runtime. Plugins must treat it as opaque.
+ *  Host parity: the runtime passes the numeric Electron webContents/window id
+ *  straight through (`BrowserWindow.fromId` key), so handles are numbers. */
+export type WindowHandle = number;
 
 /** Present ONLY when `runtime.unsafe` is granted AND developer mode is enabled by the user.
  *  Deliberate exception: plugin code runs with the full Node/Electron environment of the
@@ -61,9 +63,13 @@ export interface PluginContext {
 // --- Renderer context (MVP) ---
 
 export interface CssAPI {
-  /** Insert a stylesheet; returns a unique id scoped to the owning plugin. */
-  insert(css: string): string;
-  remove(id: string): void;
+  /** Insert a stylesheet; resolves to a unique id scoped to the owning plugin.
+   *  Host parity: the runtime bridges `webContents.insertCSS`, so insertion is
+   *  asynchronous — `insert` returns a Promise of the key. */
+  insert(css: string): Promise<string>;
+  /** Revoke a previously inserted stylesheet. Host parity: asynchronous — the
+   *  runtime retries removal over a bounded window before settling. */
+  remove(id: string): Promise<void>;
 }
 
 /** A serialized snapshot of a page element, captured host-side. This is NOT a live DOM node: a real
@@ -100,7 +106,7 @@ export interface DomAPI {
    *  not a live node; the promise rejects only on a query error (e.g. an invalid selector). */
   query(selector: string): Promise<DomElement | null>;
   /** Observe elements matching `selector`; `cb` is invoked with a serialized snapshot of each newly
-   *  observed node. The bridge polls on a ~100 ms cadence, so a snapshot lags live DOM by up to one
+   *  observed node. The bridge polls on a 500 ms cadence, so a snapshot lags live DOM by up to one
    *  poll interval. Returns a disconnect function that stops the observation. Requires
    *  `renderer.dom`. `cb` must complete synchronously and return `undefined`. */
   observe(selector: string, cb: (node: DomElement) => void): () => void;
@@ -143,11 +149,6 @@ export interface WindowAPI {
   setMica(window: WindowHandle, enabled: boolean): void;
 }
 
-export interface WebContentsAPI {
-  openDevTools(window: WindowHandle): void;
-  reload(window: WindowHandle): void;
-}
-
 // Main-plugin lifecycle events (SPEC §9 MVP). These attach at the MAIN context ROOT — NOT under
 // `ctx.window` — because they announce the host lifecycle (app loaded, renderer loaded, window
 // unloaded) rather than mutate a window. They are main-context only; the renderer context does not
@@ -158,7 +159,6 @@ export interface WebContentsAPI {
 
 export interface MainContext extends PluginContext {
   window: WindowAPI;
-  webContents: WebContentsAPI;
   /** Fires exactly once per subscription — when the target app's main process has finished loading
    *  its original app (app ready). A subscription made after the app already loaded fires
    *  immediately, exactly once. No window argument. */
@@ -177,11 +177,13 @@ export interface MainContext extends PluginContext {
 export type PluginModule<C extends PluginContext = PluginContext> = {
   /** Runs when the plugin is activated. May complete synchronously (returning nothing / `undefined`)
    *  or return a Promise; when it returns a Promise the runtime **drains** it before the plugin is
-   *  considered active. */
-  activate(ctx: C): void | Promise<void>;
+   *  considered active. A fulfilled Promise's resolve value is ignored — only a rejection fails
+   *  the hook. */
+  activate(ctx: C): void | Promise<unknown>;
   /** Runs when the plugin is deactivated (disable, plan revision, app teardown). May complete
-   *  synchronously or return a Promise; the runtime drains a returned Promise before disposing the VM. */
-  deactivate(ctx: C): void | Promise<void>;
+   *  synchronously or return a Promise; the runtime drains a returned Promise before disposing the VM.
+   *  A fulfilled Promise's resolve value is ignored — only a rejection fails the hook. */
+  deactivate(ctx: C): void | Promise<unknown>;
 };
 
 // --- Utilities ---
@@ -195,7 +197,7 @@ export function createLogger(pluginId: string): Logger {
 }
 
 /** Convenience wrapper that delegates to the permission-checked `ctx.css.insert`. */
-export function injectCSS(ctx: RendererContext, css: string): string {
+export function injectCSS(ctx: RendererContext, css: string): Promise<string> {
   return ctx.css.insert(css);
 }
 
@@ -208,7 +210,7 @@ export function createMockRendererContext(
       request: async () => ({ status: 200, headers: {}, body: "" }),
     },
     config: { get: () => undefined, set: () => {} },
-    css: { insert: () => "mock-style", remove: () => {} },
+    css: { insert: async () => "mock-style", remove: async () => {} },
     dom: { query: async () => null, observe: () => () => {} },
     script: { setDocumentTitle: () => {} },
     storage: { get: async () => null, set: async () => {} },
@@ -232,10 +234,6 @@ export function createMockMainContext(
       setPosition: () => {},
       setVibrancy: () => {},
       setMica: () => {},
-    },
-    webContents: {
-      openDevTools: () => {},
-      reload: () => {},
     },
     onLoad: () => {},
     onRendererReady: () => {},

@@ -1,0 +1,194 @@
+{
+  "version": 1,
+  "runners": ["rust-validate", "rust-extract", "cli-sandbox"],
+  "cases": [
+    {
+      "id": "valid-renderer",
+      "dir": "fixtures/valid-renderer",
+      "kind": "plugin",
+      "description": "Renderer entry using only granted ctx (logger + script).",
+      "validate": { "expect": "ok" },
+      "sandbox": {
+        "expect": "pass",
+        "entry": "renderer",
+        "expectLogs": ["valid-renderer-on", "valid-renderer-off"]
+      }
+    },
+    {
+      "id": "valid-css-only",
+      "dir": "fixtures/valid-css-only",
+      "kind": "plugin",
+      "description": "CSS-only theme: no JS entries, nothing to execute.",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "pass", "entry": null }
+    },
+    {
+      "id": "valid-main",
+      "dir": "fixtures/valid-main",
+      "kind": "plugin",
+      "description": "Main-process entry using only granted ctx (logger + window).",
+      "validate": { "expect": "ok" },
+      "sandbox": {
+        "expect": "pass",
+        "entry": "main",
+        "expectLogs": ["valid-main-on", "valid-main-off"]
+      }
+    },
+    {
+      "id": "valid-async-lifecycle",
+      "dir": "fixtures/valid-async-lifecycle",
+      "kind": "plugin",
+      "description": "Async activate/deactivate drain to fulfillment (ADR 0008).",
+      "validate": { "expect": "ok" },
+      "sandbox": {
+        "expect": "pass",
+        "entry": "renderer",
+        "expectLogs": ["async-on-start", "async-on-end", "async-off-ran"]
+      }
+    },
+    {
+      "id": "valid-network-granted",
+      "dir": "fixtures/valid-network-granted",
+      "kind": "plugin",
+      "description": "network.request with the network.access grant resolves.",
+      "validate": { "expect": "ok" },
+      "sandbox": {
+        "expect": "pass",
+        "entry": "renderer",
+        "expectLogs": ["NET-STATUS:200"]
+      }
+    },
+    {
+      "id": "denied-network-caught",
+      "dir": "fixtures/denied-network-caught",
+      "kind": "plugin",
+      "description": "network.request without the grant rejects catchably; lifecycle still passes.",
+      "validate": { "expect": "ok" },
+      "sandbox": {
+        "expect": "pass",
+        "entry": "renderer",
+        "expectLogs": ["DENIED:network.access not granted"]
+      }
+    },
+    {
+      "id": "fail-missing-deactivate",
+      "dir": "fixtures/fail-missing-deactivate",
+      "kind": "plugin",
+      "description": "Authoring contract requires both hooks: no deactivate export.",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["deactivate"] }
+    },
+    {
+      "id": "fail-missing-activate",
+      "dir": "fixtures/fail-missing-activate",
+      "kind": "plugin",
+      "description": "Authoring contract requires both hooks: no activate export.",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["activate"] }
+    },
+    {
+      "id": "fail-esm-default",
+      "dir": "fixtures/fail-esm-default",
+      "kind": "plugin",
+      "description": "ESM `export default` is never read by the host (static gate).",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["static", "ESM"] }
+    },
+    {
+      "id": "fail-esm-import",
+      "dir": "fixtures/fail-esm-import",
+      "kind": "plugin",
+      "description": "Bare ESM `import` cannot load as a classic script (static gate).",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["static"] }
+    },
+    {
+      "id": "fail-dynamic-require",
+      "dir": "fixtures/fail-dynamic-require",
+      "kind": "plugin",
+      "description": "`require` does not exist in QuickJS; bundles must be require-free (static gate).",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["require"] }
+    },
+    {
+      "id": "fail-node-globals",
+      "dir": "fixtures/fail-node-globals",
+      "kind": "plugin",
+      "description": "Node globals (process) are absent from the sandbox.",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["process"] }
+    },
+    {
+      "id": "fail-async-activate-rejects",
+      "dir": "fixtures/fail-async-activate-rejects",
+      "kind": "plugin",
+      "description": "Rejected async activate fails closed like a sync throw.",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["boom-async-conformance"] }
+    },
+    {
+      "id": "fail-non-void-deactivate",
+      "dir": "fixtures/fail-non-void-deactivate",
+      "kind": "plugin",
+      "description": "Sync deactivate must return undefined (sync-void contract).",
+      "validate": { "expect": "ok" },
+      "sandbox": { "expect": "fail", "entry": "renderer", "needles": ["expected undefined"] }
+    },
+    {
+      "id": "invalid-unknown-permission",
+      "dir": "fixtures/invalid-unknown-permission",
+      "kind": "plugin",
+      "description": "Schema rejects unknown permission strings.",
+      "validate": { "expect": "reject", "needle": "unknown permission" },
+      "sandbox": { "expect": "skip", "reason": "schema-only case for rust-validate" }
+    },
+    {
+      "id": "invalid-bad-id",
+      "dir": "fixtures/invalid-bad-id",
+      "kind": "plugin",
+      "description": "Schema rejects non-reverse-DNS ids.",
+      "validate": { "expect": "reject", "needle": "`id`" },
+      "sandbox": { "expect": "skip", "reason": "schema-only case for rust-validate" }
+    },
+    {
+      "id": "invalid-bad-protocol",
+      "dir": "fixtures/invalid-bad-protocol",
+      "kind": "plugin",
+      "description": "Protocol gate rejects ranges the host does not satisfy.",
+      "validate": { "expect": "reject", "needle": "tronhawk protocol" },
+      "sandbox": { "expect": "skip", "reason": "schema-only case for rust-validate" }
+    },
+    {
+      "id": "invalid-renderer-without-script-perm",
+      "dir": "fixtures/invalid-renderer-without-script-perm",
+      "kind": "plugin",
+      "description": "Pack-time contract: entry.renderer requires renderer.script.",
+      "validate": { "expect": "reject", "needle": "renderer.script" },
+      "sandbox": { "expect": "skip", "reason": "pack-time gate for rust-validate" }
+    },
+    {
+      "id": "zip-traversal-dotdot",
+      "dir": "fixtures/zip-traversal-dotdot",
+      "kind": "zip-spec",
+      "description": "Archive entry escaping via `..` is rejected before extraction.",
+      "sandbox": { "expect": "skip", "reason": "archive-level case for rust-extract" },
+      "extract": { "expect": "reject", "needle": "path segment `..`" }
+    },
+    {
+      "id": "zip-absolute-path",
+      "dir": "fixtures/zip-absolute-path",
+      "kind": "zip-spec",
+      "description": "Absolute archive entry paths are rejected before extraction.",
+      "sandbox": { "expect": "skip", "reason": "archive-level case for rust-extract" },
+      "extract": { "expect": "reject", "needle": "empty path segment" }
+    },
+    {
+      "id": "zip-duplicate-entries",
+      "dir": "fixtures/zip-duplicate-entries",
+      "kind": "zip-spec",
+      "description": "Byte-identical duplicate entry names are rejected up front.",
+      "sandbox": { "expect": "skip", "reason": "archive-level case for rust-extract" },
+      "extract": { "expect": "reject", "needle": "duplicate archive entry" }
+    }
+  ]
+}

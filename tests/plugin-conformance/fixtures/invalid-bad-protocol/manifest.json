@@ -1,0 +1,9 @@
+{
+  "id": "com.example.bad-protocol",
+  "name": "Bad Protocol",
+  "version": "0.1.0",
+  "author": "Conformance",
+  "tronhawk": "^99.0",
+  "entry": { "renderer": "src/renderer.js" },
+  "permissions": ["renderer.script"]
+}

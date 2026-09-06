@@ -1,0 +1,9 @@
+{
+  "archive": "materialized by the runner from entries (no binary blobs checked in)",
+  "entries": [
+    { "name": "manifest.json", "contentFile": "manifest.json" },
+    { "name": "src/renderer.js", "content": "module.exports = { activate(){}, deactivate(){} };\n" },
+    { "name": "../../evil.js", "content": "console.log('zip-slip');\n" }
+  ],
+  "extract": { "expect": "reject", "needle": "path segment `..`" }
+}

@@ -592,8 +592,7 @@ describe("ctx.onLoad", () => {
   );
 });
 
-describe("lifecycle subscription cleanup", () => {
-  test(
+describe("lifecycle subscription cleanup", () => {  test(
     "all lifecycle callbacks are disposed on plugin revoke and never fire afterwards",
     async () => {
       const pid = "lc-revoke";
@@ -629,6 +628,244 @@ describe("lifecycle subscription cleanup", () => {
       expect(pluginMessages(pid, "info", "rc-rr:" + c2.id)).toHaveLength(0);
       expect(pluginMessages(pid, "info", "rc-ul:" + c1.id)).toHaveLength(1);
       expect(pluginMessages(pid, "info", "rc-ul:" + c2.id)).toHaveLength(0);
+    },
+    15000,
+  );
+});
+
+// ===========================================================================
+// Feature 3 — unified WindowHandle: lifecycle handles drive window ops
+// ===========================================================================
+//
+// Gate 3 attempt-4 (issuedWindowHandle in src/index.js): all three lifecycle
+// events issue BrowserWindow.id when a live window is bound, so fromId
+// resolves them without crossing the webContents.id namespace. These tests
+// prove the full loop with deliberately distinct ids (window 100 vs contents
+// 1,2,…): the fake window is registered ONLY under its BrowserWindow id.
+
+// Fake window linked to a webContents, with the full op surface the E2E
+// fixtures drive. Registered under the window id only — never the contents id.
+function createLinkedWindow(winId, contents) {
+  const win = createFakeWindow(winId);
+  win.webContents = contents;
+  win.setSize = (w, h) => win.calls.push(["setSize", w, h]);
+  win.setPosition = (x, y) => win.calls.push(["setPosition", x, y]);
+  fakeWindows.set(winId, win);
+  return win;
+}
+
+const HANDLE_CREATED_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.window.onCreated((w) => {
+      ctx.window.setOpacity(w, 0.5);
+      ctx.logger.info("created-op:" + w);
+    });
+  },
+};
+`;
+
+const HANDLE_READY_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.onRendererReady((w) => {
+      ctx.window.setSize(w, 800, 600);
+      ctx.logger.info("ready-op:" + w);
+    });
+  },
+};
+`;
+
+const HANDLE_UNLOAD_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.onUnload((w) => {
+      ctx.window.setPosition(w, 10, 20);
+      ctx.logger.info("unload-op:" + w);
+    });
+  },
+};
+`;
+
+describe("unified WindowHandle: lifecycle handles drive window ops", () => {
+  test(
+    "onCreated handle (BrowserWindow.id) drives window ops",
+    async () => {
+      const pid = "hw-created";
+      testing.setWindowEnumerator(() => [...fakeWindows.values()]);
+      applyPlan(planFor("hw-created-v1", [mainPlugin(pid, HANDLE_CREATED_FIXTURE)]));
+      await waitFor(() => testing.mainPlugins().has(pid), "plugin loaded");
+
+      const c1 = makeContents();
+      createWindow(c1);
+      const win = createLinkedWindow(100, c1);
+      electron.app.emit("browser-window-created", {}, win);
+
+      expect(win.calls).toContainEqual(["setOpacity", 0.5]);
+      expect(pluginMessages(pid, "info", "created-op:100")).toHaveLength(1);
+      expect(pluginMessages(pid, "error", "setOpacity")).toHaveLength(0);
+      expect(testing.mainPlugins().has(pid)).toBe(true);
+    },
+    15000,
+  );
+
+  test(
+    "onRendererReady handle (BrowserWindow.id) drives window ops",
+    async () => {
+      const pid = "hw-ready";
+      testing.setWindowEnumerator(() => [...fakeWindows.values()]);
+      applyPlan(planFor("hw-ready-v1", [mainPlugin(pid, HANDLE_READY_FIXTURE)]));
+      await waitFor(() => testing.mainPlugins().has(pid), "plugin loaded");
+
+      const c1 = makeContents();
+      createWindow(c1);
+      const win = createLinkedWindow(100, c1);
+      // Contents id is not a BrowserWindow key; unified issuance must pass
+      // win.id (100) so fromId hits. The contents-only fallback is not used.
+      expect(fakeWindows.get(c1.id)).toBeUndefined();
+      loadWindow(c1);
+
+      expect(win.calls).toContainEqual(["setSize", 800, 600]);
+      expect(pluginMessages(pid, "info", "ready-op:100")).toHaveLength(1);
+      expect(pluginMessages(pid, "error", "setSize")).toHaveLength(0);
+      expect(testing.mainPlugins().has(pid)).toBe(true);
+    },
+    15000,
+  );
+
+  test(
+    "onUnload handle (BrowserWindow.id) drives window ops",
+    async () => {
+      const pid = "hw-unload";
+      testing.setWindowEnumerator(() => [...fakeWindows.values()]);
+      applyPlan(planFor("hw-unload-v1", [mainPlugin(pid, HANDLE_UNLOAD_FIXTURE)]));
+      await waitFor(() => testing.mainPlugins().has(pid), "plugin loaded");
+
+      const c1 = makeContents();
+      createWindow(c1);
+      const win = createLinkedWindow(100, c1);
+      expect(fakeWindows.get(c1.id)).toBeUndefined();
+      loadWindow(c1);
+      c1.emit("destroyed");
+
+      expect(win.calls).toContainEqual(["setPosition", 10, 20]);
+      expect(pluginMessages(pid, "info", "unload-op:100")).toHaveLength(1);
+      expect(pluginMessages(pid, "error", "setPosition")).toHaveLength(0);
+      expect(testing.mainPlugins().has(pid)).toBe(true);
+    },
+    15000,
+  );
+});
+
+// ===========================================================================
+// Feature 4 — cross-namespace same-value collision
+// ===========================================================================
+//
+// Window A {id:100, webContents.id:1} and window B {id:1, webContents.id:2}.
+// Under mixed issuance, A's renderer/unload handle is 1, and
+// BrowserWindow.fromId(1) returns B — misroute. Unified issuance passes 100
+// for A and 1 for B. The reverse-proof test turns the fix off
+// (`legacy-mixed-ids`) and asserts the old bug shape.
+
+const COLLISION_READY_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.onRendererReady((w) => {
+      ctx.window.setSize(w, 800, 600);
+      ctx.logger.info("ready-op:" + w + ";");
+    });
+  },
+};
+`;
+
+const COLLISION_BOTH_FIXTURE = `
+module.exports = {
+  activate(ctx) {
+    ctx.window.onCreated((w) => {
+      ctx.window.setOpacity(w, 0.5);
+      ctx.logger.info("created-op:" + w + ";");
+    });
+    ctx.onRendererReady((w) => {
+      ctx.window.setSize(w, 800, 600);
+      ctx.logger.info("ready-op:" + w + ";");
+    });
+    ctx.onUnload((w) => {
+      ctx.window.setPosition(w, 10, 20);
+      ctx.logger.info("unload-op:" + w + ";");
+    });
+  },
+};
+`;
+
+function installCollisionPair() {
+  testing.setWindowEnumerator(() => [...fakeWindows.values()]);
+  const cA = makeContents();
+  const cB = makeContents();
+  expect(cA.id).toBe(1);
+  expect(cB.id).toBe(2);
+  createWindow(cA);
+  createWindow(cB);
+  const winA = createLinkedWindow(100, cA);
+  const winB = createLinkedWindow(1, cB);
+  return { cA, cB, winA, winB };
+}
+
+describe("cross-namespace WindowHandle collision", () => {
+  test(
+    "A/B same-value handles route to their own windows (zero misroute)",
+    async () => {
+      const pid = "hw-collision";
+      applyPlan(planFor("hw-collision-v1", [mainPlugin(pid, COLLISION_BOTH_FIXTURE)]));
+      await waitFor(() => testing.mainPlugins().has(pid), "plugin loaded");
+
+      const { cA, cB, winA, winB } = installCollisionPair();
+      electron.app.emit("browser-window-created", {}, winA);
+      electron.app.emit("browser-window-created", {}, winB);
+      loadWindow(cA);
+      loadWindow(cB);
+      cA.emit("destroyed");
+      cB.emit("destroyed");
+
+      expect(winA.calls).toContainEqual(["setOpacity", 0.5]);
+      expect(winA.calls).toContainEqual(["setSize", 800, 600]);
+      expect(winA.calls).toContainEqual(["setPosition", 10, 20]);
+      expect(winB.calls).toContainEqual(["setOpacity", 0.5]);
+      expect(winB.calls).toContainEqual(["setSize", 800, 600]);
+      expect(winB.calls).toContainEqual(["setPosition", 10, 20]);
+      expect(winA.calls.filter((c) => c[0] === "setSize")).toHaveLength(1);
+      expect(winB.calls.filter((c) => c[0] === "setSize")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "created-op:100;")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "created-op:1;")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "ready-op:100;")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "ready-op:1;")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "unload-op:100;")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "unload-op:1;")).toHaveLength(1);
+      expect(testing.mainPlugins().has(pid)).toBe(true);
+    },
+    15000,
+  );
+
+  test(
+    "legacy mixed-id issuance misroutes A's renderer handle 1 onto B",
+    async () => {
+      testing.setWindowHandleMode("legacy-mixed-ids");
+      const pid = "hw-collision-legacy";
+      applyPlan(planFor("hw-collision-legacy-v1", [mainPlugin(pid, COLLISION_READY_FIXTURE)]));
+      await waitFor(() => testing.mainPlugins().has(pid), "plugin loaded");
+
+      const { cA, winA, winB } = installCollisionPair();
+      // Bare 1 is B's BrowserWindow.id: the old fromId-first resolver must
+      // still exhibit that hit, which is why issuance (not the type) had to
+      // change.
+      expect(testing.resolveWindowHandle(1)).toBe(winB);
+      expect(testing.resolveWindowHandle(100)).toBe(winA);
+
+      loadWindow(cA);
+
+      expect(winB.calls).toContainEqual(["setSize", 800, 600]);
+      expect(winA.calls).not.toContainEqual(["setSize", 800, 600]);
+      expect(pluginMessages(pid, "info", "ready-op:1;")).toHaveLength(1);
+      expect(pluginMessages(pid, "info", "ready-op:100;")).toHaveLength(0);
     },
     15000,
   );

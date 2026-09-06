@@ -27,9 +27,9 @@ test("createLogger attributes levels and ignores non-string messages", () => {
   }
 });
 
-test("injectCSS delegates to the renderer context css API", () => {
+test("injectCSS delegates to the renderer context css API", async () => {
   const ctx = createMockRendererContext();
-  const id = injectCSS(ctx, "body { color: red; }");
+  const id = await injectCSS(ctx, "body { color: red; }");
   expect(typeof id).toBe("string");
 });
 
@@ -75,8 +75,12 @@ test("mock main context exposes main APIs with window handle params", () => {
   const ctx = createMockMainContext();
   expect(typeof ctx.window.onCreated).toBe("function");
   expect(typeof ctx.window.setOpacity).toBe("function");
-  expect(typeof ctx.webContents.openDevTools).toBe("function");
-  expect("executeJavaScript" in ctx.webContents).toBe(false);
+  // Host parity: the main ctx carries window.* plus the root lifecycle
+  // events — there is no ctx.webContents surface (Future per docs/PLUGIN-SDK.md).
+  expect("webContents" in ctx).toBe(false);
+  expect(typeof ctx.onLoad).toBe("function");
+  expect(typeof ctx.onRendererReady).toBe("function");
+  expect(typeof ctx.onUnload).toBe("function");
 });
 
 test("plugin_context_raw_is_optional", () => {

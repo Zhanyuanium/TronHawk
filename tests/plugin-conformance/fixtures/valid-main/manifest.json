@@ -1,0 +1,9 @@
+{
+  "id": "com.example.valid-main",
+  "name": "Valid Main",
+  "version": "0.1.0",
+  "author": "Conformance",
+  "tronhawk": "^0.1",
+  "entry": { "main": "src/main.js" },
+  "permissions": ["electron.window"]
+}

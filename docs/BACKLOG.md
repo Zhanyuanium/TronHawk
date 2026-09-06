@@ -11,7 +11,7 @@ completed or superseded are no longer listed.
       pending-job pump (`vm.newPromise()` + `executePendingJobs()`). `ctx.dom.query` returns a
       Promise of a serialized `DomElement` snapshot (the old synchronous `Element | null` is
       re-specified — a real DOM `Element` cannot cross the QuickJS boundary), `ctx.dom.observe` is a
-      ~100 ms polling bridge delivering snapshots, `ctx.network.request` is a Core-side
+       500 ms cadence polling bridge delivering snapshots, `ctx.network.request` is a Core-side
       domain-whitelisted fetch with a catchable rejection, `ctx.storage` is renderer-only
       host-namespaced storage (`tronhawk:<pluginId>:<key>`), and `activate`/`deactivate` may return
       a Promise the runtime drains. Lifecycle-event and `observe` callbacks stay synchronous
@@ -32,8 +32,9 @@ completed or superseded are no longer listed.
       drift.
 - [x] QuickJS pending-job draining — resolved (ADR 0008): the runtime now drains pending jobs
       (`executePendingJobs()`) around host-async operations and at `activate`/`deactivate`, so the
-      SDK contract broadens from synchronous `void` to `void | Promise<void>` for lifecycle hooks
-      only. Event/`observe` callbacks remain synchronous (never drained).
+      SDK contract broadens from synchronous `void` to `void | Promise<unknown>` for lifecycle hooks
+      only (a fulfilled Promise's resolve value is ignored — only a rejection fails the hook).
+      Event/`observe` callbacks remain synchronous (never drained).
 - [ ] Real-target compatibility — generic **compat adapter** interface landed (Phase A,
       `crates/runtime/js/src/adapters`, ADR 0003); Obsidian's blocker root-caused and fixed at the
       injection layer (ADR 0004: merged asar, so `app.getAppPath()`/module resolution serve real

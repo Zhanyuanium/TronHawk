@@ -1,0 +1,9 @@
+{
+  "id": "com.example.unknown-perm",
+  "name": "Unknown Perm",
+  "version": "0.1.0",
+  "author": "Conformance",
+  "tronhawk": "^0.1",
+  "entry": { "css": "style.css", "renderer": "src/renderer.js" },
+  "permissions": ["renderer.css", "renderer.script", "nope.forbidden"]
+}
