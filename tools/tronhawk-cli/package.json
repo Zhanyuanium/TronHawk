@@ -1,0 +1,36 @@
+{
+  "name": "@tronhawk/cli",
+  "version": "0.1.0",
+  "description": "Standalone TronHawk plugin CLI: build (TS to single-file CommonJS), validate/pack via the authoritative Rust engine, smoke test",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zhanyuanium/TronHawk.git",
+    "directory": "tools/tronhawk-cli"
+  },
+  "type": "module",
+  "bin": {
+    "tronhawk": "./src/cli.ts",
+    "tronhawk-cli": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "tronhawk": {
+    "engineVersion": "0.1.0",
+    "protocolVersion": "0.1.0"
+  },
+  "dependencies": {
+    "quickjs-emscripten-core": "^0.32.0",
+    "@jitl/quickjs-singlefile-cjs-release-sync": "^0.32.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5"
+  }
+}

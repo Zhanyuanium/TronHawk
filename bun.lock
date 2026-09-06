@@ -56,6 +56,22 @@
         "typescript": "^5",
       },
     },
+    "tools/tronhawk-cli": {
+      "name": "@tronhawk/cli",
+      "version": "0.1.0",
+      "bin": {
+        "tronhawk": "./src/cli.ts",
+        "tronhawk-cli": "./src/cli.ts",
+      },
+      "dependencies": {
+        "@jitl/quickjs-singlefile-cjs-release-sync": "^0.32.0",
+        "quickjs-emscripten-core": "^0.32.0",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.4.0",
+        "typescript": "^5",
+      },
+    },
   },
   "packages": {
     "@electron-internal/extract-zip": ["@electron-internal/extract-zip@1.0.5", "https://registry.npmmirror.com/@electron-internal/extract-zip/-/extract-zip-1.0.5.tgz", {}, "sha512-+bqFCP98pLI0Tt0XQo1TmlXtwjWchISndDOxCkEcIuUgXWpBnLyRI+2DU+mesvnMMX6L1XDqYNA0lXNDHd/yiA=="],
@@ -74,7 +90,13 @@
 
     "@electron/windows-sign": ["@electron/windows-sign@2.0.6", "https://registry.npmmirror.com/@electron/windows-sign/-/windows-sign-2.0.6.tgz", { "dependencies": { "debug": "^4.3.4", "graceful-fs": "^4.2.11", "postject": "^1.0.0-alpha.6" }, "bin": { "electron-windows-sign": "bin/electron-windows-sign.mjs" } }, "sha512-ESWgNkFsXFH06I5EB2uHv3hmZA3yF4j9GTB77W74x3b5KZNItxggNzuADw41HUy6mhnC2K+E2mT0Xgc4YKu3IQ=="],
 
+    "@jitl/quickjs-ffi-types": ["@jitl/quickjs-ffi-types@0.32.0", "https://registry.npmmirror.com/@jitl/quickjs-ffi-types/-/quickjs-ffi-types-0.32.0.tgz", {}, "sha512-v9T+GQpmk43VDJ7d72sf0Nexhk+ArvtUihW27dy7lqAl0zBObFKtSBBIm5RBjwIhE8VwsPPm9PNuvPvNqLWUEg=="],
+
+    "@jitl/quickjs-singlefile-cjs-release-sync": ["@jitl/quickjs-singlefile-cjs-release-sync@0.32.0", "https://registry.npmmirror.com/@jitl/quickjs-singlefile-cjs-release-sync/-/quickjs-singlefile-cjs-release-sync-0.32.0.tgz", { "dependencies": { "@jitl/quickjs-ffi-types": "0.32.0" } }, "sha512-NjUUcw26PoeJHND6nmflAH8nIvAJvxJ2qkSPi95wfiBqPim80GtcdWommroiWb8hh1/7fVettEwodAsGt2Mrsg=="],
+
     "@malept/cross-spawn-promise": ["@malept/cross-spawn-promise@2.0.0", "https://registry.npmmirror.com/@malept/cross-spawn-promise/-/cross-spawn-promise-2.0.0.tgz", { "dependencies": { "cross-spawn": "^7.0.1" } }, "sha512-1DpKU0Z5ThltBwjNySMC14g0CkbyhCaz9FkhxqNsZI6uAPJXFS8cMXlBKo26FJ8ZuW6S9GCMcR9IO5k2X5/9Fg=="],
+
+    "@tronhawk/cli": ["@tronhawk/cli@workspace:tools/tronhawk-cli"],
 
     "@tronhawk/cli-create-plugin": ["@tronhawk/cli-create-plugin@workspace:tools/create-tronhawk-plugin"],
 
@@ -143,6 +165,8 @@
     "progress": ["progress@2.0.3", "https://registry.npmmirror.com/progress/-/progress-2.0.3.tgz", {}, "sha512-7PiHtLll5LdnKIMw100I+8xJXR5gW2QwWYkT6iJva0bXitZKa/XMrSbdmg3r2Xnaidz9Qumd0VPaMrZlF9V9sA=="],
 
     "promise-retry": ["promise-retry@2.0.1", "https://registry.npmmirror.com/promise-retry/-/promise-retry-2.0.1.tgz", { "dependencies": { "err-code": "^2.0.2", "retry": "^0.12.0" } }, "sha512-y+WKFlBR8BGXnsNlIHFGPZmyDf3DFMoLhaflAnyZgV6rG6xu+JwesTo2Q9R6XwYmtmwAFCkAk3e35jEdoeh/3g=="],
+
+    "quickjs-emscripten-core": ["quickjs-emscripten-core@0.32.0", "https://registry.npmmirror.com/quickjs-emscripten-core/-/quickjs-emscripten-core-0.32.0.tgz", { "dependencies": { "@jitl/quickjs-ffi-types": "0.32.0" } }, "sha512-QFnPfjFey8EqknSrSxe1hZrf1/8z7/6s1QzGOmKo6++02r7QRRX7ZoyNaZh7JuVjWsVW87KnQrbZqnHkOAzUyg=="],
 
     "resedit": ["resedit@2.0.3", "https://registry.npmmirror.com/resedit/-/resedit-2.0.3.tgz", { "dependencies": { "pe-library": "^1.0.1" } }, "sha512-oTeemxwoMuxxTYxXUwjkrOPfngTQehlv0/HoYFNkB4uzsP1Un1A9nI8JQKGOFkxpqkC7qkMs0lUsGrvUlbLNUA=="],
 

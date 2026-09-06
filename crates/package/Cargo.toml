@@ -2,6 +2,24 @@
 name = "tronhawk-package"
 version.workspace = true
 edition.workspace = true
+description = "TronHawk .thx package format mechanics: authoritative pack, validate, and inspect engine"
+license = "Apache-2.0"
+repository = "https://github.com/Zhanyuanium/TronHawk"
+homepage = "https://github.com/Zhanyuanium/TronHawk"
+keywords = ["tronhawk", "plugin", "package"]
+categories = ["command-line-utilities"]
+readme = "../../README.md"
+
+[[bin]]
+name = "tronhawk-pack"
+path = "src/bin/pack.rs"
+
+# Legacy alias: `cargo run -p tronhawk-package --bin pack` (docs, scaffold README).
+# Kept so existing invocations keep working; new callers (incl. `@tronhawk/cli`)
+# must prefer `tronhawk-pack`.
+[[bin]]
+name = "pack"
+path = "src/bin/pack.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
