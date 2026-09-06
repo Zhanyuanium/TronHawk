@@ -12,6 +12,8 @@ user-controlled, permission-gated, and sandboxed.
 > Status: pre-release (`0.1`). Phases 0-4 are complete; Phase 5 (OSS prep) is
 > in progress. MVP scope is **Windows x64**. See [Status](#status).
 
+**[中文版](./README_zh.md)** — Chinese version of this document.
+
 ## Highlights
 
 - **Non-invasive**: in-memory ASAR remap + DLL injection via electron-hook
@@ -20,10 +22,17 @@ user-controlled, permission-gated, and sandboxed.
   DOM, network, Node, or Electron access by default**. Every evaluation and
   host-invoked callback has a **one-second CPU deadline** plus memory/stack
   limits; plugins that exceed the cumulative budget are hard-disabled.
+- **Async host APIs**: `ctx.dom.query`/`observe` (serialized snapshots),
+  `ctx.network.request` (Core-side domain-whitelisted fetch), `ctx.storage`,
+  `ctx.config`, and runtime `ctx.css.insert`/`remove` are real Promises pumped
+  through the synchronous QuickJS VM; `activate`/`deactivate` may also be async
+  (ADR 0008). Without the `network.access` grant, `ctx.network` is a stub that
+  rejects with a catchable error.
 - **Permission-gated**: every privileged API checks a plugin's declared
-  permissions (`renderer.css`, `renderer.script`, `electron.window`, …). CSS is
+  permissions (`renderer.css`, `renderer.script`, `renderer.dom`,
+  `renderer.storage`, `electron.window`, `network.access`, …). CSS is
   treated as **data** and never executed as JS; there is no arbitrary page-JS
-  execution bridge.
+  execution bridge, and plugins cannot `fetch()` directly.
 - **Layered architecture**: strict separation between Manager, Core, Injector,
   and Runtime (`docs/AGENTS.md`).
 
@@ -61,13 +70,14 @@ Support is **tiered**, not binary (`docs/SPEC.md` §5):
 | Level | Capability |
 |---|---|
 | 0 | **Unsupported** — hardened/ASAR-integrity targets, DRM/anti-cheat/banking software. No extension support, no guarantees. |
-| 1 | **Renderer extension** — data-only CSS injection, renderer JS via the QuickJS sandbox, DOM operations (future). |
-| 2 | **Electron extension** — BrowserWindow / webContents / session / IPC through TronHawk APIs. |
+| 1 | **Renderer extension** — data-only CSS injection (+ runtime `css.insert`/`remove`), renderer JS via the QuickJS sandbox, DOM query/observe (serialized snapshots). |
+| 2 | **Electron extension** — BrowserWindow through TronHawk APIs (`window`, lifecycle events, vibrancy/Mica); webContents / session / IPC are future. |
 
 Targets include mainstream Electron apps (e.g. ChatGPT Desktop, Obsidian,
 Discord). Compatibility is validated per app — see the real-target findings in
 `docs/BACKLOG.md` and `docs/SPEC.md` §8 (validated: stock Electron 43.4.1
-apps; Obsidian partial; VS Code / ChatGPT-MSIX variants blocked by app
+apps; Obsidian injection + renderer CSS/DOM with the full workspace rendering
+in the Sep-2026 run; VS Code / ChatGPT-MSIX variants blocked by app
 layout — tracked).
 
 ## Repository layout
@@ -105,6 +115,13 @@ tests/             Integration tests (pwsh tests/integration.ps1)
 ```sh
 bun install          # link the JS workspaces (sdk, plugins/*, tools/*)
 cargo build --workspace
+```
+
+Build the runtime JS bundle (required once per fresh clone —
+`crates/runtime/assets/runtime.js` is a gitignored build artifact):
+
+```sh
+cd crates/runtime/js && bun install && bun run build
 ```
 
 ### Run the tests
@@ -197,6 +214,9 @@ cross-check are future work and not yet wired into the Manager.
   script is restricted to host-owned operations (e.g. `setDocumentTitle` via a
   fixed assignment template). `docs/adr/0002-renderer-js-sandbox.md` records
   the full rationale.
+- **No raw network.** Plugins cannot open sockets or `fetch()` directly;
+  `ctx.network.request()` runs Core-side behind a permission check, a domain
+  whitelist, and audit logging.
 
 See `SECURITY.md` for the threat model, supported-app boundary, and how to
 report a vulnerability.
@@ -213,14 +233,15 @@ report a vulnerability.
 | 5 | **OSS prep: public docs, license/compliance, contribution guide** | in progress |
 
 Implemented API surface vs. future work is spelled out at the top of
-`docs/PLUGIN-SDK.md`; remaining follow-ups (e.g. `renderer.dom`, glass window
-effects, plugin config UI, real-target application profiles) are tracked in
-`docs/BACKLOG.md`.
+`docs/PLUGIN-SDK.md`; remaining follow-ups (webContents/session/IPC,
+`network.proxy`, `.thx` signature verification, real-time log streaming/export,
+real-target application profiles) are tracked in `docs/BACKLOG.md`.
 
 ## Documentation index
 
 | Doc | Contents |
 |---|---|
+| `README_zh.md` | Chinese version of this README |
 | `docs/SPEC.md` | Product & architecture spec (requirements, tiers, decisions) |
 | `docs/AGENTS.md` | Binding AI/contributor development rules and module boundaries |
 | `docs/PLAN.md` | Phased execution roadmap |
