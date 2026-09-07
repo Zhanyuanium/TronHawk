@@ -563,3 +563,8 @@ jobs:
             if (($badErr | Out-String) -notmatch 'require\(') { throw "malicious-fixture error must name require(, got: $badErr" }
           } finally { Pop-Location }
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $good, $bad
+          # The malicious fixture above intentionally exits 1; Remove-Item does
+          # not reset $LASTEXITCODE, so zero it explicitly lest the trailing
+          # non-zero code leak out and fail the step via the GHA pwsh wrapper
+          # even though both sandbox assertions passed.
+          $LASTEXITCODE = 0
