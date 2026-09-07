@@ -541,7 +541,7 @@ jobs:
           $iso = Join-Path $env:RUNNER_TEMP "th-standalone"
           $tronhawk = Join-Path $iso "fixture/node_modules/@tronhawk/cli/src/cli.ts"
           if (-not (Test-Path -LiteralPath $tronhawk -PathType Leaf)) { throw "tronhawk CLI missing: $tronhawk" }
-          $cliRoot = Join-Path (Split-Path -Parent $tronhawk) "../.."
+          $cliRoot = Join-Path (Split-Path -Parent $tronhawk) ".."
           if (-not (Test-Path -LiteralPath (Join-Path $cliRoot "src/vendor/contract-harness.js") -PathType Leaf)) { throw "vendored harness missing from installed CLI" }
           if (Test-Path -LiteralPath (Join-Path $cliRoot "crates")) { throw "installed CLI must not see a crates/ tree" }
           $good = Join-Path $iso "sbx-good"
