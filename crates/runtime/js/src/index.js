@@ -89,6 +89,33 @@ const unloadCallbacks = new Set(); // ctx.onUnload — fires per webContents des
 // ctx.onLoad subscriptions made after this point fire immediately (the event already passed).
 let appLoaded = false;
 
+// --- A3 background close path (close-latency redesign) ---
+//
+// The window-destroyed handler transfers per-window teardown off the Electron close path:
+// destroyed returns after synchronous bookkeeping only (record transfer, map removal, VM
+// sealing, subscription snapshot, batch enqueue). Guest deactivate / QuickJS disposal /
+// onUnload delivery run in a round-robin background pump (setImmediate chain), so the
+// native window is gone at baseline speed. Observable order (deactivate before onUnload)
+// is preserved inside each window's batch; see fireUnloadSnapshot.
+//
+// Permanent safety premises (R2): at most MAX_RENDERER_PLUGINS_PER_WINDOW renderer plugins
+// per window (fail-closed refuse at load); QuickJS work stays on the owning (main) thread.
+const MAX_RENDERER_PLUGINS_PER_WINDOW = 8;
+// Sealed VMs: after their window transfers, no async source except the owning teardown batch
+// may create QuickJS handles, drain jobs, or invoke guest code on them. teardownActive marks
+// the single VM the background pump is currently servicing (its own drain is legitimate).
+const vmSealed = new WeakSet();
+const teardownActive = new WeakSet();
+// Transferred-window close batches, FIFO. Each batch: { handle, contentsId, seq,
+// actSnaps: [{ key, pluginId, vm, lifecycle, cleanups }], unloadSnap: [unloadEntry...] }.
+const closeQueue = [];
+let closePumpScheduled = false;
+let closeSeqCounter = 0;
+// Quit-mode switch (R1 exit semantics). Set on before-quit; gates NEW allocations only —
+// never flushes, never emits. Cleared when host life demonstrably continues (new window
+// content created / loaded after a cancelled quit) or on reset().
+let quitting = false;
+
 function hasPermission(granted, perm) {
   return Array.isArray(granted) && granted.includes(perm);
 }
@@ -271,6 +298,11 @@ let pumpDrainCount = 0;
 // guest continuations execute inside the same per-operation CPU-deadline enforcement as every other
 // plugin turn (ADR 0002), and a failing slice stops the pump without spinning.
 function drainPendingJobs(vm, pluginId, label) {
+  if (vmSealed.has(vm) && !teardownActive.has(vm)) {
+    // A3 isolation: a sealed VM (its window transferred) must not run guest jobs for any
+    // async source except its owning teardown batch, which marks teardownActive first.
+    return;
+  }
   if (vmDrains.get(vm)) {
     // Already draining this VM (a settle happened from inside a guest job the current drain is
     // executing). The running pump loop re-checks hasPendingJob() and picks the new job up, so a
@@ -310,6 +342,11 @@ function settleOp(id, mode, makeHandle) {
     // Already settled, or torn down with its VM (cleanupPendingOps). Late settles are no-ops.
     return;
   }
+  if (vmSealed.has(op.vm)) {
+    // A3 isolation: the owning window transferred. Teardown deleted this op's registration at
+    // transfer (abandonVmOps); a surviving entry races teardown and must not touch the VM.
+    return;
+  }
   pendingOps.delete(id);
   const label = op.label + " (op #" + id + ")";
   try {
@@ -340,6 +377,11 @@ function settleOp(id, mode, makeHandle) {
 // Create a host-owned pending promise for an async host API. The returned handle is the promise the
 // guest `await`s (return it from the host function); settle it later via settleOp(opId, ...).
 function newHostPromise(vm, pluginId, label) {
+  if (vmSealed.has(vm)) {
+    // A3 isolation: sealed VMs must not create new pending ops. Return the VM's undefined as
+    // the awaited value so guest continuations observe no settlement and run no further.
+    return { opId: -1, handle: vm.undefined };
+  }
   const deferred = vm.newPromise();
   const opId = nextOpId++;
   pendingOps.set(opId, { pluginId, vm, deferred, label: label || "host op" });
@@ -430,6 +472,10 @@ function makeInterruptHandler(vm, deadline) {
 }
 
 function runQuickJSOperation(vm, pluginId, label, operation, requireUndefined = false) {
+  if (vmSealed.has(vm) && !teardownActive.has(vm)) {
+    // A3 isolation: sealed VMs run no further guest code except inside their teardown batch.
+    return false;
+  }
   if ((quickJSInterruptCounts.get(vm) || 0) > QUICKJS_CPU_DEADLINE_INTERRUPT_LIMIT) {
     // This VM already exhausted its cumulative CPU budget (RT-1/RT-2). Refuse to run any further
     // guest code; the crossing operation scheduled the VM's disposal, and callers treat a `false`
@@ -618,6 +664,18 @@ function watchAsyncActivate(vm, pluginId, label, thenableHandle, onRejected) {
   thenableHandle.dispose();
   native.then(
     (result) => {
+      if (vmSealed.has(vm)) {
+        // A3 isolation: the window transferred while activation was in flight. The close batch
+        // owns this VM's disposal; this late settlement must not touch it (dispose here would
+        // double-count disposal and could run guest-adjacent cleanup twice).
+        try {
+          if (result && typeof result.dispose === "function") result.dispose();
+          else if (result && result.error) result.error.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+        return;
+      }
       if (result && result.error) {
         const reason = guestErrorText(vm, result.error);
         try {
@@ -635,7 +693,10 @@ function watchAsyncActivate(vm, pluginId, label, thenableHandle, onRejected) {
       }
     },
     (error) => {
-      // resolvePromise resolves (never rejects) natively; this branch is defensive only.
+      // resolvePromise resolves (never rejects) natively; this branch is defensive only. A3
+      // isolation: a sealed window's late settlement returns here without touching its VM —
+      // the close batch owns disposal.
+      if (vmSealed.has(vm)) return;
       onRejected(error && error.message ? String(error.message) : String(error));
     },
   );
@@ -1695,6 +1756,7 @@ function runRawPlugin(plugin, generation, fingerprint, windowRecord) {
 }
 
 function runMainPlugin(plugin, app, generation, fingerprint) {
+  if (quitting) return; // A3: no new loads once quit begins (recovery clears on continued life).
   // Developer-mode raw plugin: bypass the QuickJS sandbox entirely (see runRawPlugin).
   if (hasPermission(plugin.granted, "runtime.unsafe")) {
     return runRawPlugin(plugin, generation, fingerprint);
@@ -1873,6 +1935,38 @@ function runMainPlugin(plugin, app, generation, fingerprint) {
 // --- Renderer-plugin sandbox (runs per window on did-finish-load) ---
 
 function runRendererPlugin(plugin, w, generation, fingerprint) {
+  if (quitting) return; // A3: no new loads once quit begins (recovery clears on continued life).
+  // A3 safety premise (R2, permanent): at most MAX_RENDERER_PLUGINS_PER_WINDOW renderer plugins
+  // per window, counting active registrations plus pending reservations (raw plugins included:
+  // their deactivate runs guest code with no CPU deadline). The check runs at loader entry in
+  // stable plan order (reconcile iterates the plan in order), so the first eight in plan order
+  // deterministically win and the rest fail closed with an error log. Without the cap the
+  // background close pump's worst-case stall is unbounded (finding 5).
+  {
+    const suffix = "@" + w.contents.id;
+    // Stable refusal (finding 4): refused under this plan once, never retried or re-logged
+    // under the same plan — later async completions must not promote losers over the stable
+    // first-eight. Keyed by the evaluated plan generation (not the live global, which may have
+    // moved). w.capped may be absent on synthetic records; treat as empty.
+    if (w.capped && w.capped.get(plugin.id) === generation) return;
+    let slots = 0;
+    for (const key of rendererPlugins.keys()) if (key.endsWith(suffix)) slots += 1;
+    for (const key of pendingRendererPlugins.keys()) if (key.endsWith(suffix)) slots += 1;
+    if (slots >= MAX_RENDERER_PLUGINS_PER_WINDOW) {
+      if (w.capped) w.capped.set(plugin.id, generation);
+      pluginLog(
+        plugin.id,
+        "error",
+        "renderer plugin limit exceeded (" +
+          MAX_RENDERER_PLUGINS_PER_WINDOW +
+          "/window); refusing to load " +
+          plugin.id +
+          " for window " +
+          w.contents.id,
+      );
+      return;
+    }
+  }
   // Developer-mode raw plugin: bypass the QuickJS sandbox entirely (see runRawPlugin). The window
   // record is passed along so the plugin registers under its per-window key and respects the
   // rendererGeneration guard, exactly like the QuickJS renderer loaders.
@@ -2045,12 +2139,16 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
     // stale late rejection never tears down a newer VM).
     const lifecycle = capturePluginDeactivate(vm);
     let deactivated = false;
-    const deactivate = () => {
-      if (deactivated) return;
+    // lifecycle/cleanups are retained on the entry so a window-close batch can service this
+    // plugin's teardown in the background pump without re-entering through deactivate().
+    const entry = { vm, fingerprint, deactivate: null, lifecycle, cleanups: cleanupCallbacks };
+    entry.deactivate = () => {
+      // closeClaimed entries are owned by a close batch (A3 transfer neutralized this closure);
+      // any stale caller besides the batch is a no-op so guest deactivate runs at most once.
+      if (deactivated || entry.closeClaimed) return;
       deactivated = true;
       deactivatePluginVM(vm, plugin.id, "renderer plugin", lifecycle, cleanupCallbacks);
     };
-    const entry = { vm, fingerprint, deactivate };
     rendererPlugins.set(key, entry);
     if (activationCapture.asyncResult) {
       watchAsyncActivate(
@@ -2079,9 +2177,52 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
 function reconcileRendererPlugins(w) {
   const contents = w.contents;
   const wanted = new Map();
+  // A3 quit gate: once quit begins, no NEW plugin loads (removals below still run so
+  // revocation stays effective while quitting). Recovery clears `quitting` on continued
+  // host life (new window content), so normal operation is unaffected.
+  const addsAllowed = !quitting;
   for (const p of currentPlan.plugins) {
     if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access") || hasPermission(p.granted, "renderer.storage") || hasPermission(p.granted, "renderer.dom"))) {
       wanted.set(p.id, { plugin: p, fingerprint: pluginFingerprint(p) });
+    }
+  }
+
+  // R2 reorder squeeze (finding 4): rank the current plan's renderer wants in stable plan
+  // order. Actives ranked at eight or beyond are deactivated even when fingerprints match, so
+  // the cap holds when a reorder squeezes previously-loaded plugins out; pendings beyond eight
+  // are cancelled before they resolve. Removal of a loaded winner lets the next candidate
+  // promote deterministically on a later reconcile (its capped refusal, if any, was recorded
+  // under an older plan generation and no longer applies).
+  const rankOf = new Map();
+  for (const p of currentPlan.plugins) {
+    if (p.renderer && (hasPermission(p.granted, "renderer.script") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access") || hasPermission(p.granted, "renderer.storage") || hasPermission(p.granted, "renderer.dom"))) {
+      if (!rankOf.has(p.id)) rankOf.set(p.id, rankOf.size);
+    }
+  }
+  {
+    const suffix = "@" + contents.id;
+    for (const [key, entry] of [...rendererPlugins]) {
+      if (!key.endsWith(suffix)) continue;
+      const rank = rankOf.has(key.slice(0, -suffix.length))
+        ? rankOf.get(key.slice(0, -suffix.length))
+        : Infinity;
+      if (rank >= MAX_RENDERER_PLUGINS_PER_WINDOW) {
+        rendererPlugins.delete(key);
+        entry.deactivate();
+        pluginLog(
+          key.slice(0, -suffix.length),
+          "info",
+          "renderer plugin squeezed out by plan reorder (beyond 8/window)",
+        );
+      }
+    }
+    for (const key of [...pendingRendererPlugins.keys()]) {
+      if (!key.endsWith(suffix)) continue;
+      const rank = rankOf.has(key.slice(0, -suffix.length))
+        ? rankOf.get(key.slice(0, -suffix.length))
+        : Infinity;
+      // Loader continuations re-check map identity, so a cancelled pending fast-fails silently.
+      if (rank >= MAX_RENDERER_PLUGINS_PER_WINDOW) pendingRendererPlugins.delete(key);
     }
   }
 
@@ -2102,7 +2243,7 @@ function reconcileRendererPlugins(w) {
       pendingRendererPlugins.delete(key);
     }
     if (!rendererPlugins.has(key) && !pendingRendererPlugins.has(key)) {
-      runRendererPlugin(want.plugin, w, planGeneration, want.fingerprint);
+      if (addsAllowed) runRendererPlugin(want.plugin, w, planGeneration, want.fingerprint);
     }
   }
 
@@ -2120,6 +2261,310 @@ function reconcileRendererPlugins(w) {
   }
 }
 
+// --- A3 background close machinery ---
+//
+// destroyed transfers teardown here; the pump services one plugin slice per macrotask,
+// round-robin across windows (finding 6 fairness), preserving deactivate-before-unload
+// order inside each window's batch (finding 3: no contract change).
+
+// Synchronously abandon a sealing VM's in-flight host ops: dispose their deferreds so no
+// later settlement can create handles, and drop its drain guard. Runs inside the destroyed
+// transfer (before any setImmediate), so the isolation window is zero.
+function abandonVmOps(vm) {
+  cleanupPendingOps(vm);
+}
+
+// Stop a dead window's polling/subscription surfaces synchronously at transfer, without
+// touching Electron: each snapshot's host cleanups run now (dom cleanup stops its poller and
+// disposes callback handles; css cleanup drops live-keys — removal against destroyed contents
+// fast-fails inside removeCssKey). All cleanups are idempotent, so the background slice's
+// defensive re-run is a no-op. In-flight query resolutions fast-fail on the missing panel.
+function quenchRecord(rec, actSnaps) {
+  if (!rec) return;
+  try {
+    if (rec.quenched) return;
+    rec.quenched = true;
+  } catch (_e) {
+    return;
+  }
+  for (const snap of actSnaps || []) {
+    if (!snap.cleanups) continue;
+    try {
+      cleanupAll(snap.cleanups);
+    } catch (_e) {
+      // Quench must never throw out of the destroyed handler.
+    }
+  }
+}
+
+function suffixKeys(map, suffix) {
+  const out = [];
+  for (const key of map.keys()) if (key.endsWith(suffix)) out.push(key);
+  return out;
+}
+
+// Async variant of drainThenableResult: same 2000ms wall cap (DEACTIVATE_DRAIN_MS) and same
+// settlement semantics, but polls across setImmediate turns so the event loop (surviving
+// windows, DUR-1 polling) is never held hostage by one guest cleanup. Resolves
+// "fulfilled" / "rejected" / "timeout". Does not dispose promiseHandle (caller-owned).
+function asyncDrainThenableResult(vm, pluginId, label, promiseHandle, timeoutMs) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      if (vmSealed.has(vm) && !teardownActive.has(vm)) {
+        resolve("timeout");
+        return;
+      }
+      drainPendingJobs(vm, pluginId, label);
+      let state;
+      try {
+        state = vm.getPromiseState(promiseHandle);
+      } catch (_e) {
+        resolve("fulfilled"); // VM is going away; treat as settled so disposal proceeds.
+        return;
+      }
+      if (state.type === "fulfilled") {
+        if (!state.notAPromise && state.value) {
+          try {
+            state.value.dispose();
+          } catch (_e) {
+            // Best effort.
+          }
+        }
+        resolve("fulfilled");
+        return;
+      }
+      if (state.type === "rejected") {
+        if (state.error) {
+          try {
+            state.error.dispose();
+          } catch (_e) {
+            // Best effort.
+          }
+        }
+        resolve("rejected");
+        return;
+      }
+      if (Date.now() >= deadline) {
+        resolve("timeout");
+        return;
+      }
+      setImmediate(poll);
+    };
+    poll();
+  });
+}
+
+// Background-service one snapshotted renderer entry: guest deactivate (same contract as
+// deactivatePluginVM: sync-undefined or drained thenable, failures logged fail-closed),
+// then host cleanup, handle release, and VM disposal. Never throws.
+async function asyncDeactivateSnap(snap) {
+  const { vm, pluginId, lifecycle, cleanups } = snap;
+  teardownActive.add(vm);
+  try {
+    if (lifecycle && lifecycle.deactivateExport) {
+      const capture = { asyncResult: null };
+      const ok = runLifecycleHook(
+        vm,
+        pluginId,
+        "renderer plugin deactivate",
+        () => vm.callFunction(lifecycle.deactivateExport, lifecycle.moduleExports, lifecycle.ctx),
+        capture,
+      );
+      if (!ok) {
+        if (capture.asyncResult) {
+          try {
+            capture.asyncResult.dispose();
+          } catch (_e) {
+            // Best effort.
+          }
+        }
+        pluginLog(
+          pluginId,
+          "error",
+          "renderer plugin deactivate failed or returned a non-undefined result; continuing with disposal",
+        );
+      } else if (capture.asyncResult) {
+        const outcome = await asyncDrainThenableResult(
+          vm,
+          pluginId,
+          "renderer plugin deactivate",
+          capture.asyncResult,
+          DEACTIVATE_DRAIN_MS,
+        );
+        try {
+          capture.asyncResult.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+        if (outcome !== "fulfilled") {
+          pluginLog(
+            pluginId,
+            "error",
+            "renderer plugin deactivate failed or timed out; continuing with disposal",
+          );
+        }
+      }
+    }
+  } finally {
+    for (const handle of [lifecycle && lifecycle.deactivateExport, lifecycle && lifecycle.ctx, lifecycle && lifecycle.moduleExports]) {
+      if (handle) {
+        try {
+          handle.dispose();
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+    }
+    if (cleanups) {
+      try {
+        cleanupAll(cleanups);
+      } catch (_e) {
+        // A throwing host cleanup must not prevent VM disposal.
+      }
+    }
+    disposeVM(vm);
+    teardownActive.delete(vm);
+  }
+}
+
+// Background-service one snapshotted RAW entry (finding 2): run its own deactivate closure,
+// which executes the raw guest cleanup synchronously with full host parity, guarded internally
+// against throws and double runs. Raw entries carry no VM, lifecycle handles, or host cleanups,
+// so there is nothing else to release. Never throws.
+async function rawDeactivateSlice(snap) {
+  try {
+    snap.rawDeactivate();
+  } catch (_e) {
+    // runRawPlugin's deactivate already guards throws/double-runs; this covers defects.
+  }
+}
+
+// Deliver one window batch's unload snapshot: each entry at most once for this window.
+// Entries revoked after the snapshot (no longer subscribed) are skipped: their plugin is gone
+// and delivery would run guest code on a disposed VM. Entries subscribed after the snapshot
+// were never captured, so they can never receive this window's unload (finding 2).
+function fireUnloadSnapshot(batch) {
+  for (const snapEntry of batch.unloadSnap) {
+    if (!snapEntry) continue;
+    if (!unloadCallbacks.has(snapEntry)) continue;
+    try {
+      snapEntry.invoke([batch.handle]);
+    } catch (_e) {
+      // invoke() is fail-closed internally; this guards the snapshot loop itself.
+    }
+  }
+}
+
+function scheduleClosePump() {
+  if (closePumpScheduled) return;
+  closePumpScheduled = true;
+  setImmediate(pumpCloseQueue);
+}
+
+// Round-robin, single slice per macrotask (Gate 2R): each pump turn starts at most one
+// slice — the first eligible batch in queue order — then yields, so one turn's synchronous
+// prefix (a guest deactivate call, bounded by the CPU deadline) never multiplies across
+// windows. The served batch rotates behind newer arrivals, so consecutive turns alternate
+// across windows. Each batch still carries at most one in-flight slice (inFlightCount); a
+// batch whose slice is running is skipped, never re-entered, and its unload waits until every
+// in-flight teardown of that batch completes. Wakeups need no trailing schedule: every started
+// slice reschedules on completion, and transfers/sweeps schedule explicitly — an all-in-flight
+// queue therefore sleeps instead of spinning.
+function pumpCloseQueue() {
+  closePumpScheduled = false;
+  for (let i = 0; i < closeQueue.length; i += 1) {
+    const batch = closeQueue[i];
+    if (batch.inFlightCount > 0) continue;
+    const snap = batch.actSnaps[batch.cursor];
+    if (!snap) continue;
+    batch.cursor += 1;
+    batch.inFlightCount += 1;
+    // Rotate behind newer arrivals so the next turn serves another window first.
+    closeQueue.splice(i, 1);
+    closeQueue.push(batch);
+    const work = snap.raw ? rawDeactivateSlice(snap) : asyncDeactivateSnap(snap);
+    work
+      .catch(() => {})
+      .then(() => {
+        batch.inFlightCount -= 1;
+        scheduleClosePump();
+      });
+    break; // exactly one slice per macrotask
+  }
+  // Fire unload for every fully serviced batch, wherever it sits in the queue: completion
+  // order, not arrival order. Each unload carries its own window handle and no cross-window
+  // unload order is contracted, so holding a finished batch behind a slow head would be pure
+  // head-of-line blocking (finding 6). A batch leaves the queue only here — so queue-empty
+  // still implies no in-flight teardown anywhere. No trailing schedule: every started slice
+  // reschedules on completion and transfers/sweeps schedule explicitly, so an all-in-flight
+  // queue sleeps instead of spinning.
+  for (let i = closeQueue.length - 1; i >= 0; i -= 1) {
+    const batch = closeQueue[i];
+    if (batch.inFlightCount > 0 || batch.cursor < batch.actSnaps.length) continue;
+    closeQueue.splice(i, 1);
+    fireUnloadSnapshot(batch);
+  }
+}
+
+// will-quit safety sweep (findings 2/3/4): dispose any QuickJS VMs the background pump has
+// not reached, WITHOUT running guest deactivate (not even raw: raw guest code may block quit
+// without any deadline, so the dispose-only exit tier applies to every plugin kind — finding 2)
+// and WITHOUT emitting unload (no double-fire by construction: unload stays queued for the
+// pump). The loop starts at batch.cursor, so a slice already in flight (index cursor-1 while
+// inFlightCount is 1) is never touched: when it completes, the pump still fires this batch's
+// unload afterwards, preserving deactivate-before-unload even across the "drain started, then
+// will-quit, then cancel" race (finding 3). Raw snaps are left in place for the pump (their
+// guest cleanup still runs in a surviving process); only disposed QuickJS snaps are compacted
+// out, so a repeat will-quit finds nothing left to dispose (idempotent). If the process exits
+// first, the undelivered unloads and unrun raw cleanups are the documented R1 best-effort exit
+// semantic — VM disposal, the fail-closed half, is already complete here. Dispose-only here (no
+// guest code runs), so quit is never held hostage by guest cleanup; no upper bound on a slow
+// disposeVM itself is declared.
+function sweepUndisposedSync() {
+  let serviced = false;
+  for (const batch of closeQueue) {
+    const remaining = [];
+    for (let i = batch.cursor; i < batch.actSnaps.length; i += 1) {
+      const snap = batch.actSnaps[i];
+      if (!snap) continue;
+      // Raw snaps carry no VM to dispose and their guest cleanup must not run on the quit
+      // path (finding 2): leave them queued for the pump (surviving process) or for R1 loss
+      // on process termination.
+      if (snap.raw || !snap.vm) {
+        remaining.push(snap);
+        continue;
+      }
+      serviced = true;
+      // Release retained lifecycle handles first: disposeVM frees the runtime, and any live
+      // handle left over would trip QuickJS's GC-empty assertion at FreeRuntime.
+      const lc = snap.lifecycle;
+      for (const handle of [lc && lc.deactivateExport, lc && lc.ctx, lc && lc.moduleExports]) {
+        if (handle) {
+          try {
+            handle.dispose();
+          } catch (_e) {
+            // Best effort.
+          }
+        }
+      }
+      try {
+        if (snap.cleanups) cleanupAll(snap.cleanups);
+      } catch (_e) {
+        // Best effort.
+      }
+      try {
+        disposeVM(snap.vm);
+      } catch (_e) {
+        // Best effort.
+      }
+      teardownActive.delete(snap.vm);
+    }
+    batch.actSnaps = batch.actSnaps.slice(0, batch.cursor).concat(remaining);
+  }
+  if (serviced) scheduleClosePump();
+}
+
 function cleanupRendererPlugins(contentsId) {
   const suffix = "@" + contentsId;
   for (const key of pendingRendererPlugins.keys()) {
@@ -2135,6 +2580,8 @@ function cleanupRendererPlugins(contentsId) {
 
 function reconcileMainPlugins(app) {
   const wanted = new Map();
+  // A3 quit gate: see reconcileRendererPlugins — adds refused while quitting, removals run.
+  const addsAllowed = !quitting;
   for (const p of currentPlan.plugins) {
     if (p.main && (hasPermission(p.granted, "electron.window") || hasPermission(p.granted, "runtime.unsafe") || hasPermission(p.granted, "network.access"))) {
       const fingerprint = pluginFingerprint(p);
@@ -2152,7 +2599,7 @@ function reconcileMainPlugins(app) {
         pendingMainPlugins.delete(p.id);
       }
       if (!mainPlugins.has(p.id) && !pendingMainPlugins.has(p.id)) {
-        runMainPlugin(p, app, planGeneration, fingerprint);
+        if (addsAllowed) runMainPlugin(p, app, planGeneration, fingerprint);
       }
     }
   }
@@ -2267,6 +2714,39 @@ function start(app, sinks = {}) {
   }
   appRef = app;
 
+  // A3 quit semantics (R1): before-quit is ONLY a mode switch for the allocator gate below —
+  // never a flush, never an event (a flush here would race the not-yet-destroyed windows and
+  // reintroduce the 250ms/order conflict). Delivery is owned by the destroyed transfer plus
+  // the background pump, which runs during quit's window-closing phase. will-quit runs a
+  // dispose-only sweep (no guest code, no unload events): no VM is ever left undisposed while
+  // the process lives, and exit never waits on guest cleanup. All three hooks are persistent
+  // (app.on, idempotent bodies) so repeat quits re-latch and re-sweep correctly (finding 3):
+  // a cancelled quit recovers the allocator via continued host life (new window content,
+  // window focus, or app re-activation below), while already-transferred batches stay valid —
+  // their windows are genuinely gone — and keep pumping because the loop is alive.
+  if (app && typeof app.on === "function") {
+    app.on("before-quit", () => {
+      quitting = true;
+    });
+    // A quit cancelled with no new window still resumes: focusing any window or re-activating
+    // the app proves continued life and reopens the allocator.
+    app.on("browser-window-focus", () => {
+      quitting = false;
+    });
+    // 'activate' is macOS-dock-centric but harmless elsewhere; kept as one more recovery
+    // signal alongside focus/created/load.
+    app.on("activate", () => {
+      quitting = false;
+    });
+    app.on("will-quit", () => {
+      try {
+        sweepUndisposedSync();
+      } catch (_e) {
+        // Best effort — the process is exiting regardless.
+      }
+    });
+  }
+
   // Lifecycle boot event (SPEC §9 onLoad): mark the target app's main process as loaded once the
   // app is ready. bootstrap.js calls runtime.start(...) and THEN requires the original app, so the
   // original app's own boot code (its ready handlers / whenReady consumers) is registered before
@@ -2358,22 +2838,85 @@ function start(app, sinks = {}) {
     if (contents.getType() !== "window") {
       return;
     }
+    // A cancelled quit leaves the process alive: new window content proves continued life and
+    // ends quit-mode allocation gating (finding 4 recovery; before-quit is only a switch).
+    if (quitting) quitting = false;
     const w = {
       contents,
       keys: new Map(),
       gens: new Map(),
       loaded: false,
       rendererGeneration: 0,
+      // A3 R2 stable refusal: pluginId -> planGeneration under which this window refused it.
+      // A refused plugin is never retried nor re-logged under the same plan, regardless of later
+      // slot drift from async completions (finding 4). A new plan generation re-evaluates.
+      capped: new Map(),
     };
     windows.set(contents.id, w);
     contents.on("destroyed", () => {
-      const contentsId = contents.id;
-      windows.delete(contentsId);
-      cleanupRendererPlugins(contentsId);
+      // A3 transfer: synchronous bookkeeping only — the native window must be releasable the
+      // moment this handler returns. Guest deactivate / disposal / unload delivery run in the
+      // background pump (pumpCloseQueue). Observable order (deactivate before onUnload) is
+      // preserved inside each window's batch (finding 3: no contract change).
+      const rec = windows.get(contents.id);
       // Main-plugin lifecycle (SPEC §9 onUnload): fires per window when its webContents is
       // destroyed. A quitting app always destroys its windows, so app shutdown reaches the same
-      // path — a separate before-quit wire would double-fire normal per-window teardown.
-      fireWindowUnload(contentsId);
+      // path — a separate before-quit event wire would double-fire normal per-window teardown
+      // (before-quit is only a mode switch, q.v. start()).
+      if (!rec || rec.dead) return; // duplicate destroyed / re-entrant: only first transfer counts
+      rec.dead = true;
+      rec.readyArmed = false; // late adapter-gate ready() must no-op (see onReady guard below)
+      const contentsId = contents.id;
+      const handle = contentsId;
+      windows.delete(contentsId);
+      // Cancel pending loaders for this window (loader continuations re-check identity and the
+      // windows map, so any late resolution fast-fails without creating VMs).
+      const suffix = "@" + contentsId;
+      for (const key of [...pendingRendererPlugins.keys()]) {
+        if (key.endsWith(suffix)) pendingRendererPlugins.delete(key);
+      }
+      // Extract active entries, neutralizing their sync deactivate closures so teardown runs
+      // exactly once, via this batch (stale callers of entry.deactivate() become no-ops).
+      const actSnaps = [];
+      for (const [key, entry] of [...rendererPlugins]) {
+        if (!key.endsWith(suffix)) continue;
+        rendererPlugins.delete(key);
+        entry.closeClaimed = true;
+        if (entry.vm) {
+          // Seal first: from here no async source except this batch may touch the VM, and its
+          // in-flight host ops are abandoned synchronously (zero isolation window).
+          abandonVmOps(entry.vm);
+          vmSealed.add(entry.vm);
+          actSnaps.push({
+            key,
+            pluginId: key.slice(0, -suffix.length),
+            vm: entry.vm,
+            lifecycle: entry.lifecycle || null,
+            cleanups: entry.cleanups || null,
+          });
+        } else {
+          // Raw (runtime.unsafe) entries carry no VM: snapshot their deactivate closure so the
+          // background pump still runs guest cleanup in a surviving process (finding 2). Without
+          // this the neutralized closure below would drop raw cleanup entirely.
+          actSnaps.push({
+            key,
+            pluginId: key.slice(0, -suffix.length),
+            vm: null,
+            raw: true,
+            rawDeactivate: entry.deactivate,
+          });
+        }
+        entry.deactivate = () => {};
+      }
+      quenchRecord(rec, actSnaps);
+      // Subscriber snapshot: unload receivers fixed at destroy; later subscribers and later
+      // plan revisions never receive this window's unload (finding 2). Revoked-after-snapshot
+      // entries are filtered at delivery (their VMs are sealed).
+      const unloadSnap = [...unloadCallbacks];
+      // inFlightCount tracks slices started-but-unfinished for this batch (finding 1: at most
+      // one per batch; unload waits for zero).
+      closeQueue.push({ handle, contentsId, seq: ++closeSeqCounter, actSnaps, unloadSnap, cursor: 0, inFlightCount: 0 });
+      scheduleClosePump();
     });
     contents.on("did-finish-load", () => {
       // Path A renderer-timing seam: the active adapter may opt into `renderer.gate(win, ready)`
@@ -2382,6 +2925,11 @@ function start(app, sinks = {}) {
       // must call ready() exactly once within a bounded timeout (makeSelectorGate), and a throwing
       // gate falls back to the default timing below.
       const onReady = () => {
+        // A3 isolation: a late adapter-gate ready() for a transferred (dead) window must not
+        // resurrect it — no reconcile, no plugin creation, no events. Recovery: quitting mode
+        // ends when host life demonstrably continues (a load reaching this live path).
+        if (w.dead || w.readyArmed === false || windows.get(contents.id) !== w) return;
+        if (quitting) quitting = false;
         w.loaded = true;
         w.rendererGeneration += 1;
         cleanupRendererPlugins(contents.id);
@@ -2433,6 +2981,35 @@ function reset() {
   pendingMainPlugins.clear();
   rendererPlugins.clear();
   pendingRendererPlugins.clear();
+  // A3: deterministically retire queued close batches (dispose-only, no guest code, no events)
+  // so no test observes another test's background teardown and no VM leaks across reset.
+  for (const batch of closeQueue.splice(0, closeQueue.length)) {
+    for (const snap of batch.actSnaps || []) {
+      const lc = snap.lifecycle;
+      for (const handle of [lc && lc.deactivateExport, lc && lc.ctx, lc && lc.moduleExports]) {
+        if (handle) {
+          try {
+            handle.dispose();
+          } catch (_e) {
+            // Best effort.
+          }
+        }
+      }
+      try {
+        if (snap.cleanups) cleanupAll(snap.cleanups);
+      } catch (_e) {
+        // Best effort.
+      }
+      try {
+        if (snap.vm) disposeVM(snap.vm);
+      } catch (_e) {
+        // Best effort.
+      }
+      if (snap.vm) teardownActive.delete(snap.vm);
+    }
+  }
+  closePumpScheduled = false;
+  quitting = false;
   abuseDisabledPlugins.clear();
   vmDisposeCount = 0;
   quickJSGetCount = 0;
@@ -2489,6 +3066,11 @@ module.exports = {
     pendingOps: () => pendingOps,
     vmDrains: () => vmDrains,
     pendingOpsSize: () => pendingOps.size,
+    // A3 close-path seams: queued background batches, VM sealing, quit-mode switch.
+    closeQueueSize: () => closeQueue.length,
+    isVmSealed: (vm) => vmSealed.has(vm),
+    isQuitting: () => quitting,
+    maxRendererPluginsPerWindow: () => MAX_RENDERER_PLUGINS_PER_WINDOW,
     drainCount: () => pumpDrainCount,
     quickJSInterruptCount: (vm) => quickJSInterruptCounts.get(vm) || 0,
   },
