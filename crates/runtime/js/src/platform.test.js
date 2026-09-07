@@ -546,6 +546,13 @@ describe("ctx.onUnload", () => {
       createWindow(c1);
       loadWindow(c1);
       c1.emit("destroyed");
+      // A3 background close: unload delivery leaves the destroyed handler via the close-queue
+      // pump (order preserved, timing async). Await the background batch instead of asserting
+      // synchronously.
+      await waitFor(
+        () => pluginMessages(pid, "info", "ul:" + c1.id).length === 1,
+        "unload delivered for c1",
+      );
       expect(pluginMessages(pid, "info", "ul:" + c1.id)).toHaveLength(1);
       // The runtime also dropped the window record as part of the same teardown path.
       expect(testing.windows().has(c1.id)).toBe(false);
@@ -555,6 +562,10 @@ describe("ctx.onUnload", () => {
       createWindow(c2);
       loadWindow(c2);
       c2.emit("destroyed");
+      await waitFor(
+        () => pluginMessages(pid, "info", "ul:" + c2.id).length === 1,
+        "unload delivered for c2",
+      );
       expect(pluginMessages(pid, "info", "ul:" + c2.id)).toHaveLength(1);
       expect(pluginMessages(pid, "info", "ul:" + c1.id)).toHaveLength(1);
     },
@@ -605,6 +616,11 @@ describe("lifecycle subscription cleanup", () => {  test(
       createWindow(c1);
       loadWindow(c1);
       c1.emit("destroyed");
+      // A3 background close: unload is delivered by the close-queue pump; await it.
+      await waitFor(
+        () => pluginMessages(pid, "info", "rc-ul:" + c1.id).length === 1,
+        "unload delivered for c1",
+      );
       expect(pluginMessages(pid, "info", "rc-onload")).toHaveLength(1);
       expect(pluginMessages(pid, "info", "rc-rr:" + c1.id)).toHaveLength(1);
       expect(pluginMessages(pid, "info", "rc-ul:" + c1.id)).toHaveLength(1);
@@ -747,6 +763,13 @@ describe("unified WindowHandle: lifecycle handles drive window ops", () => {
       expect(fakeWindows.get(c1.id)).toBeUndefined();
       loadWindow(c1);
       c1.emit("destroyed");
+      // A3 background close: unload delivery leaves the destroyed handler via the close-queue
+      // pump (order preserved, timing async). Await the background batch instead of asserting
+      // synchronously.
+      await waitFor(
+        () => pluginMessages(pid, "info", "unload-op:100").length === 1,
+        "unload delivered for c1",
+      );
 
       expect(win.calls).toContainEqual(["setPosition", 10, 20]);
       expect(pluginMessages(pid, "info", "unload-op:100")).toHaveLength(1);
@@ -825,6 +848,15 @@ describe("cross-namespace WindowHandle collision", () => {
       loadWindow(cB);
       cA.emit("destroyed");
       cB.emit("destroyed");
+      // A3 background close: unload is delivered by the close-queue pump; await both batches.
+      await waitFor(
+        () => pluginMessages(pid, "info", "unload-op:100;").length === 1,
+        "unload delivered for winA",
+      );
+      await waitFor(
+        () => pluginMessages(pid, "info", "unload-op:1;").length === 1,
+        "unload delivered for winB",
+      );
 
       expect(winA.calls).toContainEqual(["setOpacity", 0.5]);
       expect(winA.calls).toContainEqual(["setSize", 800, 600]);

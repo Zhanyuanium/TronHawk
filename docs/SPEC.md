@@ -162,6 +162,24 @@ Events (MVP): `onLoad`, `onUnload`, `onRendererReady`, `onWindowCreated`;
 (future) `onSessionCreated`, `onIPCMessage`, `onNetworkRequest`. Event callbacks stay synchronous
 `undefined`-returning; the runtime never drains a callback return value.
 
+Window-close teardown (R1 exit semantics, R2 plugin cap — binding):
+- The native window is released synchronously on close; per-window teardown (guest
+  `deactivate`, VM disposal, `onUnload` delivery) runs in a background pump preserving
+  `deactivate`-before-`onUnload` order. `onUnload` fires exactly once per window for
+  subscribers registered at destroy time.
+- R1: if the process exits while background teardown is still queued (single-window quit,
+  `app.exit`, kill, crash), not-yet-run guest `deactivate`/`onUnload` deliveries may be lost.
+  VM disposal is still guaranteed by a dispose-only `will-quit` sweep (no guest code runs
+  there) or, for a terminating process, by the OS. `app.exit`/kill/crash carry no delivery
+  guarantee at all.
+- R2: at most 8 renderer plugins per window (permanent invariant). Further loads fail closed
+  with an error log; the first eight in stable plan order win deterministically.
+- Accepted limits (Gate 2 scope-change): consecutive window transfers inside one event loop
+  may head-of-line-block later windows for on the order of 2s (one guest deactivate call runs
+  per pump turn under the CPU deadline before yielding); no upper bound is declared for a
+  slow `disposeVM` itself; DUR-1 plan polling is guaranteed only to self-recover after cleanup
+  drains, with no time-limit guarantee while teardown is concurrent.
+
 API principles: capability-based (`ctx.window.setVibrancy()`, never `electron.BrowserWindow()`);
 explicit per-context types (`RendererContext` / `MainContext` / `NetworkContext`); stable abstraction
 (no Electron private / Chromium internals / unstable app internals).

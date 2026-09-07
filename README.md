@@ -33,6 +33,11 @@ user-controlled, permission-gated, and sandboxed.
   `renderer.storage`, `electron.window`, `network.access`, …). CSS is
   treated as **data** and never executed as JS; there is no arbitrary page-JS
   execution bridge, and plugins cannot `fetch()` directly.
+- **Fast window close**: the native window is released synchronously on close
+  while plugin teardown (guest `deactivate`, VM disposal, `onUnload`) drains in
+  the background, preserving `deactivate`-before-`onUnload` order. If the
+  process exits mid-teardown, pending guest cleanup may be skipped (VM disposal
+  is still guaranteed); at most 8 renderer plugins per window.
 - **Layered architecture**: strict separation between Manager, Core, Injector,
   and Runtime (`docs/AGENTS.md`).
 
