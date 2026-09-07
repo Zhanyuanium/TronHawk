@@ -22,7 +22,19 @@ test("native guidance names the fix (no silent fallback)", () => {
   expect(msg.toLowerCase()).toContain("no typescript fallback");
 });
 
-test("native candidate resolves in the monorepo (debug or release build)", () => {
+// Engine-dependent tests: the ts job runs on a pure-bun runner with no
+// `cargo build` (no target/{debug,release}/tronhawk-pack). Skip cleanly when
+// no candidate resolves via the trusted sources (TRONHAWK_PACK_BIN /
+// explicit config / workspace); the e2e acceptance gate builds the release
+// engine and exercises the same paths. No hardcoded paths: the probe reuses
+// locateCandidate() so every platform resolves identically.
+//
+// NOTE: bun:test `skipIf` is curried — `test.skipIf(cond)("name", fn)`.
+// Passing (cond, name, fn) registers nothing (silently drops the test).
+const hasNativeEngine = locateCandidate() !== null;
+const itWithEngine = test.skipIf(!hasNativeEngine);
+
+itWithEngine("native candidate resolves in the monorepo (debug or release build)", () => {
   // Requires `cargo build -p tronhawk-package` (debug) to have run; the e2e gate builds it.
   const candidate = locateCandidate();
   expect(candidate).not.toBeNull();
@@ -32,7 +44,7 @@ test("native candidate resolves in the monorepo (debug or release build)", () =>
   );
 });
 
-test("same-version engine resolves and matches the expected version", () => {
+itWithEngine("same-version engine resolves and matches the expected version", () => {
   const { engineVersion } = readCliPackage();
   const native = resolveNative();
   expect(native.version).toBe(engineVersion);
@@ -53,7 +65,7 @@ function makeVictimEngine(): { dir: string; victim: string } {
   return { dir, victim };
 }
 
-test("TOCTOU: swapping the original after digest verification fails closed", () => {
+itWithEngine("TOCTOU: swapping the original after digest verification fails closed", () => {
   const { engineVersion } = readCliPackage();
   const { dir, victim } = makeVictimEngine();
   const savedEnv = process.env.TRONHAWK_PACK_BIN;
@@ -93,7 +105,9 @@ test("TOCTOU: swapping the original after digest verification fails closed", () 
   }
 });
 
-test("failed resolutions leave no snapshot residue; cleanup removes the temp root", () => {
+itWithEngine(
+  "failed resolutions leave no snapshot residue; cleanup removes the temp root",
+  () => {
   const { engineVersion } = readCliPackage();
   // Ensure the process-private temp root exists.
   const native = resolveNative();
