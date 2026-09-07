@@ -98,7 +98,7 @@ binary) and the same-version native `tronhawk-pack` engine (see below).
 ## `@tronhawk/sdk` / `@tronhawk/cli` dependency resolution
 
 Both default to the npm registry release line (`^0.2.0` for `@tronhawk/sdk`,
-`^0.1.0` for `@tronhawk/cli`, kept in sync with
+`^0.1.1` for `@tronhawk/cli`, kept in sync with
 `sdk/package.json` and `tools/tronhawk-cli/package.json`). Pass `--sdk` /
 `--cli` at scaffold time to override (e.g. `--sdk file:/path/to/sdk.tgz` or
 `--cli file:/path/to/tronhawk-cli.tgz` for unpublished tarballs). The

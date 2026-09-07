@@ -1910,7 +1910,7 @@ mod tests {
 
     #[test]
     fn protocol_gate_blocks_extract_before_write() {
-        // Default host entry point: `^2.0` plugin vs HOST_PROTOCOL_VERSION (0.1.0) is rejected
+        // Default host entry point: `^2.0` plugin vs HOST_PROTOCOL_VERSION (0.1.1) is rejected
         // before anything reaches disk.
         let m = manifest_bytes("^2.0");
         let err = assert_extract_rejects(&[("manifest.json", m.as_slice())], "host protocol is");
@@ -2674,7 +2674,7 @@ mod tests {
     #[test]
     fn engine_version_matches_crate_version() {
         // The engine version is the crate version; it is independent from the CLI and
-        // protocol versions (never assume equality, even when all three are `0.1.0` today).
+        // protocol versions (never assume equality, even when all three are `0.1.1` today).
         assert_eq!(engine_version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(HOST_PROTOCOL_VERSION, "0.1.1");
     }
