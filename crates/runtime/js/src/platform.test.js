@@ -546,6 +546,13 @@ describe("ctx.onUnload", () => {
       createWindow(c1);
       loadWindow(c1);
       c1.emit("destroyed");
+      // A3 background close: unload delivery leaves the destroyed handler via the close-queue
+      // pump (order preserved, timing async). Await the background batch instead of asserting
+      // synchronously.
+      await waitFor(
+        () => pluginMessages(pid, "info", "ul:" + c1.id).length === 1,
+        "unload delivered for c1",
+      );
       expect(pluginMessages(pid, "info", "ul:" + c1.id)).toHaveLength(1);
       // The runtime also dropped the window record as part of the same teardown path.
       expect(testing.windows().has(c1.id)).toBe(false);
@@ -555,6 +562,10 @@ describe("ctx.onUnload", () => {
       createWindow(c2);
       loadWindow(c2);
       c2.emit("destroyed");
+      await waitFor(
+        () => pluginMessages(pid, "info", "ul:" + c2.id).length === 1,
+        "unload delivered for c2",
+      );
       expect(pluginMessages(pid, "info", "ul:" + c2.id)).toHaveLength(1);
       expect(pluginMessages(pid, "info", "ul:" + c1.id)).toHaveLength(1);
     },
@@ -606,6 +617,11 @@ describe("lifecycle subscription cleanup", () => {
       createWindow(c1);
       loadWindow(c1);
       c1.emit("destroyed");
+      // A3 background close: unload is delivered by the close-queue pump; await it.
+      await waitFor(
+        () => pluginMessages(pid, "info", "rc-ul:" + c1.id).length === 1,
+        "unload delivered for c1",
+      );
       expect(pluginMessages(pid, "info", "rc-onload")).toHaveLength(1);
       expect(pluginMessages(pid, "info", "rc-rr:" + c1.id)).toHaveLength(1);
       expect(pluginMessages(pid, "info", "rc-ul:" + c1.id)).toHaveLength(1);
