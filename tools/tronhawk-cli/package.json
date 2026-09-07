@@ -22,8 +22,8 @@
     "typecheck": "tsc --noEmit"
   },
   "tronhawk": {
-    "engineVersion": "0.1.0",
-    "protocolVersion": "0.1.0"
+    "engineVersion": "0.1.1",
+    "protocolVersion": "0.1.1"
   },
   "dependencies": {
     "quickjs-emscripten-core": "^0.32.0",

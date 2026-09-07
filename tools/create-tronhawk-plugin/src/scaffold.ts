@@ -25,7 +25,7 @@ export type PluginType = "css" | "renderer" | "main";
  * release line. Keep in sync with `sdk/package.json` (`version` and the
  * `tronhawk` coordination fields there).
  */
-export const DEFAULT_SDK_SPEC = "^0.1.0";
+export const DEFAULT_SDK_SPEC = "^0.2.0";
 
 /**
  * Default `@tronhawk/cli` range for scaffolded plugins: the published npm
@@ -48,7 +48,7 @@ export interface ScaffoldOptions {
   version: string;
   /** Reverse-DNS plugin id. */
   pluginId: string;
-  /** Dependency spec for `@tronhawk/sdk` (registry range by default, e.g. "^0.1.0"; `--sdk` overrides). */
+  /** Dependency spec for `@tronhawk/sdk` (registry range by default, e.g. "^0.2.0"; `--sdk` overrides). */
   sdkSpec: string;
   /** Dependency spec for `@tronhawk/cli` (registry range by default, e.g. "^0.1.0"; `--cli` overrides). */
   cliSpec: string;
@@ -470,17 +470,20 @@ export function readmeContent(o: ScaffoldOptions): string {
     ``,
     `\`\`\`sh`,
     `${buildStepLine}`,
-    `tronhawk validate .    # authoritative dir check (writes nothing)`,
+    `./node_modules/.bin/tronhawk validate .    # authoritative dir check (writes nothing)`,
+    `./node_modules/.bin/tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)`,
     `${packStepLine}`,
-    `tronhawk inspect ${o.slug}.thx   # passthrough to the Rust engine (behavior defined by Rust)`,
+    `./node_modules/.bin/tronhawk inspect ${o.slug}.thx   # passthrough to the Rust engine (behavior defined by Rust)`,
     `\`\`\``,
+    ``,
+    `How to invoke \`tronhawk\`: \`tronhawk\` is a devDependency binary (\`node_modules/.bin/tronhawk[.exe]\`), not on \`PATH\`. A bare \`tronhawk validate .\` fails with "command not found" — \`bun run <script>\` resolves \`.bin\` automatically, a bare command does not. Pick one: (1) \`./node_modules/.bin/tronhawk …\` (most reliable, used above); (2) add \`.bin\` to \`PATH\` for this shell session only; (3) put the command in \`package.json\` \`scripts\` and run \`bun run <script>\` (recommended for repeated use; \`build\`/\`pack\` already work this way). Add scripts for the commands you run often, e.g. \`{ "scripts": { "validate": "tronhawk validate .", "sandbox": "tronhawk test . --sandbox", "inspect": "tronhawk inspect ./${o.slug}.thx" } }\` then \`bun run validate\` / \`bun run sandbox\`.`,
     ``,
     `(CSS-only plugins skip the build step with an explicit notice but still run`,
     `staging; every type packs through the unified \`tronhawk pack\` command and the`,
     `same-version Rust/SHA path. Never invoke the engine binary directly: only the`,
     `CLI enforces the expected-engine version, digest, and snapshot guarantees.)`,
     `The CLI needs the native engine (same-version \`tronhawk-pack\`): set`,
-    `\`TRONHAWK_PACK_BIN\` to the engine binary, configure \`tronhawk.packBin\` in`,
+    `\`TRONHAWK_PACK_BIN\` (explicit, highest priority) to the engine binary, configure \`tronhawk.packBin\` in`,
     `the CLI package, or build it inside a TronHawk checkout`,
     `(\`cargo build -p tronhawk-package --release\`, resolved from`,
     `\`target/{release,debug}/tronhawk-pack\`). Download the asset matching your`,

@@ -13,6 +13,6 @@ test("cli/engine/protocol versions are managed independently", () => {
 });
 
 test("release-tag consistency is only an explicit assertion", () => {
-  expect(() => assertReleaseTagMatches("v0.1.0", "0.1.0", "engine")).not.toThrow();
-  expect(() => assertReleaseTagMatches("v0.2.0", "0.1.0", "engine")).toThrow();
+  expect(() => assertReleaseTagMatches("v0.1.1", "0.1.1", "engine")).not.toThrow();
+  expect(() => assertReleaseTagMatches("v0.2.0", "0.1.1", "engine")).toThrow();
 });

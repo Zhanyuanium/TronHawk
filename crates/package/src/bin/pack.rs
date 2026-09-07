@@ -19,7 +19,7 @@
 //! equivalent to `pack pack <plugin-dir> <output.thx>`.
 //!
 //! `--host-version` selects the host runtime protocol version the operation validates
-//! against (semver, e.g. `0.1.0`). When omitted, [`tronhawk_package::HOST_PROTOCOL_VERSION`]
+//! against (semver, e.g. `0.1.1`). When omitted, [`tronhawk_package::HOST_PROTOCOL_VERSION`]
 //! is used. The crate never guesses the host version.
 
 use std::path::{Path, PathBuf};

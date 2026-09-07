@@ -18,6 +18,42 @@ CLI hard-fails with install guidance and never falls back to a TypeScript packer
 
 ## Commands
 
+### How to invoke `tronhawk`
+
+`tronhawk` is a devDependency binary (`node_modules/.bin/tronhawk[.exe]`), not on
+`PATH`. A bare `tronhawk validate .` in a plugin directory fails with "command not
+found" — `bun run <script>` resolves `.bin` automatically, a bare command does not.
+Pick one:
+
+1. `./node_modules/.bin/tronhawk …` (most reliable, copy-paste ready):
+   ```sh
+   ./node_modules/.bin/tronhawk validate .
+   ```
+2. Add `.bin` to `PATH` for this shell session only:
+   ```sh
+   # PowerShell
+   $env:PATH = ".\node_modules\.bin;$env:PATH"
+   # bash/zsh
+   export PATH="$PWD/node_modules/.bin:$PATH"
+   ```
+3. Put the command in `package.json` `scripts` and run `bun run <script>`
+   (recommended for repeated use; `bun run` resolves `.bin` automatically). The
+   scaffolded template already ships `build`/`pack` this way (`bun run build`,
+   `bun run pack`); add the rest as needed, e.g.
+   `{ "scripts": { "validate": "tronhawk validate ." } }`, then `bun run validate`.
+
+The `tronhawk …` lines below are the CLI syntax — in a real shell run them via one
+of the three methods above.
+
+Engine resolution (highest first): `TRONHAWK_PACK_BIN` env (explicit, highest
+priority) > explicit `tronhawk.packBin` config > workspace
+`target/{release,debug}/tronhawk-pack(.exe)`. A missing binary, digest mismatch,
+version mismatch (`tronhawk.engineVersion` must exactly match
+`tronhawk-pack --version`), or unsupported `<platform>-<arch>` hard-fails with
+install guidance (`cargo build -p tronhawk-package --release` from the TronHawk repo
+root, or set `TRONHAWK_PACK_BIN`); there is no TypeScript fallback packer and no
+`PATH` search for the engine. See [Native engine resolution](#native-engine-resolution).
+
 ```sh
 tronhawk build <plugin-dir> [--outdir <dir>]
 tronhawk validate <plugin-dir> [--host-version <ver>] [--json]

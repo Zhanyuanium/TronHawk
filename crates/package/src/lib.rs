@@ -38,13 +38,13 @@ const MAX_COMPRESSION_RATIO: u64 = 100;
 /// A plugin's `manifest.json` `tronhawk` field is a semver `VersionReq` over this *runtime
 /// protocol* version (not the SDK/npm version). This constant is the single source of truth used
 /// by the legacy [`extract`]/[`validate_manifest`] entry points. It mirrors the workspace release
-/// version (`0.1.0`) and matches the `^0.1` ranges used by the repository's own plugin fixtures.
+/// version (`0.1.1`) and matches the `^0.1` ranges used by the repository's own plugin fixtures.
 ///
 /// Callers that know a different host version should pass it explicitly via
 /// [`extract_for_host`] / [`validate_manifest_schema_for_host`] / [`validate_tronhawk_protocol`]
 /// instead of relying on this default; when the host runtime bumps its protocol version, update
 /// this constant (and prefer migrating callers to the explicit-version variants).
-pub const HOST_PROTOCOL_VERSION: &str = "0.1.0";
+pub const HOST_PROTOCOL_VERSION: &str = "0.1.1";
 
 /// Declared value type of one plugin config field (see [`ConfigField`]). Only scalar types are
 /// supported today; `object`/`array` config fields are rejected as reserved for a future schema
@@ -170,7 +170,7 @@ pub fn validate_manifest_schema(manifest: &serde_json::Value) -> Result<(), Stri
 /// (validate_tronhawk_protocol): a plugin whose `tronhawk` range is not satisfied by the host's
 /// protocol version is rejected here, i.e. before anything is written to disk or installed.
 ///
-/// `host_version` is provided by the caller (in semver form, e.g. `"0.1.0"`); this crate never
+/// `host_version` is provided by the caller (in semver form, e.g. `"0.1.1"`); this crate never
 /// hardcodes the host version inside the check itself.
 pub fn validate_manifest_schema_for_host(
     manifest: &serde_json::Value,
@@ -2676,7 +2676,7 @@ mod tests {
         // The engine version is the crate version; it is independent from the CLI and
         // protocol versions (never assume equality, even when all three are `0.1.0` today).
         assert_eq!(engine_version(), env!("CARGO_PKG_VERSION"));
-        assert_eq!(HOST_PROTOCOL_VERSION, "0.1.0");
+        assert_eq!(HOST_PROTOCOL_VERSION, "0.1.1");
     }
 
     // --- Gate 2 hardening regressions (temp-file safety + inspect entry presence) ---

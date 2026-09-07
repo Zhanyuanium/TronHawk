@@ -1,6 +1,6 @@
 [package]
 name = "manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "TronHawk manager (Tauri GUI)"
 authors = ["TronHawk contributors"]
 edition = "2021"

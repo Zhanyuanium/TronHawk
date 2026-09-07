@@ -271,11 +271,19 @@ create-tronhawk-plugin my-plugin --type renderer
 cd my-plugin && bun install
 bun run build            # tronhawk build .: bundle entries to dist/ (CSS-only: no build step, style.css ships as data)
 bun test                 # starter smoke test against @tronhawk/sdk mocks (no host)
-tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
-tronhawk validate .      # authoritative dir check (writes nothing)
-tronhawk pack . my-plugin.thx   # build -> staging -> Rust pack (CSS-only: staging with no build -> Rust pack)
-tronhawk inspect my-plugin.thx  # passthrough to the Rust engine (behavior defined by Rust)
+./node_modules/.bin/tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
+./node_modules/.bin/tronhawk validate .      # authoritative dir check (writes nothing)
+bun run pack             # tronhawk pack . my-plugin.thx (or ./node_modules/.bin/tronhawk pack . my-plugin.thx)
+./node_modules/.bin/tronhawk inspect my-plugin.thx  # passthrough to the Rust engine (behavior defined by Rust)
 ```
+
+> How to invoke `tronhawk`: `tronhawk` is a devDependency binary
+> (`node_modules/.bin/tronhawk[.exe]`), not on `PATH` — a bare `tronhawk validate .`
+> fails with "command not found" (`bun run <script>` resolves `.bin` automatically, a
+> bare command does not). Use `./node_modules/.bin/tronhawk …` (most reliable, used
+> above), a `package.json` script with `bun run` (recommended for repeated use), or a
+> session-local `PATH` addition. See `tools/tronhawk-cli/README.md` § How to invoke
+> `tronhawk`.
 
 - Type-check only: `bun install` + `bun run typecheck` (`tsc --noEmit`).
   This checks types; it does not bundle or pack anything.
@@ -338,7 +346,7 @@ entry. CSS entries (`css` / `entry.css`) are **data** injected via
 
 The manifest `tronhawk` field (e.g. `"^0.1"`) is the **host runtime protocol
 version** the plugin targets, expressed as a semver range over the host
-protocol (`HOST_PROTOCOL_VERSION`, currently `0.1.0`). It is **not** the
+protocol (`HOST_PROTOCOL_VERSION`, currently `0.1.1`). It is **not** the
 `@tronhawk/sdk` npm version. A plugin whose range does not match the running
 host is rejected before install/load; the SDK version and the protocol version
 evolve independently.

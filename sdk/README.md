@@ -2,7 +2,7 @@
 
 TypeScript API for [TronHawk](https://github.com/Zhanyuanium/TronHawk) plugins: context types plus testing helpers. No host runtime, no packer.
 
-> Version `0.1.0` is the first usable but incomplete release. Only the APIs listed below as implemented are wired into the host runtime. The authoritative contract lives in `docs/PLUGIN-SDK.md` in the TronHawk repo.
+> Version `0.2.0` is the first usable but incomplete release. Only the APIs listed below as implemented are wired into the host runtime. The authoritative contract lives in `docs/PLUGIN-SDK.md` in the TronHawk repo.
 >
 > 中文版见 [README.zh-CN.md](./README.zh-CN.md)。
 
@@ -83,13 +83,24 @@ create-tronhawk-plugin my-plugin --type renderer
 cd my-plugin && bun install
 bun run build            # tronhawk build .: bundle entries to dist/ (CSS-only: no build step, style.css ships as data)
 bun test                 # starter smoke test against SDK mocks (no host)
-tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
-tronhawk validate .      # authoritative dir check (writes nothing)
-tronhawk pack . my-plugin.thx
-tronhawk inspect my-plugin.thx
+./node_modules/.bin/tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
+./node_modules/.bin/tronhawk validate .      # authoritative dir check (writes nothing)
+bun run pack             # tronhawk pack . my-plugin.thx (or ./node_modules/.bin/tronhawk pack . my-plugin.thx)
+./node_modules/.bin/tronhawk inspect my-plugin.thx
 ```
 
-The CLI resolves the engine from trusted sources only (no PATH search):
+How to invoke `tronhawk`: `tronhawk` is a devDependency binary
+(`node_modules/.bin/tronhawk[.exe]`), not on `PATH`. A bare `tronhawk validate .`
+fails with "command not found" — `bun run <script>` resolves `.bin` automatically, a
+bare command does not. Pick one: (1) `./node_modules/.bin/tronhawk …` (most reliable,
+used above); (2) add `.bin` to `PATH` for this shell session only; (3) put the command
+in `package.json` `scripts` and run `bun run <script>` (recommended for repeated use;
+`build`/`pack` already work this way). Add scripts for the commands you run often, e.g.
+`{ "scripts": { "validate": "tronhawk validate .", "sandbox": "tronhawk test . --sandbox" } }`,
+then `bun run validate` / `bun run sandbox`. See `tools/tronhawk-cli/README.md`
+§ How to invoke `tronhawk`.
+
+The CLI resolves the engine from trusted sources only (no PATH search), highest first:
 `TRONHAWK_PACK_BIN` (explicit, highest priority), explicit config
 `tronhawk.packBin`, or `target/{release,debug}/tronhawk-pack(.exe)` from a
 local cargo build. Set `TRONHAWK_PACK_BIN` to the same-version

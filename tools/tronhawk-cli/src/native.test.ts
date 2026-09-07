@@ -48,7 +48,7 @@ itWithEngine("same-version engine resolves and matches the expected version", ()
   const { engineVersion } = readCliPackage();
   const native = resolveNative();
   expect(native.version).toBe(engineVersion);
-  expect(native.hostProtocol).toBe("0.1.0");
+  expect(native.hostProtocol).toBe("0.1.1");
 });
 
 function makeVictimEngine(): { dir: string; victim: string } {

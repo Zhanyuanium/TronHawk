@@ -97,7 +97,8 @@ binary) and the same-version native `tronhawk-pack` engine (see below).
 
 ## `@tronhawk/sdk` / `@tronhawk/cli` dependency resolution
 
-Both default to the npm registry release line (`^0.1.0`, kept in sync with
+Both default to the npm registry release line (`^0.2.0` for `@tronhawk/sdk`,
+`^0.1.0` for `@tronhawk/cli`, kept in sync with
 `sdk/package.json` and `tools/tronhawk-cli/package.json`). Pass `--sdk` /
 `--cli` at scaffold time to override (e.g. `--sdk file:/path/to/sdk.tgz` or
 `--cli file:/path/to/tronhawk-cli.tgz` for unpublished tarballs). The
@@ -113,15 +114,27 @@ same-version Rust/SHA path; never invoke the engine binary directly):
 ```sh
 cd <plugin-dir> && bun install
 bun run build            # tronhawk build .: bundle entries to dist/ (CSS-only: no build step)
-tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
-tronhawk validate .      # authoritative dir check (writes nothing)
-tronhawk pack . <name>.thx
-tronhawk inspect <name>.thx
+./node_modules/.bin/tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
+./node_modules/.bin/tronhawk validate .      # authoritative dir check (writes nothing)
+bun run pack             # tronhawk pack . <name>.thx (or ./node_modules/.bin/tronhawk pack . <name>.thx)
+./node_modules/.bin/tronhawk inspect <name>.thx
 ```
 
-The CLI needs the same-version native engine: set `TRONHAWK_PACK_BIN` to the
-`tronhawk-pack` release binary (explicit, highest priority), configure
-`tronhawk.packBin`, or build it inside a TronHawk checkout (`cargo build -p
+How to invoke `tronhawk`: `tronhawk` is a devDependency binary
+(`node_modules/.bin/tronhawk[.exe]`), not on `PATH`. A bare `tronhawk validate .`
+fails with "command not found" — `bun run <script>` resolves `.bin` automatically, a
+bare command does not. Pick one: (1) `./node_modules/.bin/tronhawk …` (most reliable,
+used above); (2) add `.bin` to `PATH` for this shell session only; (3) put the command
+in `package.json` `scripts` and run `bun run <script>` (recommended for repeated use;
+`build`/`pack` already work this way). Add scripts for the commands you run often, e.g.
+`{ "scripts": { "validate": "tronhawk validate .", "sandbox": "tronhawk test . --sandbox" } }`,
+then `bun run validate` / `bun run sandbox`. See `tools/tronhawk-cli/README.md`
+§ How to invoke `tronhawk`.
+
+The CLI needs the same-version native engine, resolved in this priority order
+(highest first): `TRONHAWK_PACK_BIN` env to the
+`tronhawk-pack` release binary (explicit, highest priority) > explicit config
+`tronhawk.packBin` > workspace build inside a TronHawk checkout (`cargo build -p
 tronhawk-package --release`, resolved from
 `target/{release,debug}/tronhawk-pack`). The CLI's `tronhawk.engineVersion`
 must exactly match `tronhawk-pack --version`; a missing binary, digest

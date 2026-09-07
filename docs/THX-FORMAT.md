@@ -95,11 +95,11 @@ Top-level shape (unknown fields are rejected):
 - The `tronhawk` field is the **host runtime protocol version** the plugin
   targets (a semver `VersionReq`, e.g. `"^0.1"`). It is **not** the
   `@tronhawk/sdk` npm version; the two evolve independently.
-- The host implements protocol `HOST_PROTOCOL_VERSION` (currently `0.1.0`).
+- The host implements protocol `HOST_PROTOCOL_VERSION` (currently `0.1.1`).
   `validate_manifest_schema_for_host` / `extract_for_host` reject a plugin
   whose range does not match the running host **before anything is written to
   disk or installed**, naming both sides
-  (e.g. ``plugin requires tronhawk protocol `^0.2` but host protocol is 0.1.0``).
+  (e.g. ``plugin requires tronhawk protocol `^0.2` but host protocol is 0.1.1``).
 - Callers that know a different host version pass it explicitly; the crate
   never hardcodes the check.
 

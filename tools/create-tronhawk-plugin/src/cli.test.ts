@@ -200,6 +200,17 @@ describe("scaffold templates", () => {
     expect(readme.content).toContain(
       "cargo run -p tronhawk-package --bin tronhawk-pack",
     );
+    // CLI invocation errata: no bare `tronhawk …` shell line is copy-paste
+    // ready by default (`tronhawk` is a devDependency .bin, not on PATH).
+    expect(readme.content).toContain("How to invoke `tronhawk`");
+    expect(readme.content).toContain("not on `PATH`");
+    expect(readme.content).toContain("./node_modules/.bin/tronhawk validate .");
+    expect(readme.content).toContain(
+      "./node_modules/.bin/tronhawk test . --sandbox",
+    );
+    expect(readme.content).toContain("./node_modules/.bin/tronhawk inspect");
+    expect(readme.content).toContain("bun run validate");
+    expect(readme.content).not.toMatch(/\ntronhawk (build|validate|pack|inspect|test) \./);
     // Unified CLI pack: the old direct-engine `tronhawk-pack pack` bypass is gone.
     expect(readme.content).not.toContain("tronhawk-pack pack");
     // Standalone-first: the monorepo cargo flow is documented only as the
