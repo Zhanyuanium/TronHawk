@@ -411,7 +411,7 @@ jobs:
             Remove-Item -Force -ErrorAction SilentlyContinue $cliJsonOut
             $cOut = bun "$tronhawk" pack "$fixture" "$cliJsonOut" --json 2>&1
             if ($LASTEXITCODE -ne 0) { throw "CLI pack --json must exit 0 ($fixtureType; output: $cOut)" }
-            $cLines = ($cOut | Out-String).Split("`n") | Where-Object { $_.Trim() -ne "" }
+            $cLines = @(($cOut | Out-String).Split("`n") | Where-Object { $_.Trim() -ne "" })
             if (-not $cLines) { throw "CLI pack --json produced no stdout" }
             foreach ($ln in $cLines) {
               try { $ln.Trim() | ConvertFrom-Json -ErrorAction Stop | Out-Null }
