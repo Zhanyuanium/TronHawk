@@ -1,0 +1,9 @@
+{
+  "id": "com.example.valid-css-only",
+  "name": "Valid CSS Only",
+  "version": "0.1.0",
+  "author": "Conformance",
+  "tronhawk": "^0.1",
+  "entry": { "css": "style.css" },
+  "permissions": ["renderer.css"]
+}

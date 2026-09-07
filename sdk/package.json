@@ -1,7 +1,7 @@
 {
   "name": "@tronhawk/sdk",
-  "version": "0.1.0",
-  "description": "TypeScript API for TronHawk plugins (types only, no runtime)",
+  "version": "0.2.0",
+  "description": "TypeScript API for TronHawk plugins",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -12,12 +12,19 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts",
     "./package.json": "./package.json"
   },
-  "files": ["src/index.ts", "README.md", "README.zh-CN.md"],
+  "files": ["src/index.ts", "src/testing/index.ts", "src/testing/permissions.ts", "src/testing/mocks.ts", "src/testing/lifecycle.ts", "README.md", "README.zh-CN.md"],
   "publishConfig": {
     "access": "public"
   },
+  "tronhawk": {
+    "protocol": "^0.1",
+    "cli": "@tronhawk/cli@^0.1.0",
+    "packBinary": "tronhawk-pack"
+  },
+  "tronhawkNote": "The manifest `tronhawk` field is the host runtime protocol version (^0.1), NOT this package's npm version (0.2.0): the two evolve independently, as do the CLI version and the engine version (see @tronhawk/cli README: CLI version, `tronhawk.engineVersion`, `tronhawk.protocolVersion` are managed independently). `tronhawk.protocol` states the protocol range this SDK release targets; `tronhawk.cli` pins the CLI release line tested together with this SDK; `tronhawk.packBinary` is the standalone GitHub Release binary the CLI shells out to outside a monorepo checkout. (JSON has no comments, so this note is a field.) See docs/PLUGIN-SDK.md.",
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"

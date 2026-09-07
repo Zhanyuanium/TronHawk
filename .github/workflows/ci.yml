@@ -4,14 +4,19 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.4.0"
       - name: Build runtime.js bundle
@@ -21,6 +26,9 @@ jobs:
           bun install
           New-Item -ItemType Directory -Force -Path ../assets | Out-Null
           bun run build
+      - name: Test runtime.js (contract harness + unit)
+        working-directory: crates/runtime/js
+        run: bun test
       - name: Build core + injector
         run: cargo build -p tronhawk-core -p tronhawk-injector
       - name: Stage manager sidecar binaries
@@ -41,8 +49,8 @@ jobs:
   ts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.4.0"
       - name: Install workspace
@@ -53,6 +61,17 @@ jobs:
       - name: Test SDK
         working-directory: sdk
         run: bun test
+      - name: Typecheck CLI
+        working-directory: tools/tronhawk-cli
+        run: bun run typecheck
+      - name: Test CLI (unit + sandbox)
+        working-directory: tools/tronhawk-cli
+        run: bun test
+      - name: Install runtime JS deps (contract harness)
+        working-directory: crates/runtime/js
+        run: bun install
+      - name: Test plugin conformance fixtures
+        run: bun test tests/plugin-conformance
       - name: Typecheck hello-world plugin
         working-directory: plugins/hello-world
         run: bun run typecheck
@@ -60,10 +79,12 @@ jobs:
   integration:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.4.0"
       - name: Install workspace deps
@@ -81,9 +102,11 @@ jobs:
     runs-on: windows-latest
     needs: integration
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Stage plugin without node_modules
         shell: pwsh
         run: |
@@ -102,3 +125,446 @@ jobs:
           Expand-Archive -LiteralPath "hello-world.thx" -DestinationPath "_thx_check"
           if (-not (Test-Path -LiteralPath "_thx_check/manifest.json" -PathType Leaf)) { throw "manifest.json missing in hello-world.thx" }
           Get-Content -LiteralPath "_thx_check/manifest.json" -Raw | ConvertFrom-Json | Out-Null
+
+  standalone-acceptance:
+    # External-plugin flow with NO workspace link and NO Cargo context.
+    # Installs creator + CLI + SDK from packed npm tarballs into an isolated
+    # dir outside the checkout, then runs the full chain for a fixture
+    # plugin: create -> install -> build -> typecheck -> test -> validate ->
+    # pack (CLI shelling out to the standalone release binary via
+    # TRONHAWK_PACK_BIN, never `cargo -p`) -> inspect + structural checks.
+    # This stops `workspace:*` links and Cargo workspace shortcuts from
+    # masking a broken SDK/CLI release.
+    #
+    # Gate 2 acceptance (public contracts only, no undeclared behavior):
+    # - exit codes 0/1/2 (success / authoritative rejection / usage error);
+    # - `pack --json` is JSON-only on stdout (Rust: single JSON object;
+    #   CLI: every non-empty line parses as JSON, last line ok:true);
+    # - `inspect` verifies entry existence (manifest + entry files resolve);
+    # - no TypeScript fallback packer (missing/digest-mismatch/PATH-hijack
+    #   hard-fails with install guidance, never silently succeeds).
+    # Matrix covers renderer (existing path, preserved) + css-only + main
+    # fixtures; `target`/`ext` mirror release-cli.yml platform tuples so a
+    # rename of a Release asset breaks this job loudly.
+    name: standalone acceptance (${{ matrix.os }} / ${{ matrix.fixture }} / ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        fixture: [renderer, css, main]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.0"
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Pack npm tarballs (creator + cli + sdk)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tarballs = Join-Path $env:RUNNER_TEMP "th-tarballs"
+          New-Item -ItemType Directory -Force -Path $tarballs | Out-Null
+          # The scaffold hard-depends on all three; fail loud if one is missing.
+          $pkgs = @("sdk", "tools/create-tronhawk-plugin", "tools/tronhawk-cli")
+          foreach ($p in $pkgs) {
+            if (-not (Test-Path -LiteralPath (Join-Path $p "package.json"))) { throw "required package missing: $p" }
+            Push-Location -LiteralPath $p
+            try {
+              $raw = Get-Content -LiteralPath "package.json" -Raw
+              $pkg = $raw | ConvertFrom-Json
+              if ($pkg.private) { throw "$p/package.json is private:true and cannot be published" }
+              if ($raw -match "workspace:") { throw "$p/package.json must not contain workspace: specs" }
+              # Pack into the package dir, then move (no --destination flag:
+              # keeps this working on older bun 1.4.x).
+              Remove-Item -Force -ErrorAction SilentlyContinue ./*.tgz
+              bun pm pack | Out-Null
+              $made = Get-ChildItem -Filter *.tgz
+              if (-not $made) { throw "bun pm pack produced no tarball in $p" }
+              $made | Move-Item -Destination $tarballs -Force
+            } finally { Pop-Location }
+          }
+          $tgz = Get-ChildItem -LiteralPath $tarballs -Filter "*.tgz"
+          if (-not $tgz) { throw "no tarballs produced" }
+          $tgz | ForEach-Object { Write-Host $_.Name }
+      - name: Build standalone pack binary (release)
+        run: cargo build --release -p tronhawk-package --bin pack
+      - name: Full chain in isolated dir (no workspace, no cargo)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iso = Join-Path $env:RUNNER_TEMP "th-standalone"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $iso
+          New-Item -ItemType Directory -Force -Path $iso | Out-Null
+          if (Test-Path -LiteralPath (Join-Path $iso "Cargo.toml")) { throw "isolated dir must not be a Cargo workspace" }
+
+          $tarballs = Join-Path $env:RUNNER_TEMP "th-tarballs"
+          $creatorTgz = (Get-ChildItem -LiteralPath $tarballs -Filter "tronhawk-cli-create-plugin-*.tgz" | Select-Object -First 1).FullName
+          $sdkTgz = (Get-ChildItem -LiteralPath $tarballs -Filter "tronhawk-sdk-*.tgz" | Select-Object -First 1).FullName
+          # NOTE: "tronhawk-cli-*.tgz" also matches the creator tarball
+          # (tronhawk-cli-create-plugin-*): exclude it explicitly.
+          $cliTgz = (Get-ChildItem -LiteralPath $tarballs -Filter "tronhawk-cli-*.tgz" | Where-Object { $_.Name -notlike "*create-plugin*" } | Select-Object -First 1).FullName
+          if (-not $creatorTgz) { throw "creator tarball not found" }
+          if (-not $sdkTgz) { throw "sdk tarball not found" }
+          if (-not $cliTgz) { throw "cli tarball not found" }
+
+          # 1. create: install the creator FROM ITS TARBALL, never the workspace source.
+          $tool = Join-Path $iso "tool"
+          New-Item -ItemType Directory -Force -Path $tool | Out-Null
+          Push-Location -LiteralPath $tool
+          try {
+            bun add ("file:" + $creatorTgz.Replace("\", "/")) | Out-Null
+          } finally { Pop-Location }
+          $cli = Join-Path $tool "node_modules/@tronhawk/cli-create-plugin/src/cli.ts"
+          if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "creator CLI missing: $cli" }
+          $fixture = Join-Path $iso "fixture"
+          $fixtureType = "${{ matrix.fixture }}"
+          bun $cli --author "CI" `
+            --type $fixtureType `
+            --sdk ("file:" + $sdkTgz.Replace("\", "/")) `
+            --cli ("file:" + $cliTgz.Replace("\", "/")) `
+            $fixture
+          if ($LASTEXITCODE -ne 0) { throw "create failed ($fixtureType)" }
+
+          # The scaffold must carry no workspace: link and no local file:
+          # probe beyond the explicit --sdk/--cli overrides.
+          $raw = Get-Content -LiteralPath (Join-Path $fixture "package.json") -Raw
+          if ($raw -match "workspace:") { throw "scaffold leaked a workspace: spec" }
+
+          # The CLI shells out to this binary (mirrors using the Release asset).
+          $packBin = Join-Path $env:GITHUB_WORKSPACE "target/release/pack"
+          if ($IsWindows) { $packBin += ".exe" }
+          if (-not (Test-Path -LiteralPath $packBin -PathType Leaf)) { throw "pack binary missing: $packBin" }
+          $env:TRONHAWK_PACK_BIN = $packBin
+          # Platform tuple aligns with release-cli.yml: the Release asset for
+          # this runner must be `tronhawk-pack-<target>[.exe]` (Rust target
+          # triple: 3 or 4 hyphen-separated [a-z0-9_]+ segments, e.g.
+          # aarch64-apple-darwin / x86_64-unknown-linux-gnu). Fail loud on
+          # rename/drift (matrix.target/ext mirror the release matrix).
+          $expectedTarget = "${{ matrix.target }}"
+          $expectedExt = "${{ matrix.ext }}"
+          $releaseAsset = "tronhawk-pack-$expectedTarget$expectedExt"
+          # Allow 3- or 4-segment Rust triples; still reject path traversal,
+          # spaces, and special chars (only [a-z0-9_-] plus optional .exe).
+          if ($releaseAsset -notmatch '^tronhawk-pack-[a-z0-9_]+-[a-z0-9_]+-[a-z0-9_]+(-[a-z0-9_]+)?(\.exe)?$') { throw "bad release asset name: $releaseAsset" }
+          # Regression lock with release-cli.yml: renaming the asset prefix or
+          # any target in either file must break loudly. `dist/tronhawk-pack-`
+          # is the staging line in release-cli.yml (not a comment); `target:`
+          # pins the matrix value.
+          $releaseYmlPath = Join-Path $env:GITHUB_WORKSPACE ".github/workflows/release-cli.yml"
+          $releaseYml = Get-Content -LiteralPath $releaseYmlPath -Raw
+          if ($releaseYml -notmatch 'dist/tronhawk-pack-') { throw "release-cli.yml asset naming drifted (expected dist/tronhawk-pack-<target>)" }
+          if ($releaseYml -notmatch ("(?m)^\s*target:\s*" + [regex]::Escape($expectedTarget) + "\s*$")) { throw "matrix.target $expectedTarget not found in release-cli.yml (drift?)" }
+          Write-Host "fixture=$fixtureType os=${{ matrix.os }} expected-release-asset=$releaseAsset"
+          # CSS-only `bun run pack` invokes the engine directly: stage it on
+          # PATH under its Release asset name.
+          $engineDir = Join-Path $env:RUNNER_TEMP "th-engine-bin"
+          New-Item -ItemType Directory -Force -Path $engineDir | Out-Null
+          $engineName = "tronhawk-pack"
+          if ($IsWindows) { $engineName += ".exe" }
+          Copy-Item -Force -LiteralPath $packBin -Destination (Join-Path $engineDir $engineName)
+          # Also stage a copy under the exact Release asset name so the
+          # sidecar/PATH checks below exercise the published layout.
+          Copy-Item -Force -LiteralPath $packBin -Destination (Join-Path $engineDir $releaseAsset)
+          Add-Content -Path $env:GITHUB_PATH -Value $engineDir
+          # $GITHUB_PATH applies to later steps only; update this process too.
+          $env:PATH = "$engineDir$([IO.Path]::PathSeparator)$env:PATH"
+
+          Push-Location -LiteralPath $fixture
+          try {
+            # 2-5. install (registry defaults overridden to the local tarballs
+            # above) -> build (CLI bundles entries to dist/) -> typecheck ->
+            # starter test (SDK mocks, no host).
+            bun install
+            if ($LASTEXITCODE -ne 0) { throw "bun install failed" }
+            foreach ($dep in @("node_modules/@tronhawk/sdk", "node_modules/@tronhawk/cli")) {
+              $item = Get-Item -LiteralPath $dep -ErrorAction Stop
+              if ($item.LinkType) { throw "$dep is a $($item.LinkType), expected a real copy" }
+            }
+            bun run build
+            if ($LASTEXITCODE -ne 0) { throw "bun run build failed" }
+            bun run typecheck
+            if ($LASTEXITCODE -ne 0) { throw "bun run typecheck failed" }
+            bun test
+            if ($LASTEXITCODE -ne 0) { throw "bun test failed" }
+          } finally { Pop-Location }
+
+          $tronhawk = Join-Path $fixture "node_modules/@tronhawk/cli/src/cli.ts"
+          if (-not (Test-Path -LiteralPath $tronhawk -PathType Leaf)) { throw "tronhawk CLI missing: $tronhawk" }
+
+          # 6. CLI smoke test on the built output (JS entries only:
+          # `tronhawk test` exits non-zero for CSS-only plugins by contract),
+          # then the QuickJS contract sandbox over the same entries
+          # (`test --sandbox` runs for every fixture type; CSS-only passes
+          # with a note), then authoritative validate.
+          $manifestPre = Get-Content -LiteralPath (Join-Path $fixture "manifest.json") -Raw | ConvertFrom-Json
+          if ($manifestPre.entry.renderer -or $manifestPre.entry.main) {
+            bun $tronhawk test $fixture
+            if ($LASTEXITCODE -ne 0) { throw "tronhawk test failed" }
+          }
+          bun $tronhawk test $fixture --sandbox
+          if ($LASTEXITCODE -ne 0) { throw "tronhawk test --sandbox failed" }
+          bun $tronhawk validate $fixture
+          if ($LASTEXITCODE -ne 0) { throw "validate failed" }
+
+          # 7. pack via the generated script (tronhawk pack: build -> staging
+          # -> Rust pack -> Rust inspect round-trip -> atomic rename).
+          Push-Location -LiteralPath $fixture
+          try {
+            bun run pack
+            if ($LASTEXITCODE -ne 0) { throw "bun run pack failed" }
+          } finally { Pop-Location }
+
+          # 8. validate the .thx artifact: authoritative `inspect` plus
+          # structural checks (manifest parses, entry files resolve, JS
+          # entries export activate/deactivate).
+          $thx = Join-Path $fixture "fixture.thx"
+          if (-not (Test-Path -LiteralPath $thx -PathType Leaf)) { throw "fixture.thx not found" }
+          if ((Get-Item -LiteralPath $thx).Length -eq 0) { throw "fixture.thx is empty" }
+          & $packBin inspect $thx
+          if ($LASTEXITCODE -ne 0) { throw "inspect failed" }
+          $check = Join-Path $iso "_thx_check"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $check
+          Expand-Archive -LiteralPath $thx -DestinationPath $check
+          $manifest = Get-Content -LiteralPath (Join-Path $check "manifest.json") -Raw | ConvertFrom-Json
+          if ($manifest.id -ne "com.example.fixture") { throw "unexpected plugin id: $($manifest.id)" }
+          foreach ($prop in $manifest.entry.PSObject.Properties) {
+            if (-not (Test-Path -LiteralPath (Join-Path $check $prop.Value))) { throw "entry file missing in .thx: $($prop.Value)" }
+          }
+          foreach ($prop in $manifest.entry.PSObject.Properties | Where-Object { $_.Value -like "*.js" }) {
+            $entryAbs = (Join-Path $check $prop.Value).Replace("\", "/")
+            bun -e "const m = require('$entryAbs'); if (typeof m.activate !== 'function' || typeof m.deactivate !== 'function') { throw new Error('bad entry exports') }"
+            if ($LASTEXITCODE -ne 0) { throw "entry smoke test failed: $($prop.Value)" }
+          }
+
+          # 9. Exit-code contract 0/1/2 (declared in tools/tronhawk-cli/src/cli.ts
+          # and crates/package/src/bin/pack.rs: 0 success, 1 authoritative
+          # rejection / operation failure, 2 usage error). 0 is proven above.
+          # 1: unknown permission is rejected authoritatively by Rust (and CLI).
+          $bad = Join-Path $iso "bad"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bad
+          Copy-Item -Recurse -Force -LiteralPath $fixture -Destination $bad
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $bad "node_modules")
+          $badManifestPath = Join-Path $bad "manifest.json"
+          $badManifest = Get-Content -LiteralPath $badManifestPath -Raw | ConvertFrom-Json
+          $badManifest.permissions = @("bogus.permission")
+          ($badManifest | ConvertTo-Json -Depth 10) | Set-Content -Encoding utf8 -LiteralPath $badManifestPath
+          # Stderr is merged (2>&1) so failures print diagnostics instead of
+          # swallowing them with 2>$null.
+          $badCliOut = bun "$tronhawk" validate "$bad" 2>&1
+          if ($LASTEXITCODE -ne 1) { throw "validate on invalid plugin must exit 1 (got $LASTEXITCODE; output: $badCliOut)" }
+          $badEngOut = & $packBin validate "$bad" 2>&1
+          if ($LASTEXITCODE -ne 1) { throw "engine validate on invalid plugin must exit 1 (got $LASTEXITCODE; output: $badEngOut)" }
+          # 2: usage errors (unknown command / missing operand).
+          $bogusCliOut = bun "$tronhawk" bogus-command 2>&1
+          if ($LASTEXITCODE -ne 2) { throw "CLI unknown command must exit 2 (got $LASTEXITCODE; output: $bogusCliOut)" }
+          $bogusEngOut = & $packBin bogus-command 2>&1
+          if ($LASTEXITCODE -ne 2) { throw "engine unknown subcommand must exit 2 (got $LASTEXITCODE; output: $bogusEngOut)" }
+          $missingOpOut = bun "$tronhawk" pack "$fixture" 2>&1
+          if ($LASTEXITCODE -ne 2) { throw "CLI pack with missing operand must exit 2 (got $LASTEXITCODE; output: $missingOpOut)" }
+
+          # 10. JSON-only stdout for --json (declared machine-readable surface).
+          # Rust `pack --json` / `inspect --json` emit a single JSON object;
+          # CLI `validate --json` likewise; CLI `pack --json` emits a single
+          # JSON object with ok:true (one document — the engine line is
+          # consolidated with input/output rewritten, never a second CLI
+          # summary line).
+          $vOut = bun "$tronhawk" validate "$fixture" --json 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "validate --json must exit 0 (output: $vOut)" }
+          try { $vJson = ($vOut | Out-String).Trim() | ConvertFrom-Json -ErrorAction Stop }
+          catch { throw "validate --json stdout is not single JSON: $_`n---stdout---`n$vOut" }
+          if (-not $vJson.ok) { throw "validate --json missing ok:true" }
+          # Engine `pack` packs every file under the input dir and refuses
+          # symlinks: `bun install` leaves node_modules/.bin symlinks on Unix,
+          # so packing $fixture directly fails (macOS) or bloats (Windows:
+          # 7MB with node_modules vs 7KB clean, locally reproduced). Pack a
+          # clean copy without node_modules/*.thx (same manifest + entries).
+          $jsonSrc = Join-Path $iso "json-src"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $jsonSrc
+          Copy-Item -Recurse -Force -LiteralPath $fixture -Destination $jsonSrc
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $jsonSrc "node_modules")
+          Get-ChildItem -LiteralPath $jsonSrc -Filter "*.thx" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          $jsonPackOut = Join-Path $iso "json-pack.thx"
+          Remove-Item -Force -ErrorAction SilentlyContinue $jsonPackOut
+          $pOut = & $packBin pack "$jsonSrc" "$jsonPackOut" --json 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "engine pack --json must exit 0 (output: $pOut)" }
+          try { $pJson = ($pOut | Out-String).Trim() | ConvertFrom-Json -ErrorAction Stop }
+          catch { throw "engine pack --json stdout is not single JSON: $_`n---stdout---`n$pOut" }
+          if (-not $pJson.ok) { throw "engine pack --json missing ok:true" }
+          if (-not (Test-Path -LiteralPath $jsonPackOut -PathType Leaf)) { throw "engine pack --json produced no .thx" }
+          Remove-Item -Force -ErrorAction SilentlyContinue $jsonPackOut
+          if ($fixtureType -ne "css") {
+            $cliJsonOut = Join-Path $iso "cli-json.thx"
+            Remove-Item -Force -ErrorAction SilentlyContinue $cliJsonOut
+            $cOut = bun "$tronhawk" pack "$fixture" "$cliJsonOut" --json 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "CLI pack --json must exit 0 ($fixtureType; output: $cOut)" }
+            $cLines = @(($cOut | Out-String).Split("`n") | Where-Object { $_.Trim() -ne "" })
+            if (-not $cLines) { throw "CLI pack --json produced no stdout" }
+            foreach ($ln in $cLines) {
+              try { $ln.Trim() | ConvertFrom-Json -ErrorAction Stop | Out-Null }
+              catch { throw "CLI pack --json line is not JSON: $ln" }
+            }
+            $cLast = $cLines[-1].Trim() | ConvertFrom-Json
+            if (-not $cLast.ok) { throw "CLI pack --json last line missing ok:true" }
+            if (-not (Test-Path -LiteralPath $cliJsonOut -PathType Leaf)) { throw "CLI pack --json produced no .thx" }
+            Remove-Item -Force -ErrorAction SilentlyContinue $cliJsonOut
+          } else {
+            # CSS-only packs via the engine directly (`tronhawk-pack pack`):
+            # assert its --json is a single object (same engine contract).
+            $cssJsonOut = Join-Path $iso "css-json.thx"
+            Remove-Item -Force -ErrorAction SilentlyContinue $cssJsonOut
+            $cssOut = & $packBin pack "$jsonSrc" "$cssJsonOut" --json 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "css engine pack --json must exit 0 (output: $cssOut)" }
+            try { $cssJson = ($cssOut | Out-String).Trim() | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw "css engine pack --json not single JSON: $_" }
+            if (-not $cssJson.ok) { throw "css engine pack --json missing ok:true" }
+            Remove-Item -Force -ErrorAction SilentlyContinue $cssJsonOut
+          }
+          # `inspect --json` verifies the artifact without extracting: single
+          # JSON with manifest + entries covering every declared entry file.
+          $iOut = & $packBin inspect "$thx" --json 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "inspect --json must exit 0 (output: $iOut)" }
+          try { $iJson = ($iOut | Out-String).Trim() | ConvertFrom-Json -ErrorAction Stop }
+          catch { throw "inspect --json stdout is not single JSON: $_`n---stdout---`n$iOut" }
+          if (-not $iJson.manifest) { throw "inspect --json missing manifest" }
+          if (-not $iJson.entries) { throw "inspect --json missing entries" }
+          foreach ($prop in $manifest.entry.PSObject.Properties) {
+            if ($iJson.entries -notcontains $prop.Value) { throw "inspect --json entries missing $($prop.Value)" }
+          }
+
+          # 11. No TypeScript fallback: a missing engine hard-fails (exit 1)
+          # with install guidance and never writes a .thx.
+          $realPackBin = $env:TRONHAWK_PACK_BIN
+          $env:TRONHAWK_PACK_BIN = Join-Path $iso "missing-pack-bin.exe"
+          $noFallbackOut = Join-Path $iso "should-not-exist.thx"
+          Remove-Item -Force -ErrorAction SilentlyContinue $noFallbackOut
+          $nfErr = bun "$tronhawk" validate "$fixture" 2>&1
+          if ($LASTEXITCODE -ne 1) { $env:TRONHAWK_PACK_BIN = $realPackBin; throw "validate with missing engine must exit 1 (got $LASTEXITCODE)" }
+          if (($nfErr | Out-String) -notmatch 'TRONHAWK_PACK_BIN|native engine|no TypeScript fallback') {
+            $env:TRONHAWK_PACK_BIN = $realPackBin; throw "missing-engine error must carry install guidance, got: $nfErr"
+          }
+          if ($fixtureType -ne "css") {
+            $noFallbackPackOut = bun "$tronhawk" pack "$fixture" "$noFallbackOut" 2>&1
+            if ($LASTEXITCODE -ne 1) { $env:TRONHAWK_PACK_BIN = $realPackBin; throw "pack with missing engine must exit 1 (got $LASTEXITCODE; output: $noFallbackPackOut)" }
+            if (Test-Path -LiteralPath $noFallbackOut) { $env:TRONHAWK_PACK_BIN = $realPackBin; throw "pack with missing engine must not write .thx" }
+          }
+          $env:TRONHAWK_PACK_BIN = $realPackBin
+          $restoreOut = bun "$tronhawk" validate "$fixture" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "validate after restoring engine must exit 0 (output: $restoreOut)" }
+
+          # 12. Release sidecar existence + digest-mismatch hard fail
+          # (tools/tronhawk-cli/src/native.ts verifyDigestIfPresent: absence
+          # skips, presence with mismatch hard-fails with guidance).
+          if (Test-Path -LiteralPath "$packBin.sha256") { Remove-Item -Force -LiteralPath "$packBin.sha256" }
+          $h = (Get-FileHash -LiteralPath $packBin -Algorithm SHA256).Hash.ToLower()
+          "$h  $(Split-Path -Leaf $packBin)" | Set-Content -NoNewline -Encoding ascii "$packBin.sha256"
+          if (-not (Test-Path -LiteralPath "$packBin.sha256" -PathType Leaf)) { throw "sidecar not written" }
+          Get-Content -LiteralPath "$packBin.sha256"
+          $validSidecarOut = bun "$tronhawk" validate "$fixture" 2>&1
+          if ($LASTEXITCODE -ne 0) { Remove-Item -Force -ErrorAction SilentlyContinue "$packBin.sha256"; throw "validate with valid sidecar must exit 0 (output: $validSidecarOut)" }
+          "0" * 64 + "  $(Split-Path -Leaf $packBin)" | Set-Content -NoNewline -Encoding ascii "$packBin.sha256"
+          bun "$tronhawk" validate "$fixture" 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 1) { Remove-Item -Force -ErrorAction SilentlyContinue "$packBin.sha256"; throw "validate with corrupt sidecar must exit 1 (got $LASTEXITCODE)" }
+          $dgErr = bun "$tronhawk" validate "$fixture" 2>&1
+          if (($dgErr | Out-String) -notmatch 'digest mismatch|tampered|TRONHAWK_PACK_BIN|native engine') {
+            Remove-Item -Force -ErrorAction SilentlyContinue "$packBin.sha256"; throw "digest-mismatch error must name the cause, got: $dgErr"
+          }
+          Remove-Item -Force -ErrorAction SilentlyContinue "$packBin.sha256"
+          $noSidecarOut = bun "$tronhawk" validate "$fixture" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "validate after removing sidecar must exit 0 (output: $noSidecarOut)" }
+
+          # 13. PATH hijack hard fail (final CLI contract: PATH is never trusted;
+          # resolution is TRONHAWK_PACK_BIN / explicit config / workspace only,
+          # so a forged `tronhawk-pack` on PATH must never be executed).
+          # With explicit unset and cwd outside the workspace, lookup finds
+          # nothing and must hard-fail (exit 1) with install guidance (never 0,
+          # never a TS fallback). Restoring the explicit var must win (exit 0).
+          # Runs from $iso so neither cliDir nor cwd leaks the Cargo workspace.
+          $hijackDir = Join-Path $iso "hijack"
+          New-Item -ItemType Directory -Force -Path $hijackDir | Out-Null
+          $fakeName = "tronhawk-pack"
+          if ($IsWindows) { $fakeName += ".exe" }
+          # Forged binary: a real copy with a tampered sidecar beside it, so
+          # resolution finds it via PATH but verification hard-fails with
+          # guidance (never silently succeeds). The copy keeps the fake
+          # executable on all OSes without needing a compiler.
+          Copy-Item -Force -LiteralPath $packBin -Destination (Join-Path $hijackDir $fakeName)
+          "0" * 64 + "  $fakeName" | Set-Content -NoNewline -Encoding ascii (Join-Path $hijackDir "$fakeName.sha256")
+          $savedPath = $env:PATH
+          $savedPackBin = $env:TRONHAWK_PACK_BIN
+          Push-Location -LiteralPath $iso
+          try {
+            $env:PATH = "$hijackDir$([IO.Path]::PathSeparator)$env:PATH"
+            $env:TRONHAWK_PACK_BIN = ""
+            bun "$tronhawk" validate "$fixture" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 1) { throw "PATH-hijacked engine must exit 1 (got $LASTEXITCODE)" }
+            $hjErr = bun "$tronhawk" validate "$fixture" 2>&1
+            if (($hjErr | Out-String) -notmatch 'digest mismatch|tampered|TRONHAWK_PACK_BIN|native engine|version|mismatch|usable version') {
+              throw "PATH-hijack error must carry guidance, got: $hjErr"
+            }
+            # Explicit TRONHAWK_PACK_BIN beats PATH: restore it, keep the fake
+            # first on PATH, and the real engine must still win (exit 0).
+            $env:TRONHAWK_PACK_BIN = $packBin
+            $beatsHijackOut = bun "$tronhawk" validate "$fixture" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "explicit TRONHAWK_PACK_BIN must beat PATH hijack (output: $beatsHijackOut)" }
+          } finally {
+            Pop-Location
+            $env:PATH = $savedPath
+            $env:TRONHAWK_PACK_BIN = $savedPackBin
+          }
+          $env:TRONHAWK_PACK_BIN = $packBin
+          $afterRestoreOut = bun "$tronhawk" validate "$fixture" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "validate after PATH restore must exit 0 (output: $afterRestoreOut)" }
+      - name: Tarball-installed sandbox outside the checkout
+        # `test --sandbox` must work from the packed CLI tarball installed
+        # outside any checkout (fixture-independent, so it runs once per OS).
+        # The harness ships inside the package (src/vendor) with its QuickJS
+        # runtime dependency: cwd and CLI both live outside the repo, and the
+        # installed package must carry no crates/ tree.
+        if: matrix.fixture == 'renderer'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iso = Join-Path $env:RUNNER_TEMP "th-standalone"
+          $tronhawk = Join-Path $iso "fixture/node_modules/@tronhawk/cli/src/cli.ts"
+          if (-not (Test-Path -LiteralPath $tronhawk -PathType Leaf)) { throw "tronhawk CLI missing: $tronhawk" }
+          $cliRoot = Join-Path (Split-Path -Parent $tronhawk) ".."
+          if (-not (Test-Path -LiteralPath (Join-Path $cliRoot "src/vendor/contract-harness.js") -PathType Leaf)) { throw "vendored harness missing from installed CLI" }
+          if (Test-Path -LiteralPath (Join-Path $cliRoot "crates")) { throw "installed CLI must not see a crates/ tree" }
+          $good = Join-Path $iso "sbx-good"
+          $bad = Join-Path $iso "sbx-bad"
+          foreach ($d in @($good, $bad)) {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $d
+            New-Item -ItemType Directory -Force -Path (Join-Path $d "src") | Out-Null
+          }
+          '{"id":"com.example.sbx-good","name":"Sbx Good","version":"0.1.0","author":"CI","tronhawk":"^0.1","entry":{"renderer":"src/renderer.js"},"permissions":["renderer.script"]}' | Set-Content -NoNewline -Encoding utf8 -LiteralPath (Join-Path $good "manifest.json")
+          'module.exports = { activate(ctx) { ctx.logger.info("sbx-good-on"); }, deactivate(ctx) { ctx.logger.info("sbx-good-off"); } };' | Set-Content -NoNewline -Encoding utf8 -LiteralPath (Join-Path $good "src/renderer.js")
+          '{"id":"com.example.sbx-bad","name":"Sbx Bad","version":"0.1.0","author":"CI","tronhawk":"^0.1","entry":{"renderer":"src/renderer.js"},"permissions":["renderer.script"]}' | Set-Content -NoNewline -Encoding utf8 -LiteralPath (Join-Path $bad "manifest.json")
+          'const fs = require("fs"); module.exports = { activate(ctx) { ctx.logger.info("x" + fs); }, deactivate(ctx) {} };' | Set-Content -NoNewline -Encoding utf8 -LiteralPath (Join-Path $bad "src/renderer.js")
+          Push-Location -LiteralPath $iso
+          try {
+            bun "$tronhawk" test "$good" --sandbox
+            if ($LASTEXITCODE -ne 0) { throw "tarball-installed sandbox must pass the good fixture" }
+            $badErr = bun "$tronhawk" test "$bad" --sandbox 2>&1
+            if ($LASTEXITCODE -ne 1) { throw "tarball-installed sandbox must fail the malicious fixture (got $LASTEXITCODE)" }
+            if (($badErr | Out-String) -notmatch 'require\(') { throw "malicious-fixture error must name require(, got: $badErr" }
+          } finally { Pop-Location }
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $good, $bad
+          # The malicious fixture above intentionally exits 1; Remove-Item does
+          # not reset $LASTEXITCODE, so zero it explicitly lest the trailing
+          # non-zero code leak out and fail the step via the GHA pwsh wrapper
+          # even though both sandbox assertions passed.
+          $LASTEXITCODE = 0

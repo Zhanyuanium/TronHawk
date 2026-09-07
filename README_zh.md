@@ -97,6 +97,12 @@ tests/             集成测试（pwsh tests/integration.ps1）
 
 ## 快速开始
 
+> 独立插件开发首选 standalone 工具链：`@tronhawk/sdk` 的类型 + 测试辅助，配合独立
+> `@tronhawk/cli`（`tronhawk` 二进制）与同版本 `tronhawk-pack` 引擎——不需要 TronHawk
+> checkout（见 `docs/PLUGIN-SDK.md` 与 `tools/create-tronhawk-plugin/README.md`）。下面的
+> 构建/测试/打包命令是在本 monorepo 里开发 TronHawk 本体用的；`cargo run -p` 的 monorepo
+> 打包流程仅是贡献者备选（只能在仓库根目录下运行）。
+
 ### 前置条件
 
 - Windows 10/11 x64（MVP 平台），装好 MSVC C++ 构建工具

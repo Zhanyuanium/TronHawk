@@ -1,8 +1,8 @@
 # @tronhawk/sdk
 
-[TronHawk](https://github.com/Zhanyuanium/TronHawk) 插件的 TypeScript API。纯类型，无运行时。
+[TronHawk](https://github.com/Zhanyuanium/TronHawk) 插件的 TypeScript API：上下文类型 + 测试辅助。无宿主运行时，无打包器。
 
-> `0.1.0` 是首个可用但不完整的版本。只有下面标注“已实现”的 API 才真正接入了宿主运行时。权威契约见仓库内 `docs/PLUGIN-SDK.md`。
+> `0.2.0` 是首个可用但不完整的版本。只有下面标注“已实现”的 API 才真正接入了宿主运行时。权威契约见仓库内 `docs/PLUGIN-SDK.md`。
 >
 > English version: [README.md](./README.md).
 
@@ -16,10 +16,10 @@ bun add @tronhawk/sdk
 
 ## 快速开始
 
-从 TronHawk monorepo 脚手架建插件：
+独立脚手架建插件（无需 TronHawk checkout，在任何目录都可用）：
 
 ```sh
-bun run create-tronhawk-plugin -- plugins/my-plugin --type renderer
+create-tronhawk-plugin plugins/my-plugin --type renderer
 # --type css | renderer（默认）| main
 ```
 
@@ -58,12 +58,42 @@ const plugin: PluginModule<MainContext> = {
 export default plugin;
 ```
 
+> 上面是用于类型检查的 TypeScript 源码。宿主实际加载的文件（`entry.renderer` / `entry.main`）必须是可执行的 CommonJS（`module.exports = { activate, deactivate }`）——ESM（`export default`）永远不会被直接执行。脚手架生成的 `src/renderer.js` / `src/main.js` 就是这种形式。
+
 ## SDK 提供的内容
 
 - `PluginContext`：`logger`；`network`（需 `network.access`，Core 侧域名白名单 fetch）；`config`（读 Manager 下发的快照，沙盒插件的 `set` 是 no-op）。
-- `RendererContext`：`css.insert/remove`（`renderer.css`）；`script.setDocumentTitle`（`renderer.script`）；`dom.query/observe`（`renderer.dom`，序列化快照、约 100ms 轮询）；`storage.get/set`（`renderer.storage`，仅 renderer、按插件隔离）。
+- `RendererContext`：`css.insert/remove`（`renderer.css`）；`script.setDocumentTitle`（`renderer.script`）；`dom.query/observe`（`renderer.dom`，序列化快照、500ms 轮询）；`storage.get/set`（`renderer.storage`，仅 renderer、按插件隔离）。
 - `MainContext`：`window.onCreated/setOpacity/setSize/setPosition/setVibrancy/setMica`（`electron.window`）；`onLoad/onRendererReady/onUnload` 生命周期事件（挂在 main 根上，同步 `undefined` 回调，失败即注销）。
-- 测试辅助：`createMockRendererContext`、`createMockMainContext`、`createLogger`、`injectCSS`。
+- 测试辅助（无需宿主即可用）：`createMockRendererContext`、`createMockMainContext`、`createLogger`、`injectCSS`。可在 TronHawk 宿主之外做单元测试。
+
+SDK 不提供的东西：没有宿主运行时（没有 QuickJS 沙箱，除 mock 外不提供任何 `ctx` 实现），也没有 `.thx` 打包器。打包由同版本原生 `tronhawk-pack` 引擎判定，经独立 `@tronhawk/cli`（`tronhawk` 二进制）调用。
+
+独立工具链（无需 TronHawk checkout）：
+
+```sh
+create-tronhawk-plugin my-plugin --type renderer
+cd my-plugin && bun install
+bun run build              # tronhawk build .：打包 entry 到 dist/（CSS-only 无 build 步骤，style.css 按数据发布）
+bun test                   # 基于 SDK mock 的起始冒烟测试（无需宿主）
+./node_modules/.bin/tronhawk test . --sandbox  # QuickJS 契约 harness（随 CLI 发布，无需 checkout）
+./node_modules/.bin/tronhawk validate .        # 权威目录检查（不写文件）
+bun run pack               # tronhawk pack . my-plugin.thx（或 ./node_modules/.bin/tronhawk pack . my-plugin.thx）
+./node_modules/.bin/tronhawk inspect my-plugin.thx
+```
+
+如何调用 `tronhawk`：`tronhawk` 只是 devDependency 的 bin（`node_modules/.bin/tronhawk[.exe]`），不在 `PATH` 上，插件目录里裸打 `tronhawk validate .` 会报找不到命令——`bun run <script>` 会自动解析 `.bin`，裸命令不会。三选一：(1) `./node_modules/.bin/tronhawk …`（最稳，上面的可复制命令就是这种）；(2) 本窗口临时把 `.bin` 加进 `PATH`（仅当前 shell 生效）；(3) 写进 `package.json` 的 `scripts` 走 `bun run`（反复用推荐，`build`/`pack` 本来就是这样）。常用命令建议都写成 npm scripts，例如 `{ "scripts": { "validate": "tronhawk validate .", "sandbox": "tronhawk test . --sandbox" } }`，然后 `bun run validate` / `bun run sandbox`。详见 `tools/tronhawk-cli/README.md` 的 How to invoke `tronhawk` 一节。
+
+CLI 只从可信来源解析引擎（不做 PATH 搜索），优先级从高到低：`TRONHAWK_PACK_BIN`（显式指定，优先级最高）、显式配置 `tronhawk.packBin`，或本地 cargo 构建产物 `target/{release,debug}/tronhawk-pack(.exe)`。把 `TRONHAWK_PACK_BIN` 指向同版本 `tronhawk-pack` 发布二进制——CLI 的 `tronhawk.engineVersion` 必须与 `tronhawk-pack --version` 严格一致；缺失、digest 不一致或版本不一致都会 hard-fail 并给出安装指引（没有 TypeScript 兜底打包器）。CSS-only 插件显式跳过 `build`，但仍走统一 `tronhawk pack` 命令与同版本 Rust/SHA 路径——永远不要直接调用引擎二进制。
+
+备选（仅限 TronHawk monorepo checkout 内的贡献者流程，从仓库根目录执行）：
+
+```sh
+cargo run -p tronhawk-package --bin tronhawk-pack -- validate <path-to-plugin>
+cargo run -p tronhawk-package --bin tronhawk-pack -- pack <path-to-plugin> <out.thx>
+```
+
+运行时只加载可执行的 CommonJS（`module.exports.activate`/`deactivate`）——TypeScript ESM（`export default`）永远不会被直接执行，所以 `entry.renderer` / `entry.main` 必须指向 `.js`（见 `docs/PLUGIN-SDK.md`）。
 
 不要依赖 Electron 私有 API、Chromium 内部实现或目标 App 的实现细节。
 

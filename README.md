@@ -107,6 +107,13 @@ tests/             Integration tests (pwsh tests/integration.ps1)
 
 ## Quickstart
 
+> Standalone plugin development uses the `@tronhawk/sdk` types + testing helpers
+> and the standalone `@tronhawk/cli` (`tronhawk` binary) with the same-version
+> `tronhawk-pack` engine — no TronHawk checkout needed (see `docs/PLUGIN-SDK.md`
+> and `tools/create-tronhawk-plugin/README.md`). The build/test/bundle commands
+> below develop TronHawk itself inside this monorepo; the `cargo run -p`
+> monorepo pack flow is a contributors-only alternative (from the repo root only).
+
 ### Prerequisites
 
 - Windows 10/11 x64 (MVP platform) with the MSVC C++ build tools

@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import {
+  DEFAULT_CLI_SPEC,
+  DEFAULT_SDK_SPEC,
   type PluginType,
   type ScaffoldFile,
   type ScaffoldOptions,
@@ -41,8 +43,11 @@ Options
   --id <id>              Manifest plugin id (reverse-DNS, lowercase).
                          Default: com.example.<name>.
   --sdk <spec>           Dependency spec for "@tronhawk/sdk". Default:
-                         "workspace:*" inside the monorepo's plugins/, otherwise
-                         a relative "file:" spec pointing at the local SDK.
+                         "${DEFAULT_SDK_SPEC}" (npm registry). Use
+                         "file:<path>" for a local tarball or checkout.
+  --cli <spec>           Dependency spec for "@tronhawk/cli" (devDependency,
+                         provides the "tronhawk" build/validate/pack binary).
+                         Default: "${DEFAULT_CLI_SPEC}" (npm registry).
   --force                Replace a non-empty target directory.
   -h, --help             Show this help.
   -v, --version          Print the version.
@@ -59,6 +64,7 @@ interface ParsedArgs {
   author?: string;
   id?: string;
   sdk?: string;
+  cli?: string;
   force: boolean;
   help: boolean;
   version: boolean;
@@ -135,6 +141,13 @@ function parseArgs(argv: string[]): ParsedArgs {
         i = v[1];
         break;
       }
+      case "--cli": {
+        const v = takeValue(i, "--cli");
+        if (!v) return out;
+        out.cli = v[0];
+        i = v[1];
+        break;
+      }
       default:
         if (arg.startsWith("-")) {
           out.errors.push(`unknown option: ${arg}`);
@@ -150,80 +163,6 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function isPluginType(v: string): v is PluginType {
   return v === "css" || v === "renderer" || v === "main";
-}
-
-interface SdkRepo {
-  /** Monorepo root: the directory whose sdk/package.json is @tronhawk/sdk. */
-  root: string;
-  sdkDir: string;
-}
-
-/** Walk up from `start` looking for the TronHawk monorepo (sdk/package.json). */
-function findSdkRepo(start: string): SdkRepo | null {
-  let cur = path.resolve(start);
-  for (;;) {
-    try {
-      const manifestPath = path.join(cur, "sdk", "package.json");
-      const pkg = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
-        name?: string;
-      };
-      if (pkg.name === "@tronhawk/sdk") {
-        return { root: cur, sdkDir: path.join(cur, "sdk") };
-      }
-    } catch {
-      // keep walking up
-    }
-    const parent = path.dirname(cur);
-    if (parent === cur) return null;
-    cur = parent;
-  }
-}
-
-function toPosix(p: string): string {
-  return p.split(path.sep).join("/");
-}
-
-/** True when the scaffold target will itself be a bun workspace member dir. */
-function isWorkspaceMemberTarget(repo: SdkRepo, targetAbs: string): boolean {
-  const parent = path.dirname(targetAbs);
-  for (const dir of ["plugins", "tools"]) {
-    if (path.relative(parent, path.join(repo.root, dir)) === "") return true;
-  }
-  return false;
-}
-
-interface SdkSpec {
-  spec: string;
-  note?: string;
-}
-
-function resolveSdkSpec(repo: SdkRepo | null, targetAbs: string): SdkSpec {
-  if (repo) {
-    if (isWorkspaceMemberTarget(repo, targetAbs)) {
-      return {
-        spec: "workspace:*",
-        note: "run `bun install` from the monorepo root to register the workspace link",
-      };
-    }
-    let rel = path.relative(targetAbs, repo.sdkDir);
-    const crossDrive = path.isAbsolute(rel) || /^[A-Za-z]:[\\/]/.test(rel);
-    if (!crossDrive && rel !== "") {
-      return {
-        spec: `file:${toPosix(rel)}`,
-        note: `bun resolves the local SDK at ${toPosix(rel)} relative to the plugin`,
-      };
-    }
-  }
-  return {
-    spec: "workspace:*",
-    note: "no local SDK was detected; pass --sdk (e.g. file:../sdk or a registry spec) if this target is not inside the monorepo",
-  };
-}
-
-/** True when `abs` is strictly inside directory `dir`. */
-function isInsideDir(dir: string, abs: string): boolean {
-  const rel = path.relative(dir, abs);
-  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 function readGitUser(): string | undefined {
@@ -272,7 +211,7 @@ function printSummary(
   files: ScaffoldFile[],
   targetAbs: string,
   sdkNote: string | undefined,
-  insideMonorepo: boolean,
+  cliNote: string | undefined,
 ): void {
   const kind = typeLabel(opts.type);
   const where = formatRelOrAbs(process.cwd(), targetAbs);
@@ -285,20 +224,30 @@ function printSummary(
   console.log("Next steps:");
   console.log(`  cd ${where}`);
   console.log("  bun install");
-  console.log("  bun run typecheck");
-  console.log("");
-  console.log("Pack to .thx (optional):");
-  if (insideMonorepo) {
-    console.log(`  cd ${where} && rm -rf node_modules   # packer refuses symlinks`);
-    console.log(`  cargo run -p tronhawk-package --bin pack -- . ${opts.slug}.thx`);
-    console.log("  bun install                          # restore deps");
+  if (opts.type === "css") {
+    console.log('  echo "no build step (CSS-only: style.css ships as data)"');
   } else {
-    console.log(`  # from the TronHawk repo root, after removing node_modules from the plugin:`);
-    console.log(`  cargo run -p tronhawk-package --bin pack -- ${where} ${opts.slug}.thx`);
+    console.log("  bun run build        # tronhawk build: bundle entries to dist/");
   }
+  console.log("  bun run typecheck");
+  console.log("  bun test");
+  console.log("");
+  console.log("Pack to .thx (needs the same-version tronhawk-pack engine, see README):");
+  console.log("  tronhawk validate .   # authoritative dir check (writes nothing)");
+  // All types pack through the unified `tronhawk pack` command. CSS-only
+  // skips `build` explicitly (style.css ships as data) but still runs
+  // staging + the same-version Rust/SHA path; never call the engine directly.
+  console.log(`  tronhawk pack . ${opts.slug}.thx   # all types (CSS: no build, same Rust/SHA path)`);
+  console.log("");
+  console.log("Engine setup: set TRONHAWK_PACK_BIN to the same-version tronhawk-pack binary");
+  console.log("(CLI tronhawk.engineVersion must exactly match tronhawk-pack --version).");
   if (sdkNote) {
     console.log("");
     console.log(`Note: @tronhawk/sdk = ${opts.sdkSpec} - ${sdkNote}`);
+  }
+  if (cliNote) {
+    if (!sdkNote) console.log("");
+    console.log(`Note: @tronhawk/cli = ${opts.cliSpec} - ${cliNote}`);
   }
   console.log("");
 }
@@ -376,10 +325,18 @@ export async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const repo = findSdkRepo(import.meta.dir);
-  const sdk = a.sdk?.trim() ? { spec: a.sdk.trim() } : resolveSdkSpec(repo, targetAbs);
+  // Standalone-first: both specs default to the npm registry release
+  // lines. No workspace / local-checkout probing: `--sdk` / `--cli` are the
+  // only overrides (e.g. file: tarballs while the packages are unpublished).
+  const sdkSpec = a.sdk?.trim() ? a.sdk.trim() : DEFAULT_SDK_SPEC;
+  const sdkNote = a.sdk?.trim()
+    ? "overridden via --sdk"
+    : "npm registry default (override with --sdk, e.g. --sdk file:/path/to/sdk.tgz)";
+  const cliSpec = a.cli?.trim() ? a.cli.trim() : DEFAULT_CLI_SPEC;
+  const cliNote = a.cli?.trim()
+    ? "overridden via --cli"
+    : "npm registry default (override with --cli, e.g. --cli file:/path/to/tronhawk-cli.tgz)";
 
-  const insideMonorepo = repo !== null && isInsideDir(repo.root, targetAbs);
   const opts: ScaffoldOptions = {
     slug,
     displayName,
@@ -387,7 +344,8 @@ export async function main(argv: string[]): Promise<number> {
     type: a.type,
     version: DEFAULT_VERSION,
     pluginId,
-    sdkSpec: sdk.spec,
+    sdkSpec,
+    cliSpec,
   };
 
   const files = buildFiles(opts);
@@ -419,7 +377,7 @@ export async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
-  printSummary(opts, files, targetAbs, sdk.note, insideMonorepo);
+  printSummary(opts, files, targetAbs, sdkNote, cliNote);
   return 0;
 }
 

@@ -1,0 +1,9 @@
+{
+  "id": "com.example.fail-dynamic-require",
+  "name": "Fail Dynamic Require",
+  "version": "0.1.0",
+  "author": "Conformance",
+  "tronhawk": "^0.1",
+  "entry": { "renderer": "src/renderer.js" },
+  "permissions": ["renderer.script"]
+}

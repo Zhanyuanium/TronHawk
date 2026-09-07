@@ -19,8 +19,8 @@ type OnUnloadCallback = Parameters<MainContext["onUnload"]>[0];
 // --- Async lifecycle (ADR 0008) ---
 // The runtime drains a Promise returned by `activate`/`deactivate` (via `executePendingJobs()`)
 // before the plugin is considered activated/deactivated, so both a synchronous `undefined`-returning
-// hook and an async (Promise-returning) hook are accepted. A Promise carrying a concrete value is
-// still rejected — the runtime only drains a promise that resolves to nothing.
+// hook and an async (Promise-returning) hook are accepted. A fulfilled Promise's resolve value is ignored —
+// only a rejection fails the hook.
 
 // Synchronous (`undefined`-returning) lifecycle hooks stay valid — no-return `activate(ctx) {}`
 // bodies are the common authoring form and must keep compiling.
@@ -41,10 +41,12 @@ type _SyncDeactivateAccepted = Assert<
 type _AsyncDeactivateAccepted = Assert<
   IsAssignable<(ctx: MainContext) => Promise<void>, MainDeactivate> extends true ? true : false
 >;
-// The runtime drains only promises that resolve to nothing; a Promise of a concrete value is not a
-// valid hook result.
-type _ValuePromiseActivateRejected = Assert<
-  IsAssignable<(ctx: MainContext) => Promise<string>, MainActivate> extends false ? true : false
+// Host ignores the fulfillment value; a Promise of a concrete value is a valid hook result.
+type _ValuePromiseActivateAccepted = Assert<
+  IsAssignable<(ctx: MainContext) => Promise<string>, MainActivate> extends true ? true : false
+>;
+type _ValuePromiseDeactivateAccepted = Assert<
+  IsAssignable<(ctx: MainContext) => Promise<string>, MainDeactivate> extends true ? true : false
 >;
 
 // --- Sync-only callbacks (unchanged; ADR 0008 keeps them synchronous) ---

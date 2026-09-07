@@ -1,9 +1,14 @@
 {
   "name": "@tronhawk/cli-create-plugin",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Scaffold a new TronHawk plugin project (package.json, manifest.json, src templates).",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zhanyuanium/TronHawk.git",
+    "directory": "tools/create-tronhawk-plugin"
+  },
   "bin": {
     "create-tronhawk-plugin": "./src/cli.ts"
   },
@@ -11,6 +16,9 @@
     "src",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "create-tronhawk-plugin": "bun ./src/cli.ts",
     "build": "bun build ./src/cli.ts --target=bun --outdir dist",

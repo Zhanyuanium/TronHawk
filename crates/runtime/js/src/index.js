@@ -77,6 +77,133 @@ let hostPlatform = process.platform;
 // feature tests hermetic without changing production behavior.
 let windowResolver = (id) => BrowserWindow.fromId(id);
 
+// Live-window enumeration for window-handle issuance (BrowserWindow.id lookup
+// from a webContents.id) and for the webContents-id fallback in
+// resolveWindowHandle. Evaluated lazily per call (never captured): production
+// always enumerates the real Electron windows, while the bun harness replaces
+// it via __testing (setWindowEnumerator) for the same module-registry reason
+// as windowResolver above. reset() restores this default.
+function defaultWindowEnumerator() {
+  try {
+    const all = BrowserWindow.getAllWindows();
+    return Array.isArray(all) ? all : [];
+  } catch (_e) {
+    return [];
+  }
+}
+let windowEnumerator = defaultWindowEnumerator;
+
+// WindowHandle strategy (Gate 3 attempt-4: cross-namespace collision).
+//
+// Candidate (b) — "Electron's two id spaces cannot collide" — is false, so
+// this host picks (a): unified issuance of BrowserWindow.id.
+//
+// Proof that the spaces collide (not speculation): BrowserWindow.id comes from
+// Electron's NativeWindow::next_id_ (shell/browser/native_window.cc) and
+// webContents.id from content::WebContents' independent counter. They are not
+// a shared sequence. The first window often has both equal to 1 (same window,
+// harmless), but the counters diverge as soon as any extra WebContents exists
+// (BrowserView, webview, background page, DevTools). Then window B's
+// BrowserWindow.id can equal window A's webContents.id. Fixture used by the
+// regression test: A {id:100, webContents.id:1} vs B {id:1, webContents.id:2}.
+// A's renderer handle 1 under the old mixed-id scheme is BrowserWindow.fromId(1)
+// → B. Changing WindowHandle's TypeScript type to `number` does not fix this:
+// the value is still a bare integer from two namespaces.
+//
+// Candidate (a) payload-carries-namespace (tagged strings / objects) was
+// rejected here: WindowHandle stays a number (SDK contract, plugins stringify
+// handles, window ops read via vm.getNumber), and tagging would rewrite every
+// rr:/ul: assertion plus VIBRANCY-style bare-number ops. Unified issuance
+// keeps the numeric contract.
+//
+// Issuance (issuedWindowHandle):
+//   * onCreated already passed BrowserWindow.id — unchanged.
+//   * onRendererReady / onUnload now pass the bound BrowserWindow.id when a
+//     live BrowserWindow is associated with the contents (stashed on the
+//     window record, or looked up via the enumerator). Same window → same
+//     number from all three events, and fromId resolves it.
+//   * Contents-only path (no live BrowserWindow, the rr:/ul: tests that never
+//     register one): keep issuing webContents.id so those assertions stay
+//     numeric-identical. Window ops on that handle fail-closed (fromId miss
+//     and no window to scan).
+//
+// Old numeric handles remain readable: resolveWindowHandle still accepts a
+// bare number as BrowserWindow.id (fromId) and, on miss, as webContents.id
+// (scan). A plugin that reconstructs a webContents.id which equals some other
+// window's BrowserWindow.id still hits fromId first — that leftover only
+// applies to reconstructed ids, not to newly issued handles. Explicit
+// fail-closed for unknown ids is unchanged (structured no-op, never a throw).
+//
+// `__testing.setWindowHandleMode("legacy-mixed-ids")` restores the old
+// issuance (rr/ul pass webContents.id) so the A/B fixture reproduces the
+// misroute. Production and reset() stay on "unified-window-id".
+const WINDOW_HANDLE_MODE_UNIFIED = "unified-window-id";
+const WINDOW_HANDLE_MODE_LEGACY = "legacy-mixed-ids";
+let windowHandleMode = WINDOW_HANDLE_MODE_UNIFIED;
+
+function enumerateLiveWindows() {
+  let all = [];
+  try {
+    all = windowEnumerator() || [];
+  } catch (_e) {
+    all = [];
+  }
+  return Array.isArray(all) ? all : [];
+}
+
+function liveBrowserWindowForContentsId(contentsId) {
+  if (typeof contentsId !== "number") return null;
+  for (const w of enumerateLiveWindows()) {
+    if (w && w.webContents && w.webContents.id === contentsId) return w;
+  }
+  return null;
+}
+
+function stashBrowserWindowId(record, win) {
+  if (record && win && typeof win.id === "number") {
+    record.browserWindowId = win.id;
+  }
+}
+
+function issuedWindowHandle(record, contentsIdFallback) {
+  const contentsId =
+    record && record.contents && typeof record.contents.id === "number"
+      ? record.contents.id
+      : contentsIdFallback;
+  if (windowHandleMode === WINDOW_HANDLE_MODE_LEGACY) {
+    return typeof contentsId === "number" ? contentsId : null;
+  }
+  if (record && typeof record.browserWindowId === "number") {
+    return record.browserWindowId;
+  }
+  const live = liveBrowserWindowForContentsId(contentsId);
+  if (live && typeof live.id === "number") {
+    stashBrowserWindowId(record, live);
+    return live.id;
+  }
+  return typeof contentsId === "number" ? contentsId : null;
+}
+
+// Window op resolution. Newly issued handles are BrowserWindow.id when a
+// window is bound, so step 1 hits. Step 2 remains for old numeric webContents
+// ids and the contents-only issuance fallback (readable compatibility on miss).
+// Unknown ids resolve to null — structured no-op / logged-error, never a throw.
+// Destroyed-window corner: a destroyed window has left getAllWindows() and
+// fromId, so a late handle is an ordinary unknown id, never a crash.
+function resolveWindowHandle(id) {
+  let direct = null;
+  try {
+    direct = windowResolver(id);
+  } catch (_e) {
+    direct = null;
+  }
+  if (direct) return direct;
+  for (const w of enumerateLiveWindows()) {
+    if (w && w.webContents && w.webContents.id === id) return w;
+  }
+  return null;
+}
+
 // Main-plugin lifecycle events (SPEC §9 MVP: onLoad / onRendererReady / onUnload). onWindowCreated
 // already exists as ctx.window.onCreated. Subscriptions are module-level because their host events
 // (app ready, per-window did-finish-load / webContents destroyed) are process-wide, not per-plugin;
@@ -1321,6 +1448,12 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
     };
     const invoke = (w) => {
       if (!registered) return false;
+      // Stash BrowserWindow.id onto the contents record so later
+      // onRendererReady/onUnload issue the same numeric handle (unified
+      // issuance). No-op when this window's contents is not yet tracked.
+      if (w && w.webContents) {
+        stashBrowserWindowId(windows.get(w.webContents.id), w);
+      }
       const id = vm.newNumber(w.id);
       try {
         // A callback timeout hard-kills the whole plugin (see runQuickJSOperation): the callback
@@ -1355,7 +1488,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
     // it runs under the enclosing operation's QuickJS deadline, so there is no CPU escape here.
     const id = vm.getNumber(winHandle);
     const n = vm.getNumber(nHandle);
-    const w = BrowserWindow.fromId(id);
+    const w = resolveWindowHandle(id);
     if (w) {
       w.setOpacity(n);
       pluginLog(pluginId, "info", "window.setOpacity: window=" + id + " opacity=" + n);
@@ -1368,7 +1501,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   const setSize = vm.newFunction("setSize", (winHandle, wHandle, hHandle) => {
     // RT-3 (informational): see setOpacity — value coercion runs under the op's deadline.
     const id = vm.getNumber(winHandle);
-    const w = BrowserWindow.fromId(id);
+    const w = resolveWindowHandle(id);
     if (w) w.setSize(vm.getNumber(wHandle), vm.getNumber(hHandle));
     return vm.undefined;
   });
@@ -1378,7 +1511,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
   const setPosition = vm.newFunction("setPosition", (winHandle, xHandle, yHandle) => {
     // RT-3 (informational): see setOpacity — value coercion runs under the op's deadline.
     const id = vm.getNumber(winHandle);
-    const w = BrowserWindow.fromId(id);
+    const w = resolveWindowHandle(id);
     if (w) w.setPosition(vm.getNumber(xHandle), vm.getNumber(yHandle));
     return vm.undefined;
   });
@@ -1390,7 +1523,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
     // an object handle; it runs under the enclosing operation's QuickJS deadline.
     const id = vm.getNumber(winHandle);
     const material = vm.getString(materialHandle);
-    const w = windowResolver(id);
+    const w = resolveWindowHandle(id);
     if (!w) {
       // Invalid window handle: structured error, never a synchronous throw across the bridge.
       pluginLog(pluginId, "error", "window.setVibrancy: unknown window id " + id);
@@ -1428,7 +1561,7 @@ function buildWindowApi(vm, app, cleanupCallbacks, pluginId) {
     // RT-3 (informational): see setVibrancy — coercion runs under the op's deadline.
     const id = vm.getNumber(winHandle);
     const enabled = enabledFromHandle(vm, enabledHandle);
-    const w = windowResolver(id);
+    const w = resolveWindowHandle(id);
     if (!w) {
       pluginLog(pluginId, "error", "window.setMica: unknown window id " + id);
       return vm.undefined;
@@ -1498,13 +1631,15 @@ function enabledFromHandle(vm, handle) {
 //     require of the original app registered its own boot code), or immediately at registration if
 //     the app already finished loading. No window argument: it is the app-process boot event.
 //   * onRendererReady fires per window per did-finish-load (i.e. per navigation), reusing the
-//     window record's loaded/rendererGeneration path inside start(); it passes the webContents id.
+//     window record's loaded/rendererGeneration path inside start(); it passes the issued
+//     WindowHandle (BrowserWindow.id when a live window is bound, else webContents.id — see
+//     issuedWindowHandle). Directly usable in window ops.
 //     Subscriptions made after a window already loaded fire once for each such window, mirroring
 //     onCreated's existing-window replay.
 //   * onUnload fires per window when its webContents is destroyed (the runtime's canonical unload
 //     point — a quitting app always destroys its windows, so app shutdown is covered by the same
 //     path without a separate before-quit wire that would double-fire normal per-window teardown);
-//     it passes the webContents id.
+//     it passes the same issued handle as onRendererReady (stashed before the record is dropped).
 function subscribeLifecycle(vm, pluginId, cleanupCallbacks, set, label, once, cbHandle) {
   const callback = cbHandle.dup();
   let registered = true;
@@ -1525,7 +1660,7 @@ function subscribeLifecycle(vm, pluginId, cleanupCallbacks, set, label, once, cb
     pluginId,
     vm,
     unregister,
-    // argValues are JS numbers (window/contents ids today). Each is converted to a QuickJS handle
+    // argValues are JS numbers (issued WindowHandles). Each is converted to a QuickJS handle
     // for the guest call and disposed afterwards, exactly like onCreated's window-id handle.
     invoke: (argValues) => {
       if (!registered) return false;
@@ -1581,7 +1716,9 @@ function attachLifecycleApi(vm, ctx, pluginId, cleanupCallbacks) {
       // reach the subscription through the live did-finish-load dispatch in start().
       for (const w of [...windows.values()]) {
         if (!w.loaded) continue;
-        if (!entry.invoke([w.contents.id])) break;
+        const handle = issuedWindowHandle(w);
+        if (handle == null) continue;
+        if (!entry.invoke([handle])) break;
       }
     }
     return vm.undefined;
@@ -1617,16 +1754,20 @@ function markAppLoaded() {
 // contents finished loading (per navigation — called from the did-finish-load path in start()).
 function fireRendererReady(w) {
   if (!w || !w.contents) return;
+  const handle = issuedWindowHandle(w);
+  if (handle == null) return;
   for (const entry of [...rendererReadyCallbacks]) {
-    entry.invoke([w.contents.id]);
+    entry.invoke([handle]);
   }
 }
 
 // Per-window unload dispatch: fires ctx.onUnload subscribers when a window's webContents is
-// destroyed (called from the webContents destroyed path in start()).
-function fireWindowUnload(contentsId) {
+// destroyed (called from the webContents destroyed path in start()). `handle` is the issued
+// WindowHandle (BrowserWindow.id when bound, else webContents.id).
+function fireWindowUnload(handle) {
+  if (handle == null) return;
   for (const entry of [...unloadCallbacks]) {
-    entry.invoke([contentsId]);
+    entry.invoke([handle]);
   }
 }
 
@@ -2867,7 +3008,10 @@ function start(app, sinks = {}) {
       rec.dead = true;
       rec.readyArmed = false; // late adapter-gate ready() must no-op (see onReady guard below)
       const contentsId = contents.id;
-      const handle = contentsId;
+      // Unified WindowHandle issuance (PR#1 semantics on the PR#2 async path): issue before the
+      // record is dropped so a stashed BrowserWindow.id survives. The batch delivers onUnload
+      // with this handle (fireUnloadSnapshot reads batch.handle).
+      const handle = issuedWindowHandle(rec, contentsId);
       windows.delete(contentsId);
       // Cancel pending loaders for this window (loader continuations re-check identity and the
       // windows map, so any late resolution fast-fails without creating VMs).
@@ -3028,6 +3172,8 @@ function reset() {
   appLoaded = false;
   hostPlatform = process.platform;
   windowResolver = (id) => BrowserWindow.fromId(id);
+  windowEnumerator = defaultWindowEnumerator;
+  windowHandleMode = WINDOW_HANDLE_MODE_UNIFIED;
 }
 
 module.exports = {
@@ -3053,6 +3199,25 @@ module.exports = {
     setWindowResolver: (resolver) => {
       windowResolver = typeof resolver === "function" ? resolver : (id) => BrowserWindow.fromId(id);
     },
+    // Live-window enumeration seam for the bun harness: resolveWindowHandle's
+    // contents-id fallback scans these windows, so tests enumerate their fake
+    // windows hermetically regardless of which "electron" stub index.js
+    // captured at load. reset() restores production Electron enumeration.
+    setWindowEnumerator: (enumerator) => {
+      windowEnumerator =
+        typeof enumerator === "function" ? enumerator : defaultWindowEnumerator;
+    },
+    // Issuance-mode seam for the reverse-proof collision test: "legacy-mixed-ids"
+    // restores Gate 3 mixed issuance (rr/ul pass webContents.id) so the A/B
+    // fixture misroutes through resolveWindowHandle's fromId-first step.
+    // Anything else (including omit/reset) is unified BrowserWindow.id issuance.
+    setWindowHandleMode: (mode) => {
+      windowHandleMode =
+        mode === WINDOW_HANDLE_MODE_LEGACY
+          ? WINDOW_HANDLE_MODE_LEGACY
+          : WINDOW_HANDLE_MODE_UNIFIED;
+    },
+    resolveWindowHandle: (id) => resolveWindowHandle(id),
     // Async-op pump seams for the bun harness (src/async-pump.test.js): the harness spawns a real
     // QuickJS context, registers host functions backed by newHostPromise, settles ops through
     // settleOp/disposeVM, and asserts on the live pump state. These exist only so the feature tests

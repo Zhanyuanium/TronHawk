@@ -1,28 +1,29 @@
 # @tronhawk/cli-create-plugin
 
 Scaffold a new [TronHawk](https://github.com/TronHawk) plugin project: `package.json`,
-`tsconfig.json`, a `manifest.json`, and TypeScript starter sources.
+`tsconfig.json`, a `manifest.json`, and executable CommonJS starter sources
+(`src/renderer.js` / `src/main.js`, loaded directly by the QuickJS host).
 
 Requires [bun](https://bun.sh) (the repo's JS toolchain). The CLI is a bun package with no
 runtime dependencies; it runs the scaffold templates directly.
 
 ## Usage
 
-From the monorepo root (the package is a bun workspace member):
+Standalone (from the npm registry; works outside any TronHawk checkout):
 
 ```sh
-bun run create-tronhawk-plugin -- plugins/my-plugin          # renderer starter (default)
-bun run create-tronhawk-plugin -- plugins/window-tint --type main --author "Ada"
+bunx @tronhawk/cli-create-plugin plugins/my-plugin          # renderer starter (default)
+bunx @tronhawk/cli-create-plugin plugins/window-tint --type main --author "Ada"
 ```
 
-Directly via the source entry (works from anywhere):
+Directly via the source entry (contributors inside a checkout, works from anywhere):
 
 ```sh
 bun ./tools/create-tronhawk-plugin/src/cli.ts plugins/my-plugin --type renderer
 ```
 
-Or link the package once to get a global `create-tronhawk-plugin` on your PATH
-(`bun link` inside `tools/create-tronhawk-plugin`, then run `create-tronhawk-plugin <name>`
+Or install the package once to get a global `create-tronhawk-plugin`
+(`bun add -g @tronhawk/cli-create-plugin`, then run `create-tronhawk-plugin <name>`
 from any directory).
 
 The generic usage is:
@@ -52,7 +53,7 @@ given. Scaffolding into the current directory, an ancestor, or the filesystem ro
 # Renderer plugin (page CSS + renderer script) in ./dark-scrollbar
 create-tronhawk-plugin dark-scrollbar
 
-# Main-process plugin inside the monorepo's plugin folder
+# Main-process plugin in a plugins folder
 create-tronhawk-plugin plugins/window-tint --type main --author "Ada"
 
 # CSS-only theme into a temp dir (--force overwrites)
@@ -63,48 +64,96 @@ create-tronhawk-plugin ./tmp/theme --type css --force
 
 ```
 my-plugin/
-├── package.json       # bun package: tronhawk-plugin-<name>, typecheck/build scripts
-├── tsconfig.json      # strict TS, noEmit (mirrors the in-repo plugin convention)
+├── package.json       # bun package: tronhawk-plugin-<name>, typecheck script (no build step)
+├── tsconfig.json      # strict TS, noEmit, allowJs/checkJs (mirrors the in-repo plugin convention)
 ├── manifest.json      # id, name, version, author, tronhawk "^0.1", entry, permissions
 ├── README.md
 ├── .gitignore
 ├── style.css          # css & renderer types: page theme referenced by entry.css
 └── src/
-    ├── renderer.ts    # renderer type: active; others: commented starter
-    └── main.ts        # main type: active; others: commented starter
+    ├── renderer.js    # renderer type: active CommonJS entry; others: commented starter
+    └── main.js        # main type: active CommonJS entry; others: commented starter
 ```
+
+Runtime entries are executable CommonJS: the QuickJS host evaluates the entry
+with `module`/`exports` scaffolding and reads
+`module.exports.activate`/`deactivate`. TypeScript ESM (`export default`) is
+never loaded directly — `entry.renderer` / `entry.main` must point at `.js`.
 
 Per type, `manifest.json` is generated as:
 
 | `--type` | `entry` | `permissions` |
 |---|---|---|
 | `css` | `{ "css": "style.css" }` | `["renderer.css"]` |
-| `renderer` (default) | `{ "css": "style.css", "renderer": "src/renderer.ts" }` | `["renderer.css", "renderer.script"]` |
-| `main` | `{ "main": "src/main.ts" }` | `["electron.window"]` |
+| `renderer` (default) | `{ "css": "style.css", "renderer": "src/renderer.js" }` | `["renderer.css", "renderer.script"]` |
+| `main` | `{ "main": "src/main.js" }` | `["electron.window"]` |
 
 The `tronhawk` field is the TronHawk **runtime protocol version** (`"^0.1"`), not the SDK npm
-version. The SDK dependency (`@tronhawk/sdk`) is the TypeScript API surface only.
+version. The SDK dependency (`@tronhawk/sdk`) provides the TypeScript API
+surface plus testing helpers (`createMockRendererContext`,
+`createMockMainContext`, `createLogger`, `injectCSS`) — no host runtime and no
+packer; packing goes through the standalone `@tronhawk/cli` (`tronhawk`
+binary) and the same-version native `tronhawk-pack` engine (see below).
 
-## `@tronhawk/sdk` dependency resolution
+## `@tronhawk/sdk` / `@tronhawk/cli` dependency resolution
 
-The SDK is not published to a registry (it is `private` in the monorepo), so the CLI picks the
-dependency spec that will actually work where you scaffold:
-
-- Target directory is a workspace member folder inside the monorepo
-  (`plugins/*` or `tools/*`) → `"@tronhawk/sdk": "workspace:*"`.
-- Target directory anywhere else on the same drive → a relative
-  `"file:../../sdk"` spec that resolves to the local SDK (detected by walking up from the CLI).
-- Otherwise `workspace:*` with a note — pass `--sdk` to override, e.g.
-  `--sdk file:../path/to/sdk` or a registry spec once the SDK is published.
+Both default to the npm registry release line (`^0.2.0` for `@tronhawk/sdk`,
+`^0.1.0` for `@tronhawk/cli`, kept in sync with
+`sdk/package.json` and `tools/tronhawk-cli/package.json`). Pass `--sdk` /
+`--cli` at scaffold time to override (e.g. `--sdk file:/path/to/sdk.tgz` or
+`--cli file:/path/to/tronhawk-cli.tgz` for unpublished tarballs). The
+scaffolder never emits `workspace:*` or a local `file:` probe by default, so
+an external plugin cannot be masked by a checkout.
 
 ## Packing to `.thx`
 
-Packing is a Rust binary (`crates/package`), invoked from the monorepo as
-`cargo run -p tronhawk-package --bin pack -- <plugin-dir> <out.thx>`. The packer validates
-`manifest.json` and its entry files, then packs every file in the folder — it **refuses
-symlinks**, so remove the plugin's `node_modules` (which contains a symlinked
-`@tronhawk/sdk`) before packing. The scaffolded `README.md` documents the exact commands;
-the `.thx` artifact is git-ignored.
+Every type packs through the unified CLI command (CSS-only skips `build`
+explicitly — `style.css` ships as data — but still runs staging and the
+same-version Rust/SHA path; never invoke the engine binary directly):
+
+```sh
+cd <plugin-dir> && bun install
+bun run build            # tronhawk build .: bundle entries to dist/ (CSS-only: no build step)
+./node_modules/.bin/tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
+./node_modules/.bin/tronhawk validate .      # authoritative dir check (writes nothing)
+bun run pack             # tronhawk pack . <name>.thx (or ./node_modules/.bin/tronhawk pack . <name>.thx)
+./node_modules/.bin/tronhawk inspect <name>.thx
+```
+
+How to invoke `tronhawk`: `tronhawk` is a devDependency binary
+(`node_modules/.bin/tronhawk[.exe]`), not on `PATH`. A bare `tronhawk validate .`
+fails with "command not found" — `bun run <script>` resolves `.bin` automatically, a
+bare command does not. Pick one: (1) `./node_modules/.bin/tronhawk …` (most reliable,
+used above); (2) add `.bin` to `PATH` for this shell session only; (3) put the command
+in `package.json` `scripts` and run `bun run <script>` (recommended for repeated use;
+`build`/`pack` already work this way). Add scripts for the commands you run often, e.g.
+`{ "scripts": { "validate": "tronhawk validate .", "sandbox": "tronhawk test . --sandbox" } }`,
+then `bun run validate` / `bun run sandbox`. See `tools/tronhawk-cli/README.md`
+§ How to invoke `tronhawk`.
+
+The CLI needs the same-version native engine, resolved in this priority order
+(highest first): `TRONHAWK_PACK_BIN` env to the
+`tronhawk-pack` release binary (explicit, highest priority) > explicit config
+`tronhawk.packBin` > workspace build inside a TronHawk checkout (`cargo build -p
+tronhawk-package --release`, resolved from
+`target/{release,debug}/tronhawk-pack`). The CLI's `tronhawk.engineVersion`
+must exactly match `tronhawk-pack --version`; a missing binary, digest
+mismatch, or version mismatch hard-fails with install guidance — there is no
+TypeScript fallback packer and no PATH search for the engine.
+
+Alternative (contributors inside a TronHawk monorepo checkout, from the repo
+root only):
+
+```sh
+cargo run -p tronhawk-package --bin tronhawk-pack -- validate <plugin-dir>
+cargo run -p tronhawk-package --bin tronhawk-pack -- pack <plugin-dir> <out.thx>
+```
+
+The packer validates `manifest.json` and its entry files, then packs every file
+in the folder — it **refuses symlinks**, so remove the plugin's `node_modules`
+before packing when calling the engine directly. The scaffolded
+`README.md` documents the exact commands; the `.thx` artifact is git-ignored.
+See `docs/THX-FORMAT.md` for the `.thx` layout and file-safety rules.
 
 ## Development
 

@@ -1,0 +1,170 @@
+name: Release CLI + pack binaries
+
+# Publishes the standalone plugin toolchain:
+#   - `tronhawk-pack-<target>[.exe]` release binaries (Windows/macOS/Linux,
+#     x64/arm64) built from crates/package -- no Cargo workspace needed to USE
+#     them, only to build them here. Surface: `validate <dir>`,
+#     `pack <dir> <out.thx>`, `inspect <file.thx>` (exit 0/1/2 contract).
+#   - npm tarballs for the publishable JS packages (@tronhawk/sdk, the
+#     create-plugin CLI, and @tronhawk/cli), packed with `bun pm pack`
+#     (no registry publish).
+# Everything lands on the GitHub Release with a SHA-256 manifest.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing GitHub Release tag to upload assets to (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-pack-binaries:
+    name: pack (${{ matrix.target }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            ext: .exe
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          # No Intel macOS runner: cross-compile x64 from the arm64 host.
+          # crates/package is pure Rust, and the Apple linker handles
+          # -arch x86_64, so this needs only the rustup target below.
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: pack-${{ matrix.target }}
+      - name: Build pack (release)
+        run: cargo build --release -p tronhawk-package --bin pack --target ${{ matrix.target }}
+      - name: Stage asset + hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "target/${{ matrix.target }}/release/pack${{ matrix.ext }}"
+          if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "binary missing: $src" }
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $dst = "dist/tronhawk-pack-${{ matrix.target }}${{ matrix.ext }}"
+          Copy-Item -Force -LiteralPath $src -Destination $dst
+          $h = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash.ToLower()
+          "$h  $(Split-Path -Leaf $dst)" | Set-Content -NoNewline -Encoding ascii "$dst.sha256"
+          Get-Content -LiteralPath "$dst.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pack-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  pack-npm:
+    name: npm tarballs (sdk + creator + cli)
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.0"
+      - name: Pack npm tarballs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path (Get-Location) "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          # Publishable JS packages: SDK + scaffolder CLI + standalone CLI.
+          # The guards below keep every published tarball free of
+          # `workspace:` specs and `private:true`.
+          $pkgs = @("sdk", "tools/create-tronhawk-plugin", "tools/tronhawk-cli")
+          foreach ($p in $pkgs) {
+            if (-not (Test-Path -LiteralPath (Join-Path $p "package.json"))) { throw "required package missing: $p" }
+            Push-Location -LiteralPath $p
+            try {
+              $raw = Get-Content -LiteralPath "package.json" -Raw
+              $pkg = $raw | ConvertFrom-Json
+              if ($pkg.private) { throw "$p/package.json is private:true and cannot be published" }
+              if ($raw -match "workspace:") { throw "$p/package.json must not contain workspace: specs" }
+              # Pack into the package dir, then move (no --destination flag:
+              # keeps this working on older bun 1.4.x).
+              Remove-Item -Force -ErrorAction SilentlyContinue ./*.tgz
+              bun pm pack | Out-Null
+              $made = Get-ChildItem -Filter *.tgz
+              if (-not $made) { throw "bun pm pack produced no tarball in $p" }
+              $made | Move-Item -Destination $dist -Force
+            } finally { Pop-Location }
+          }
+          $tgz = Get-ChildItem -LiteralPath $dist -Filter "*.tgz"
+          if (-not $tgz) { throw "no tarballs produced" }
+          $tgz | ForEach-Object { Write-Host $_.Name }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-tarballs
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: attach assets to GitHub Release
+    permissions:
+      contents: write
+    needs: [build-pack-binaries, pack-npm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Write SHA256SUMS.txt manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = Get-ChildItem -LiteralPath "assets" -File |
+            Where-Object { $_.Name -ne "SHA256SUMS.txt" -and $_.Name -notlike "*.sha256" } |
+            Sort-Object Name
+          if (-not $files) { throw "no assets to hash" }
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($f.Name)"
+            $sidecar = "$($f.FullName).sha256"
+            if (Test-Path -LiteralPath $sidecar) {
+              $expected = (Get-Content -LiteralPath $sidecar -Raw).Trim()
+              if ($expected -ne "$h  $($f.Name)") { throw "sidecar mismatch: $($f.Name)" }
+            }
+          }
+          $lines | Set-Content -Encoding ascii -LiteralPath "assets/SHA256SUMS.txt"
+          Get-Content -LiteralPath "assets/SHA256SUMS.txt"
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          files: assets/*

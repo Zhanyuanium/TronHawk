@@ -1,8 +1,8 @@
 # @tronhawk/sdk
 
-TypeScript API for [TronHawk](https://github.com/Zhanyuanium/TronHawk) plugins. Types only — no runtime.
+TypeScript API for [TronHawk](https://github.com/Zhanyuanium/TronHawk) plugins: context types plus testing helpers. No host runtime, no packer.
 
-> Version `0.1.0` is the first usable but incomplete release. Only the APIs listed below as implemented are wired into the host runtime. The authoritative contract lives in `docs/PLUGIN-SDK.md` in the TronHawk repo.
+> Version `0.2.0` is the first usable but incomplete release. Only the APIs listed below as implemented are wired into the host runtime. The authoritative contract lives in `docs/PLUGIN-SDK.md` in the TronHawk repo.
 >
 > 中文版见 [README.zh-CN.md](./README.zh-CN.md)。
 
@@ -16,10 +16,10 @@ Requires `bun` (the repo's JS toolchain). No runtime dependencies.
 
 ## Quick start
 
-Scaffold a plugin (from the TronHawk monorepo):
+Scaffold a plugin (standalone; works outside any TronHawk checkout):
 
 ```sh
-bun run create-tronhawk-plugin -- plugins/my-plugin --type renderer
+create-tronhawk-plugin plugins/my-plugin --type renderer
 # --type css | renderer (default) | main
 ```
 
@@ -58,12 +58,71 @@ const plugin: PluginModule<MainContext> = {
 export default plugin;
 ```
 
+> The snippets above are TypeScript sources for type-checking. The file the
+> host actually loads (`entry.renderer` / `entry.main`) must be executable
+> CommonJS (`module.exports = { activate, deactivate }`) — ESM
+> (`export default`) is never executed directly. The scaffolder generates
+> `src/renderer.js` / `src/main.js` in that form.
+
 ## What the SDK provides
 
 - `PluginContext`: `logger`, `network` (domain-whitelisted, `network.access`), `config` (read via Manager snapshot; `set` is a no-op for sandboxed plugins).
-- `RendererContext`: `css.insert/remove` (`renderer.css`), `script.setDocumentTitle` (`renderer.script`), `dom.query/observe` (`renderer.dom`, serialized snapshots, ~100 ms polling), `storage.get/set` (`renderer.storage`, renderer-only, host-namespaced per plugin).
+- `RendererContext`: `css.insert/remove` (`renderer.css`), `script.setDocumentTitle` (`renderer.script`), `dom.query/observe` (`renderer.dom`, serialized snapshots, 500 ms cadence), `storage.get/set` (`renderer.storage`, renderer-only, host-namespaced per plugin).
 - `MainContext`: `window.onCreated/setOpacity/setSize/setPosition/setVibrancy/setMica` (`electron.window`), `onLoad/onRendererReady/onUnload` lifecycle events (main-root, synchronous `undefined` callbacks, fail-closed unregister).
-- Test helpers: `createMockRendererContext`, `createMockMainContext`, `createLogger`, `injectCSS`.
+- Testing helpers (no host required): `createMockRendererContext`, `createMockMainContext`, `createLogger`, `injectCSS`. Use them for unit tests outside the TronHawk host.
+
+What the SDK does NOT provide: no host runtime (no QuickJS sandbox, no
+`ctx` implementation outside mocks), and no `.thx` packer. Packing is
+decided by the same-version native `tronhawk-pack` engine through the
+standalone `@tronhawk/cli` (`tronhawk` binary).
+
+Standalone toolchain (works outside any TronHawk checkout):
+
+```sh
+create-tronhawk-plugin my-plugin --type renderer
+cd my-plugin && bun install
+bun run build            # tronhawk build .: bundle entries to dist/ (CSS-only: no build step, style.css ships as data)
+bun test                 # starter smoke test against SDK mocks (no host)
+./node_modules/.bin/tronhawk test . --sandbox  # QuickJS contract harness (ships inside the CLI, no checkout needed)
+./node_modules/.bin/tronhawk validate .      # authoritative dir check (writes nothing)
+bun run pack             # tronhawk pack . my-plugin.thx (or ./node_modules/.bin/tronhawk pack . my-plugin.thx)
+./node_modules/.bin/tronhawk inspect my-plugin.thx
+```
+
+How to invoke `tronhawk`: `tronhawk` is a devDependency binary
+(`node_modules/.bin/tronhawk[.exe]`), not on `PATH`. A bare `tronhawk validate .`
+fails with "command not found" — `bun run <script>` resolves `.bin` automatically, a
+bare command does not. Pick one: (1) `./node_modules/.bin/tronhawk …` (most reliable,
+used above); (2) add `.bin` to `PATH` for this shell session only; (3) put the command
+in `package.json` `scripts` and run `bun run <script>` (recommended for repeated use;
+`build`/`pack` already work this way). Add scripts for the commands you run often, e.g.
+`{ "scripts": { "validate": "tronhawk validate .", "sandbox": "tronhawk test . --sandbox" } }`,
+then `bun run validate` / `bun run sandbox`. See `tools/tronhawk-cli/README.md`
+§ How to invoke `tronhawk`.
+
+The CLI resolves the engine from trusted sources only (no PATH search), highest first:
+`TRONHAWK_PACK_BIN` (explicit, highest priority), explicit config
+`tronhawk.packBin`, or `target/{release,debug}/tronhawk-pack(.exe)` from a
+local cargo build. Set `TRONHAWK_PACK_BIN` to the same-version
+`tronhawk-pack` release binary — the CLI's `tronhawk.engineVersion` must
+exactly match `tronhawk-pack --version`; a missing binary, digest mismatch,
+or version mismatch hard-fails with install guidance (there is no TypeScript
+fallback packer). CSS-only plugins skip `build` explicitly but still pack
+through the unified `tronhawk pack` command and the same-version Rust/SHA
+path — never invoke the engine binary directly.
+
+Alternative (contributors inside a TronHawk monorepo checkout, from the repo
+root only):
+
+```sh
+cargo run -p tronhawk-package --bin tronhawk-pack -- validate <path-to-plugin>
+cargo run -p tronhawk-package --bin tronhawk-pack -- pack <path-to-plugin> <out.thx>
+```
+
+The runtime still only loads executable CommonJS
+(`module.exports.activate`/`deactivate`) — TypeScript ESM (`export default`)
+is never executed directly, so `entry.renderer` / `entry.main` must point at
+`.js` (see `docs/PLUGIN-SDK.md`).
 
 Do NOT depend on Electron private APIs, Chromium internals, or target-app implementation details.
 

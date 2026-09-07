@@ -57,7 +57,7 @@ pump**.
   `Element | null` query is **re-specified**:
   - `ctx.dom.query(selector): Promise<DomElement | null>` — first match or `null`.
   - `ctx.dom.observe(selector, cb: (node: DomElement) => void): () => void` — a **polling** bridge
-    (~100 ms cadence) delivering a snapshot of each newly observed node to a synchronous callback;
+     (500 ms cadence) delivering a snapshot of each newly observed node to a synchronous callback;
     returns a disconnect function. There is deliberately **no synchronous `dom.query`**.
 - **Network.** `ctx.network.request(req): Promise<NetworkResponse>` (unchanged shape, both contexts,
   requires `network.access`) runs a **Core-side, domain-whitelisted fetch** — the plugin never opens
@@ -68,12 +68,13 @@ pump**.
   entry as `tronhawk:<pluginId>:<key>`, so each plugin reads and writes only its own keyspace; values
   are strings and host-bounded.
 - **Lifecycle types.** `PluginModule.activate`/`deactivate` become
-  `(ctx: C) => void | Promise<void>` — the TypeScript spelling of the runtime contract "return
-  `undefined` synchronously, or a Promise the runtime drains". (The literal union
+  `(ctx: C) => void | Promise<unknown>` — the TypeScript spelling of the runtime contract "return
+  `undefined` synchronously, or a Promise the runtime drains". A fulfilled Promise's resolve value
+  is ignored; only a rejection fails the hook. (The literal union
   `undefined | Promise<undefined>` would statically reject ordinary async hooks — `async fn` has type
   `Promise<void>` — and would also break existing synchronous no-return `activate(ctx) { … }` plugin
-  bodies, which TS infers as returning `void`; `void | Promise<void>` accepts both authoring forms
-  while still rejecting a Promise of a concrete value.)
+  bodies, which TS infers as returning `void`; `void | Promise<unknown>` accepts both authoring forms
+  and does not reject a Promise of a concrete value.)
 - **Lifecycle-event and observe callback types are unchanged** — strictly synchronous
   `undefined`-returning, asserted in `sdk/src/lifecycle-contract.typecheck.ts`.
 
@@ -99,7 +100,8 @@ process boundary instead of an in-process call.
 
 - SDK 0.5.0 adds the `DomElement` snapshot type, re-specifies `DomAPI` (`query` →
   `Promise<DomElement | null>`, `observe` → snapshot callback), adds `StorageAPI`/`ctx.storage` on
-  `RendererContext`, and broadens `activate`/`deactivate` to `void | Promise<void>`.
+  `RendererContext`, and broadens `activate`/`deactivate` to `void | Promise<unknown>`
+  (a fulfilled Promise's resolve value is ignored; only a rejection fails the hook).
   `sdk/src/lifecycle-contract.typecheck.ts` asserts the new lifecycle contract and keeps the
   sync-only assertions on event callbacks.
 - `PLUGIN-SDK.md` and SPEC §9/§10 flip `ctx.dom`, `ctx.network`, `ctx.storage`, and async lifecycle

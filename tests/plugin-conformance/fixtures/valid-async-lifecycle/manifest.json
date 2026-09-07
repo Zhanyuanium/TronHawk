@@ -1,0 +1,9 @@
+{
+  "id": "com.example.valid-async-lifecycle",
+  "name": "Valid Async Lifecycle",
+  "version": "0.1.0",
+  "author": "Conformance",
+  "tronhawk": "^0.1",
+  "entry": { "renderer": "src/renderer.js" },
+  "permissions": ["renderer.script"]
+}

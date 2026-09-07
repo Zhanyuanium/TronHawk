@@ -7,6 +7,8 @@ import * as path from "node:path";
 
 import { main } from "./cli";
 import {
+  DEFAULT_CLI_SPEC,
+  DEFAULT_SDK_SPEC,
   buildFiles,
   humanize,
   isValidPluginId,
@@ -54,7 +56,8 @@ function scaffoldFor(type: PluginType): ReturnType<typeof buildFiles> {
     type,
     version: "0.1.0",
     pluginId: "com.example.my-plugin",
-    sdkSpec: "workspace:*",
+    sdkSpec: DEFAULT_SDK_SPEC,
+    cliSpec: DEFAULT_CLI_SPEC,
   });
 }
 
@@ -100,8 +103,17 @@ describe("scaffold templates", () => {
       expect(paths).toContain("manifest.json");
       expect(paths).toContain("README.md");
       expect(paths).toContain(".gitignore");
-      expect(paths).toContain("src/renderer.ts");
-      expect(paths).toContain("src/main.ts");
+      expect(paths).toContain("src/renderer.js");
+      expect(paths).toContain("src/main.js");
+      // One starter smoke test per scaffold so `bun run test` passes out of
+      // the box (bun test exits non-zero with no test files).
+      expect(paths).toContain(
+        type === "renderer"
+          ? "src/renderer.test.ts"
+          : type === "main"
+            ? "src/main.test.ts"
+            : "src/theme.test.ts",
+      );
 
       for (const f of files) {
         if (f.path.endsWith(".json")) {
@@ -117,13 +129,16 @@ describe("scaffold templates", () => {
     const obj = JSON.parse(manifest.content) as Record<string, unknown>;
     expect(obj.entry).toEqual({
       css: "style.css",
-      renderer: "src/renderer.ts",
+      renderer: "src/renderer.js",
     });
     expect(obj.permissions).toEqual(["renderer.css", "renderer.script"]);
-    const renderer = files.find((f) => f.path === "src/renderer.ts")!;
-    expect(renderer.content).toContain("PluginModule<RendererContext>");
-    expect(renderer.content).not.toContain("// import type");
+    const renderer = files.find((f) => f.path === "src/renderer.js")!;
+    expect(renderer.content).toContain("module.exports");
+    expect(renderer.content).toContain("activate");
+    expect(renderer.content).not.toContain("\nexport default");
     expect(files.some((f) => f.path === "style.css")).toBe(true);
+    // The runtime entry must never be a TS ESM file.
+    expect(files.some((f) => f.path === "src/renderer.ts")).toBe(false);
   });
 
   test("css type is theme-only with the renderer.css permission", () => {
@@ -139,31 +154,74 @@ describe("scaffold templates", () => {
     const files = scaffoldFor("main");
     const manifest = files.find((f) => f.path === "manifest.json")!;
     const obj = JSON.parse(manifest.content) as Record<string, unknown>;
-    expect(obj.entry).toEqual({ main: "src/main.ts" });
+    expect(obj.entry).toEqual({ main: "src/main.js" });
     expect(obj.permissions).toEqual(["electron.window"]);
-    const mainSrc = files.find((f) => f.path === "src/main.ts")!;
-    expect(mainSrc.content).toContain("PluginModule<MainContext>");
-    const renderer = files.find((f) => f.path === "src/renderer.ts")!;
+    const mainSrc = files.find((f) => f.path === "src/main.js")!;
+    expect(mainSrc.content).toContain("module.exports");
+    expect(mainSrc.content).toContain("activate");
+    expect(mainSrc.content).not.toContain("\nexport default");
+    expect(files.some((f) => f.path === "src/main.ts")).toBe(false);
+    const renderer = files.find((f) => f.path === "src/renderer.js")!;
     expect(onlyCommentsOrBlank(renderer.content)).toBe(true);
   });
 
-  test("package.json carries the SDK dep, typecheck script and manifest conventions", () => {
+  test("package.json carries the registry SDK/CLI deps plus build/typecheck/test/pack scripts", () => {
     const files = scaffoldFor("renderer");
     const pkg = files.find((f) => f.path === "package.json")!;
     const obj = JSON.parse(pkg.content) as {
       name: string;
       scripts: Record<string, string>;
       dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
     };
     expect(obj.name).toBe("tronhawk-plugin-my-plugin");
+    // Entries are bundled to dist/ by the CLI; typecheck + starter test need no host.
+    expect(obj.scripts.build).toBe("tronhawk build .");
     expect(obj.scripts.typecheck).toBe("tsc --noEmit");
-    expect(obj.scripts.pack).toBeUndefined(); // packing is documented, not scripted
-    expect(obj.dependencies["@tronhawk/sdk"]).toBe("workspace:*");
+    // `bun test` exits non-zero with no test files, so the scaffold ships a
+    // starter test and a script that runs it.
+    expect(obj.scripts.test).toBe("bun test");
+    expect(files.some((f) => f.path === "src/renderer.test.ts")).toBe(true);
+    // CLI-driven pack (staging -> single authoritative Rust pack with the
+    // temp + round-trip + atomic rename inside Rust).
+    // Canonical subcommand form (the bare `<dir> <out.thx>` form is deprecated).
+    expect(obj.scripts.pack).toBe("tronhawk pack . my-plugin.thx");
+    // Registry defaults: never a workspace: link or a local file: probe, so an
+    // external plugin cannot be masked by the monorepo.
+    expect(obj.dependencies["@tronhawk/sdk"]).toBe(DEFAULT_SDK_SPEC);
+    expect(obj.devDependencies["@tronhawk/cli"]).toBe(DEFAULT_CLI_SPEC);
+    expect(JSON.stringify(obj)).not.toContain("workspace:");
+    // @types/bun backs the `bun:test` import in the starter test file.
+    expect(obj.devDependencies["@types/bun"]).toBeTruthy();
 
     const readme = files.find((f) => f.path === "README.md")!;
+    expect(readme.content).toContain("tronhawk pack");
+    expect(readme.content).toContain("TRONHAWK_PACK_BIN");
     expect(readme.content).toContain(
-      "cargo run -p tronhawk-package --bin pack",
+      "cargo run -p tronhawk-package --bin tronhawk-pack",
     );
+    // CLI invocation errata: no bare `tronhawk …` shell line is copy-paste
+    // ready by default (`tronhawk` is a devDependency .bin, not on PATH).
+    expect(readme.content).toContain("How to invoke `tronhawk`");
+    expect(readme.content).toContain("not on `PATH`");
+    expect(readme.content).toContain("./node_modules/.bin/tronhawk validate .");
+    expect(readme.content).toContain(
+      "./node_modules/.bin/tronhawk test . --sandbox",
+    );
+    expect(readme.content).toContain("./node_modules/.bin/tronhawk inspect");
+    expect(readme.content).toContain("bun run validate");
+    expect(readme.content).not.toMatch(/\ntronhawk (build|validate|pack|inspect|test) \./);
+    // Unified CLI pack: the old direct-engine `tronhawk-pack pack` bypass is gone.
+    expect(readme.content).not.toContain("tronhawk-pack pack");
+    // Standalone-first: the monorepo cargo flow is documented only as the
+    // contributor alternative; the old "cd into the plugin folder and pack
+    // with ." guidance is gone.
+    expect(readme.content).not.toContain("`cd` into the plugin folder");
+    expect(readme.content).not.toContain("with `.` as the path");
+    // Runtime entries are CommonJS .js, never TS ESM.
+    expect(readme.content).toContain("src/renderer.js");
+    expect(readme.content).not.toContain('"renderer": "src/renderer.ts"');
+    expect(readme.content).not.toContain('"main": "src/main.ts"');
 
     const manifest = files.find((f) => f.path === "manifest.json")!;
     const m = JSON.parse(manifest.content) as Record<string, unknown>;
@@ -174,18 +232,72 @@ describe("scaffold templates", () => {
     expect(m.tronhawk).toBe("^0.1");
   });
 
-  test("commented starters are syntactically valid no-op TS", () => {
+  test("build/pack scripts are per-type: CLI bundle for JS entries, unified CLI pack for all types", () => {
+    // `tronhawk build` hard-fails with no JS entry, so CSS-only plugins use an
+    // echo build — but every type packs through the unified `tronhawk pack`
+    // command (CSS-only skips build explicitly, staging still runs, same-version
+    // Rust/SHA path). Never invoke the engine binary directly.
+    const css = scaffoldFor("css");
+    const cssPkg = JSON.parse(
+      css.find((f) => f.path === "package.json")!.content,
+    ) as { scripts: Record<string, string> };
+    expect(cssPkg.scripts.build).toContain("no build step");
+    expect(cssPkg.scripts.build).not.toContain("tronhawk");
+    expect(cssPkg.scripts.pack).toBe("tronhawk pack . my-plugin.thx");
+
+    for (const type of ["renderer", "main"] as const) {
+      const files = scaffoldFor(type);
+      const pkg = JSON.parse(
+        files.find((f) => f.path === "package.json")!.content,
+      ) as { scripts: Record<string, string> };
+      expect(pkg.scripts.build).toBe("tronhawk build .");
+      expect(pkg.scripts.pack).toBe("tronhawk pack . my-plugin.thx");
+    }
+  });
+
+  test("starter tests import SDK mocks and the active entry (no host, no globals)", () => {
+    const renderer = scaffoldFor("renderer");
+    const rendererTest = renderer.find((f) => f.path === "src/renderer.test.ts")!;
+    expect(rendererTest.content).toContain('from "bun:test"');
+    expect(rendererTest.content).toContain("createMockRendererContext");
+    expect(rendererTest.content).toContain('from "./renderer.js"');
+
+    const main = scaffoldFor("main");
+    const mainTest = main.find((f) => f.path === "src/main.test.ts")!;
+    expect(mainTest.content).toContain("createMockMainContext");
+    expect(mainTest.content).toContain('from "./main.js"');
+
+    const css = scaffoldFor("css");
+    const themeTest = css.find((f) => f.path === "src/theme.test.ts")!;
+    expect(themeTest.content).toContain("entry.css");
+    expect(themeTest.content).toContain("style.css");
+  });
+
+  test("scaffolded tsconfig resolves bun:test and default-imports CJS entries", () => {
+    const files = scaffoldFor("renderer");
+    const tsconfig = files.find((f) => f.path === "tsconfig.json")!;
+    const obj = JSON.parse(tsconfig.content) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    expect(obj.compilerOptions.types).toEqual(["bun"]);
+    expect(obj.compilerOptions.esModuleInterop).toBe(true);
+    expect(obj.compilerOptions.allowJs).toBe(true);
+    expect(obj.compilerOptions.checkJs).toBe(true);
+  });
+
+  test("commented starters are syntactically valid no-op JS (CommonJS)", () => {
     const rendererFiles = scaffoldFor("renderer");
-    const mainTs = rendererFiles.find((f) => f.path === "src/main.ts")!;
+    const mainJs = rendererFiles.find((f) => f.path === "src/main.js")!;
     // The disabled template must contain no executable statement.
-    expect(onlyCommentsOrBlank(mainTs.content)).toBe(true);
+    expect(onlyCommentsOrBlank(mainJs.content)).toBe(true);
 
     const mainFiles = scaffoldFor("main");
-    const rendererTs = mainFiles.find((f) => f.path === "src/renderer.ts")!;
-    expect(onlyCommentsOrBlank(rendererTs.content)).toBe(true);
+    const rendererJs = mainFiles.find((f) => f.path === "src/renderer.js")!;
+    expect(onlyCommentsOrBlank(rendererJs.content)).toBe(true);
 
     // Disabled templates still show the starter code (commented out).
-    expect(rendererTs.content).toContain("// export default plugin;");
+    expect(rendererJs.content).toContain("// module.exports");
+    expect(rendererJs.content).not.toContain("\nexport default");
   });
 });
 
@@ -234,24 +346,34 @@ describe("create-tronhawk-plugin CLI (spawned)", () => {
         entry: Record<string, string>;
         permissions: string[];
       };
-      expect(manifest.entry.renderer).toBe("src/renderer.ts");
+      expect(manifest.entry.renderer).toBe("src/renderer.js");
       expect(manifest.entry.css).toBe("style.css");
       expect(manifest.permissions).toEqual(["renderer.css", "renderer.script"]);
 
       const pkg = readJson(path.join(target, "package.json")) as {
         name: string;
+        scripts: Record<string, string>;
         dependencies: Record<string, string>;
+        devDependencies: Record<string, string>;
       };
       expect(pkg.name).toBe("tronhawk-plugin-my-plugin");
-      expect(pkg.dependencies["@tronhawk/sdk"]).toBeTruthy();
+      // Registry defaults even when scaffolded from inside a checkout: no
+      // workspace: link, no local file: probe.
+      expect(pkg.dependencies["@tronhawk/sdk"]).toBe(DEFAULT_SDK_SPEC);
+      expect(pkg.devDependencies["@tronhawk/cli"]).toBe(DEFAULT_CLI_SPEC);
+      expect(pkg.scripts.build).toBe("tronhawk build .");
+      expect(pkg.scripts.test).toBe("bun test");
+      expect(pkg.scripts.pack).toBe("tronhawk pack . my-plugin.thx");
 
       // Syntactically valid source files exist.
-      for (const rel of ["src/renderer.ts", "src/main.ts", "style.css", "tsconfig.json", "README.md", ".gitignore"]) {
+      for (const rel of ["src/renderer.js", "src/main.js", "src/renderer.test.ts", "style.css", "tsconfig.json", "README.md", ".gitignore"]) {
         expect(fs.existsSync(path.join(target, rel))).toBe(true);
       }
-      expect(fs.existsSync(path.join(target, "src/renderer.ts"))).toBe(true);
-      const renderer = fs.readFileSync(path.join(target, "src/renderer.ts"), "utf8");
-      expect(renderer).toContain("PluginModule<RendererContext>");
+      expect(fs.existsSync(path.join(target, "src/renderer.ts"))).toBe(false);
+      expect(fs.existsSync(path.join(target, "src/main.ts"))).toBe(false);
+      const renderer = fs.readFileSync(path.join(target, "src/renderer.js"), "utf8");
+      expect(renderer).toContain("module.exports");
+      expect(renderer).not.toContain("\nexport default");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -277,10 +399,11 @@ describe("create-tronhawk-plugin CLI (spawned)", () => {
       };
       expect(manifest.id).toBe("com.acme.win-fx");
       expect(manifest.name).toBe("Win Fx");
-      expect(manifest.entry.main).toBe("src/main.ts");
+      expect(manifest.entry.main).toBe("src/main.js");
       expect(manifest.permissions).toEqual(["electron.window"]);
-      const main = fs.readFileSync(path.join(target, "src/main.ts"), "utf8");
-      expect(main).toContain("PluginModule<MainContext>");
+      const main = fs.readFileSync(path.join(target, "src/main.js"), "utf8");
+      expect(main).toContain("module.exports");
+      expect(main).not.toContain("\nexport default");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -305,7 +428,40 @@ describe("create-tronhawk-plugin CLI (spawned)", () => {
     }
   });
 
-  test("--sdk overrides the dependency spec", async () => {
+  test("default scaffold has no workspace: spec anywhere (no monorepo masking)", async () => {
+    const tmp = makeTmpDir();
+    const target = path.join(tmp, "plain");
+    try {
+      const r = await runCli(["--author", AUTHOR, target]);
+      expect(r.code).toBe(0);
+      const raw = fs.readFileSync(path.join(target, "package.json"), "utf8");
+      expect(raw).not.toContain("workspace:");
+      const pkg = JSON.parse(raw) as {
+        dependencies: Record<string, string>;
+        devDependencies: Record<string, string>;
+      };
+      expect(pkg.dependencies["@tronhawk/sdk"]).toBe(DEFAULT_SDK_SPEC);
+      expect(pkg.devDependencies["@tronhawk/cli"]).toBe(DEFAULT_CLI_SPEC);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("--cli overrides the CLI dependency spec", async () => {
+    const tmp = makeTmpDir();
+    const target = path.join(tmp, "p");
+    try {
+      const r = await runCli(["--author", AUTHOR, "--cli", "file:/tmp/tronhawk-cli.tgz", target]);
+      expect(r.code).toBe(0);
+      const pkg = readJson(path.join(target, "package.json")) as {
+        devDependencies: Record<string, string>;
+      };
+      expect(pkg.devDependencies["@tronhawk/cli"]).toBe("file:/tmp/tronhawk-cli.tgz");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+  test("--sdk overrides the SDK dependency spec", async () => {
     const tmp = makeTmpDir();
     const target = path.join(tmp, "p");
     try {
@@ -351,6 +507,25 @@ describe("create-tronhawk-plugin CLI (spawned)", () => {
     }
   });
 
+  test("summary routes every type through the unified tronhawk pack (no direct engine, no PATH engine)", async () => {
+    for (const type of ["css", "renderer", "main"] as const) {
+      const tmp = makeTmpDir();
+      const target = path.join(tmp, `sum-${type}`);
+      try {
+        const r = await runCli(["--author", AUTHOR, "--type", type, target]);
+        expect(r.code).toBe(0);
+        // All types share one CLI pack line (CSS skips build but keeps the
+        // same-version Rust/SHA path).
+        expect(r.stdout).toContain(`tronhawk pack . sum-${type}.thx`);
+        // The old CSS direct-engine bypass and the PATH-engine claim are gone.
+        expect(r.stdout).not.toContain("tronhawk-pack pack");
+        expect(r.stdout).not.toContain("on your PATH");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+  });
+
   test("manifest produced by the CLI matches manifestObject()", () => {
     const files = buildFiles({
       slug: "x",
@@ -359,7 +534,8 @@ describe("create-tronhawk-plugin CLI (spawned)", () => {
       type: "renderer",
       version: "0.1.0",
       pluginId: "com.example.x",
-      sdkSpec: "workspace:*",
+      sdkSpec: DEFAULT_SDK_SPEC,
+      cliSpec: DEFAULT_CLI_SPEC,
     });
     const manifest = files.find((f) => f.path === "manifest.json")!;
     const viaCli = manifestObject({
@@ -369,7 +545,8 @@ describe("create-tronhawk-plugin CLI (spawned)", () => {
       type: "renderer",
       version: "0.1.0",
       pluginId: "com.example.x",
-      sdkSpec: "workspace:*",
+      sdkSpec: DEFAULT_SDK_SPEC,
+      cliSpec: DEFAULT_CLI_SPEC,
     });
     expect(JSON.parse(manifest.content)).toEqual(viaCli);
   });
