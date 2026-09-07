@@ -38,6 +38,14 @@ deactivated (ADR 0008). Lifecycle-event and window callbacks (`ctx.onLoad` / `ct
 must return JavaScript `undefined` — the runtime never drains their return value and unregisters any
 callback that throws, exceeds its CPU deadline, or returns a non-`undefined` value.
 
+**Renderer plugin cap (R2, binding and permanent):** at most **8 renderer plugins per window**.
+Further loads fail closed with an error log; the first eight in stable plan order win
+deterministically. The cap limits total teardown work; it states no per-turn latency bound.
+Accepted limits: consecutive window transfers inside one event loop may head-of-line-block
+later windows for on the order of 2s; no upper bound is declared for a slow `disposeVM`
+itself; DUR-1 plan polling is guaranteed only to self-recover after cleanup drains, with no
+time-limit guarantee while teardown is concurrent.
+
 ## Plugin structure
 
 ```
@@ -169,7 +177,14 @@ Emit semantics:
   loaded is replayed once for each such window, mirroring `onCreated`'s existing-window replay.
 - `ctx.onUnload(cb)` — fires **per window when its `webContents` is destroyed**, carrying the
   destroyed window's `WindowHandle`. A quitting app always destroys its windows, so app shutdown is
-  covered by the same path.
+  covered by the same path. Delivery is asynchronous (background close pump, `deactivate`-before-
+  `onUnload` order preserved): each subscriber in the destroy-time snapshot that is still valid
+  at delivery receives that window's unload at most — in practice exactly — once. Subscribers
+  added after the snapshot are never included, and a subscriber revoked between the snapshot
+  and delivery is skipped (its plugin is already gone), so exactly-once and the revoke-skip
+  never conflict. R1: if the process exits while
+  teardown is still queued, the delivery may be lost (VM disposal is still guaranteed by the
+  `will-quit` sweep or the OS); `app.exit`/kill/crash carry no delivery guarantee.
 
 ## Logging & network
 

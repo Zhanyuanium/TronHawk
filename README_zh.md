@@ -30,6 +30,10 @@
   `renderer.script`、`renderer.dom`、`renderer.storage`、`electron.window`、
   `network.access` 等）。CSS 被当作**数据**对待，永远不会作为 JS 执行；不存
   在任意页面 JS 执行桥，插件也不能直接 `fetch()`。
+- **快速关闭窗口**：关闭时原生窗口同步释放，插件清理（guest `deactivate`、
+  VM 回收、`onUnload`）在后台 draining，且保持 `deactivate` 先于 `onUnload` 的
+  顺序。若进程在清理完成前退出，未执行的 guest 清理可能被跳过（VM 回收仍有保
+  证）；每个窗口最多 8 个 renderer 插件。
 - **分层架构**：Manager、Core、Injector、Runtime 严格分离（`docs/AGENTS.md`）。
 
 ## 工作原理
