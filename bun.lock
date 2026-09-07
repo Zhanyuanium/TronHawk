@@ -58,7 +58,7 @@
     },
     "tools/tronhawk-cli": {
       "name": "@tronhawk/cli",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "bin": {
         "tronhawk": "./src/cli.ts",
         "tronhawk-cli": "./src/cli.ts",

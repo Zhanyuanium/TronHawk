@@ -1,6 +1,6 @@
 {
   "name": "@tronhawk/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Standalone TronHawk plugin CLI: build (TS to single-file CommonJS), validate/pack via the authoritative Rust engine, smoke test",
   "license": "Apache-2.0",
   "repository": {
@@ -9,6 +9,9 @@
     "directory": "tools/tronhawk-cli"
   },
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "tronhawk": "./src/cli.ts",
     "tronhawk-cli": "./src/cli.ts"

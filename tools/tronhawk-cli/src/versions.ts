@@ -30,7 +30,7 @@ export function readCliPackage(): CliPackageInfo {
     tronhawk?: { engineVersion?: string; protocolVersion?: string; packBin?: string };
   };
   // Gate 2: missing fields must fail — never derive one version from another
-  // (no `engineVersion ?? cliVersion`, no `protocolVersion ?? "0.1.0"`, no
+  // (no `engineVersion ?? cliVersion`, no `protocolVersion ?? "0.1.1"`, no
   // `"0.0.0"` placeholder). Release-tag / package / engine consistency is only
   // ever an explicit assertion by the caller (see `assertEngineVersion` in
   // native.ts); this module never compares versions across kinds.

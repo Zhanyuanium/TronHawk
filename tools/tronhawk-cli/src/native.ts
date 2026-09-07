@@ -221,8 +221,8 @@ function parseVersionJson(stdout: string): { version: string; hostProtocol: stri
 
 function parseVersionHuman(stdout: string): { version: string; hostProtocol: string } | null {
   // Human form:
-  //   tronhawk-pack 0.1.0
-  //   host-protocol 0.1.0
+  //   tronhawk-pack 0.1.1
+  //   host-protocol 0.1.1
   const version = stdout.match(/^tronhawk-pack\s+(\S+)/m)?.[1];
   const hostProtocol = stdout.match(/^host-protocol\s+(\S+)/m)?.[1];
   if (version && hostProtocol) return { version, hostProtocol };

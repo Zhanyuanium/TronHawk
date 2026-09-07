@@ -6,7 +6,7 @@ every authoritative check runs in the same-version Rust engine (`tronhawk-pack` 
 CLI hard-fails with install guidance and never falls back to a TypeScript packer.
 
 > Three versions are managed independently (never assume equality, even when all
-> three are `0.1.0` today; missing fields fail instead of being derived):
+> three are `0.1.1` today; missing fields fail instead of being derived):
 > - CLI version — this package's `version`.
 > - Engine version — `tronhawk.engineVersion` in this package, must exactly
 >   match `tronhawk-pack --version` (explicit assertion at resolve time).

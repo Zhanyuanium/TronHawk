@@ -33,7 +33,7 @@ export const DEFAULT_SDK_SPEC = "^0.2.0";
  * (`version`; the CLI's `tronhawk.engineVersion` pins the matching
  * `tronhawk-pack` release binary).
  */
-export const DEFAULT_CLI_SPEC = "^0.1.0";
+export const DEFAULT_CLI_SPEC = "^0.1.1";
 
 export interface ScaffoldOptions {
   /** Directory base name slugged to kebab-case (used for ids and file names). */
@@ -50,7 +50,7 @@ export interface ScaffoldOptions {
   pluginId: string;
   /** Dependency spec for `@tronhawk/sdk` (registry range by default, e.g. "^0.2.0"; `--sdk` overrides). */
   sdkSpec: string;
-  /** Dependency spec for `@tronhawk/cli` (registry range by default, e.g. "^0.1.0"; `--cli` overrides). */
+  /** Dependency spec for `@tronhawk/cli` (registry range by default, e.g. "^0.1.1"; `--cli` overrides). */
   cliSpec: string;
 }
 
