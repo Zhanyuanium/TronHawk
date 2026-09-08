@@ -57,8 +57,10 @@ function planFor(revision, plugins) {
   return { revision, plugins };
 }
 
-function pluginEntry(id, grants, rendererSource) {
-  return { id, version: "1", granted: grants, renderer: rendererSource, css: null, main: null };
+function pluginEntry(id, grants, rendererSource, config) {
+  const entry = { id, version: "1", granted: grants, renderer: rendererSource, css: null, main: null };
+  if (config !== undefined) entry.config = config;
+  return entry;
 }
 
 // --- Fake trusted overlay view (host-controlled, separate WebContents) ---
@@ -257,8 +259,17 @@ afterEach(() => {
   mock.module("electron", () => electron);
 });
 
-function willNavigateEvent(overlayContents) {
-  return { sender: overlayContents, preventDefault: () => {} };
+// Real Electron `will-navigate` details shape (single param, no sender —
+// see electron.d.ts WebContentsWillNavigateEventParams): url + frame role +
+// preventDefault. Origin safety comes from the host registering the listener
+// ONLY on the overlay WebContents.
+function willNavigateDetails(url, extra) {
+  return {
+    url,
+    isMainFrame: true,
+    preventDefault: () => {},
+    ...(extra || {}),
+  };
 }
 
 // Real Electron `will-frame-navigate` details shape (single param, no
@@ -278,12 +289,26 @@ describe("window-controls pure module", () => {
   test("permission + scheme + bounds + safe prefs are fixed", () => {
     expect(wc.WINDOW_CONTROLS_PERMISSION).toBe("electron.windowControls");
     expect(wc.WINDOW_CONTROLS_SCHEME).toBe("tronhawk-wc");
-    expect(wc.WINDOW_CONTROLS_VIEW_BOUNDS).toEqual({ x: 12, y: 12, width: 68, height: 24 });
+    expect(wc.WINDOW_CONTROLS_VIEW_BOUNDS).toEqual({ x: 3, y: 0, width: 72, height: 30 });
     expect(wc.WINDOW_CONTROLS_SAFE_PREFERENCES).toMatchObject({
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     });
+  });
+
+  test("sole numeric table: d14/p24/gap10/inset5, no DPR conversion", () => {
+    // DIP/CSS px only: d=14, p=24, cell 24x24, gap 10, inset 5; left origin
+    // x=(H-24)/2+L (default H=30 -> x=3).
+    // Physical pixels are never taken as CSS px (14 CSS = 28 physical at DPR=2).
+    expect(wc.WINDOW_CONTROLS_LIGHT_DIAMETER).toBe(14);
+    expect(wc.WINDOW_CONTROLS_CELL_SIZE).toBe(24);
+    expect(wc.WINDOW_CONTROLS_LIGHT_PITCH).toBe(24);
+    expect(wc.WINDOW_CONTROLS_LIGHT_GAP).toBe(10);
+    expect(wc.WINDOW_CONTROLS_LIGHT_INSET).toBe(5);
+    expect(wc.WINDOW_CONTROLS_LIGHT_PITCH - wc.WINDOW_CONTROLS_LIGHT_DIAMETER).toBe(10);
+    expect((wc.WINDOW_CONTROLS_CELL_SIZE - wc.WINDOW_CONTROLS_LIGHT_DIAMETER) / 2).toBe(5);
+    expect(3 * wc.WINDOW_CONTROLS_CELL_SIZE).toBe(72);
   });
 
   test("overlay HTML is fixed-style, token-bound, script-free", () => {
@@ -360,6 +385,180 @@ describe("window-controls pure module", () => {
   });
 });
 
+describe("window-controls geometry normalization", () => {
+  test("missing config normalizes to the default region", () => {
+    for (const input of [undefined, null, {}, { "unrelated-key": 1 }]) {
+      expect(wc.normalizeWindowControlsGeometry(input)).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    }
+    expect(wc.normalizeWindowControlsGeometry({})).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+  });
+
+  test("custom height/adjustment shape the region: x = (H-24)/2+L, width always 72", () => {
+    // H=40, L=10 -> x=8+10=18; three 24x24 cells tile the 72x40 view at m=8.
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 40, "left-offset": 10 })).toEqual({
+      x: 18,
+      y: 0,
+      width: 72,
+      height: 40,
+    });
+    // H=40 with default adjustment: x tracks the vertical margin (m=8).
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 40 })).toEqual({ x: 8, y: 0, width: 72, height: 40 });
+    expect(wc.windowControlsViewBounds({ "region-height": 64 })).toEqual({ x: 20, y: 0, width: 72, height: 64 });
+    // Cells stay 24x24 in an H-tall flex row (m=(H-24)/2); lights are fixed
+    // 14px inline SVGs (sized by attributes, not CSS).
+    const css = wc.windowControlsViewCss({ "region-height": 40 });
+    expect(css).toContain("width:24px;height:24px");
+    expect(css).toContain("height:40px");
+    expect(css).toContain(".wc a svg{display:block;}");
+    expect(css).not.toContain("gap:");
+  });
+
+  test("wrong types fall back to defaults (no coercion)", () => {
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": "40", "left-offset": "10" })).toEqual({
+      x: 3,
+      y: 0,
+      width: 72,
+      height: 30,
+    });
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": true, "left-offset": [10] })).toEqual({
+      x: 3,
+      y: 0,
+      width: 72,
+      height: 30,
+    });
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": NaN, "left-offset": Infinity })).toEqual({
+      x: 3,
+      y: 0,
+      width: 72,
+      height: 30,
+    });
+  });
+
+  test("finite values round then clamp: height 30..64, adjustment 0..256", () => {
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 24 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 100 })).toEqual({ x: 20, y: 0, width: 72, height: 64 });
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 29.6 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "left-offset": -5 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "left-offset": 1000 })).toEqual({ x: 259, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "left-offset": 10.4 })).toEqual({ x: 13, y: 0, width: 72, height: 30 });
+  });
+
+  test("normalization is exact and deterministic: values pass through untouched", () => {
+    // Geometry is pure config math on CSS px: 30 in means exactly 30 out, on
+    // every display — no environment reads, no adjustments.
+    const g = wc.normalizeWindowControlsGeometry({ "region-height": 30, "left-offset": 0 });
+    expect(g).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(Object.isFrozen(g)).toBe(true);
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 30, "left-offset": 0 })).toEqual(g);
+    expect(wc.sameWindowControlsGeometry(g, { x: 3, y: 0, width: 72, height: 30 })).toBe(true);
+    expect(wc.sameWindowControlsGeometry(g, { x: 3, y: 0, width: 72, height: 31 })).toBe(false);
+    expect(wc.sameWindowControlsGeometry(null, g)).toBe(false);
+  });
+
+  test("served HTML/CSS follow the instance geometry", () => {
+    const html = wc.windowControlsViewHtml("c".repeat(32), { "region-height": 48 });
+    expect(html).toContain("width:24px;height:24px");
+    expect(html).toContain("height:48px");
+    expect(html).toContain('width="14" height="14"');
+    expect(html).toContain("tronhawk-wc://cccccccccccccccccccccccccccccccc/close");
+    // Omitted geometry falls back to defaults (24px cells in a 30px row).
+    expect(wc.windowControlsViewHtml("c".repeat(32))).toContain("width:24px;height:24px");
+  });
+
+  test("normalized geometries pass view builders through untouched (no re-default)", () => {
+    const g = wc.normalizeWindowControlsGeometry({ "region-height": 40, "left-offset": 10 });
+    expect(wc.windowControlsViewBounds(g)).toEqual({ x: 18, y: 0, width: 72, height: 40 });
+    expect(wc.windowControlsViewCss(g)).toContain("width:24px;height:24px");
+  });
+});
+
+describe("window-controls tooltip language + overrides", () => {
+  test("locale resolves by prefix: en-US/en, zh-CN/zh-Hans/zh-Hant, unknown to en", () => {
+    expect(wc.resolveWindowControlsLanguage("en-US")).toBe("en");
+    expect(wc.resolveWindowControlsLanguage("en")).toBe("en");
+    expect(wc.resolveWindowControlsLanguage("zh-CN")).toBe("zh");
+    expect(wc.resolveWindowControlsLanguage("zh-Hans-CN")).toBe("zh");
+    expect(wc.resolveWindowControlsLanguage("zh-Hant")).toBe("zh");
+    expect(wc.resolveWindowControlsLanguage("de-DE")).toBe("en");
+    expect(wc.resolveWindowControlsLanguage("")).toBe("en");
+    expect(wc.resolveWindowControlsLanguage(null)).toBe("en");
+    expect(wc.resolveWindowControlsLanguage(undefined)).toBe("en");
+    expect(wc.resolveWindowControlsLanguage(123)).toBe("en");
+  });
+
+  test("language tables carry both languages", () => {
+    expect(wc.resolveWindowControlsLabels("en", {})).toEqual({
+      close: "Close",
+      minimize: "Minimize",
+      maximize: "Maximize",
+      restore: "Restore",
+      controls: "Window controls",
+    });
+    expect(wc.resolveWindowControlsLabels("zh-CN", {})).toEqual({
+      close: "关闭",
+      minimize: "最小化",
+      maximize: "最大化",
+      restore: "还原",
+      controls: "窗口控件",
+    });
+  });
+
+  test("non-empty overrides win; empty/whitespace/non-string fall through", () => {
+    expect(
+      wc.resolveWindowControlsLabels("en", { "tooltip-close": "Quit", "tooltip-restore": "Unmax" }),
+    ).toEqual({ close: "Quit", minimize: "Minimize", maximize: "Maximize", restore: "Unmax", controls: "Window controls" });
+    expect(wc.resolveWindowControlsLabels("zh-CN", { "tooltip-close": "   " }).close).toBe("关闭");
+    expect(wc.resolveWindowControlsLabels("en", { "tooltip-close": "" }).close).toBe("Close");
+    expect(wc.resolveWindowControlsLabels("en", { "tooltip-close": 42 }).close).toBe("Close");
+    expect(wc.resolveWindowControlsLabels("en", null).close).toBe("Close");
+  });
+
+  test("overrides truncate at 128 chars and escape in served HTML", () => {
+    const long = "B".repeat(200);
+    expect(wc.resolveWindowControlsLabels("en", { "tooltip-close": long }).close).toHaveLength(128);
+    const evil = '"><svg onload=x>&<\'"';
+    const labels = wc.resolveWindowControlsLabels("en", { "tooltip-close": evil });
+    const html = wc.windowControlsViewHtml("d".repeat(32), undefined, labels);
+    expect(html).not.toContain('"><svg onload=x>');
+    expect(html).toContain("&quot;&gt;&lt;svg onload=x&gt;&amp;&lt;&#39;&quot;");
+    expect(wc.escapeWindowControlsAttrText("&<>\"'")).toBe("&amp;&lt;&gt;&quot;&#39;");
+    expect(wc.truncateWindowControlsLabel("xy")).toBe("xy");
+  });
+
+  test("sync snippet flips maximize/restore through the same table", () => {
+    expect(wc.windowControlsSyncSnippet(false)).toContain('"Maximize"');
+    expect(wc.windowControlsSyncSnippet(true)).toContain('"Restore"');
+    const zh = wc.resolveWindowControlsLabels("zh", {});
+    expect(wc.windowControlsSyncSnippet(false, zh)).toContain('"最大化"');
+    expect(wc.windowControlsSyncSnippet(true, zh)).toContain('"还原"');
+    const custom = wc.resolveWindowControlsLabels("en", { "tooltip-maximize": "Big", "tooltip-restore": "Small" });
+    expect(wc.windowControlsSyncSnippet(false, custom)).toContain('"Big"');
+    expect(wc.windowControlsSyncSnippet(true, custom)).toContain('"Small"');
+  });
+
+  test("served HTML carries localized labels and vector glyphs", () => {
+    const zh = wc.resolveWindowControlsLabels("zh-Hans-CN", {});
+    const html = wc.windowControlsViewHtml("e".repeat(32), undefined, zh);
+    expect(html).toContain('aria-label="关闭"');
+    expect(html).toContain('title="最小化"');
+    expect(html).toContain('aria-label="最大化"');
+    // Group itself is localized too.
+    expect(html).toContain('role="group" aria-label="窗口控件"');
+    // One inline SVG per button: symmetric 14px glyph paths, hidden from AT.
+    expect(html.match(/<svg viewBox="0 0 14 14"[^>]*aria-hidden="true">/g)).toHaveLength(3);
+    expect(html).toContain("M4.75 4.75L9.25 9.25M9.25 4.75L4.75 9.25");
+    expect(html).toContain("M4.5 7H9.5");
+    expect(html).toContain("M7 4.5V9.5M4.5 7H9.5");
+    expect(html).toContain('width="14" height="14"');
+    // Glyphs show on hover only; focus outline is kept.
+    expect(html).not.toContain("hover::after");
+    // Omitted labels fall back to English (tooltips and group alike).
+    const def = wc.windowControlsViewHtml("e".repeat(32));
+    expect(def).toContain('aria-label="Close"');
+    expect(def).toContain('role="group" aria-label="Window controls"');
+  });
+});
+
 describe("ctx.windowControls trusted dispatch", () => {
   test("safe view config + real-click closed loop (minimize/toggle/close)", async () => {
     const src = `
@@ -379,9 +578,12 @@ describe("ctx.windowControls trusted dispatch", () => {
     expect(opts.webPreferences.nodeIntegration).toBe(false);
     expect(opts.webPreferences.sandbox).toBe(true);
     expect(opts.webPreferences.preload).toBeUndefined();
-    // Exact content-sized geometry + explicit transparent background: no
-    // transparent margin around the controls to swallow page clicks.
-    expect(FakeWebContentsView.created[0].bounds).toEqual({ x: 12, y: 12, width: 68, height: 24 });
+    // Exact content-sized geometry (three 24x24 hit cells tiling the 72px
+    // width, 72x30 view at (3, 0)) + explicit transparent background: the
+    // 30px height holds 3px transparent bands top/bottom outside the hit
+    // cells (vertical centering by construction, default m=3) — by design,
+    // not a click-swallowing margin: no side margins, nothing past the view.
+    expect(FakeWebContentsView.created[0].bounds).toEqual({ x: 3, y: 0, width: 72, height: 30 });
     expect(FakeWebContentsView.created[0].backgroundColor).toBe("#00000000");
     // No page-DOM injection for the overlay (trusted view only).
     expect(pageSnippets.join("\n")).not.toContain("traffic-lights");
@@ -402,10 +604,10 @@ describe("ctx.windowControls trusted dispatch", () => {
     expect(servedMinimize).not.toBeNull();
     expect(servedMinimize[1]).toBe(`tronhawk-wc://${token}/minimize`);
     // Every overlay navigation is blocked first (overlay never leaves its
-    // trusted document), then dispatched on sender + token match.
+    // trusted document), then dispatched on registration boundary + token.
     let prevented = 0;
     const click = (url) =>
-      oc.emit("will-navigate", { sender: oc, preventDefault: () => { prevented++; } }, url);
+      oc.emit("will-navigate", willNavigateDetails(url, { preventDefault: () => { prevented++; } }));
     click(servedMinimize[1]);
     await waitFor(() => win.calls.some((c) => c[0] === "minimize"), "minimize dispatched");
     click(`tronhawk-wc://${token}/toggleMaximize`);
@@ -482,6 +684,30 @@ describe("ctx.windowControls trusted dispatch", () => {
     expect(prevented).toBe(1);
   });
 
+  test("will-navigate ignores any positional second arg (single-param API)", async () => {
+    const src = `
+      module.exports = {
+        activate: async (ctx) => { await ctx.windowControls.mount(); ctx.logger.info("WC-READY"); },
+      };
+    `;
+    const { win } = loadOne({ grants: WC_GRANTS, rendererSource: src });
+    await waitFor(() => pluginMessages(PID, "info", "WC-READY").length > 0, "mounted");
+    const oc = overlayViewForWindow(win).webContents;
+    const token = overlayTokenForWindow(win);
+    // The real API passes the URL only on details: a legacy-style positional
+    // URL with no details.url must NOT dispatch (blocked, but ignored).
+    let prevented = 0;
+    const before = win.calls.length;
+    oc.emit(
+      "will-navigate",
+      { isMainFrame: true, preventDefault: () => { prevented++; } },
+      `tronhawk-wc://${token}/minimize`,
+    );
+    await sleep(30);
+    expect(win.calls.length).toBe(before);
+    expect(prevented).toBe(1);
+  });
+
   test("one click emitting both events dispatches exactly once", async () => {
     const src = `
       module.exports = {
@@ -496,7 +722,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     const prevent = () => { prevented++; };
     // Same user click observed through both events (either order): the first
     // sighting dispatches, the twin is skipped.
-    oc.emit("will-navigate", { sender: oc, preventDefault: prevent }, `tronhawk-wc://${token}/minimize`);
+    oc.emit("will-navigate", willNavigateDetails(`tronhawk-wc://${token}/minimize`, { preventDefault: prevent }));
     oc.emit("will-frame-navigate", { url: `tronhawk-wc://${token}/minimize`, isMainFrame: true, preventDefault: prevent });
     await waitFor(() => win.calls.some((c) => c[0] === "minimize"), "minimize dispatched");
     await sleep(50);
@@ -504,7 +730,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     expect(prevented).toBe(2);
     // Reversed order behaves the same (frame first, then navigate).
     oc.emit("will-frame-navigate", { url: `tronhawk-wc://${token}/close`, isMainFrame: true, preventDefault: prevent });
-    oc.emit("will-navigate", { sender: oc, preventDefault: prevent }, `tronhawk-wc://${token}/close`);
+    oc.emit("will-navigate", willNavigateDetails(`tronhawk-wc://${token}/close`, { preventDefault: prevent }));
     await waitFor(() => win.calls.some((c) => c[0] === "close"), "close dispatched");
     await sleep(50);
     expect(win.calls.filter((c) => c[0] === "close")).toHaveLength(1);
@@ -595,7 +821,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     const url = `tronhawk-wc://${token}/minimize`;
     expect(oc.openWindow({ url })).toEqual({ action: "deny" });
     // A late navigation twin of the same click is skipped.
-    oc.emit("will-navigate", { sender: oc, preventDefault: () => {} }, url);
+    oc.emit("will-navigate", willNavigateDetails(url, { preventDefault: () => {} }));
     oc.emit("will-frame-navigate", { url, isMainFrame: true, preventDefault: () => {} });
     await waitFor(() => win.calls.some((c) => c[0] === "minimize"), "minimize dispatched");
     await sleep(50);
@@ -617,8 +843,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     let prevented = 0;
     oc.emit(
       "will-navigate",
-      { sender: oc, preventDefault: () => { prevented++; } },
-      `tronhawk-wc://${token}/minimize`,
+      willNavigateDetails(`tronhawk-wc://${token}/minimize`, { preventDefault: () => { prevented++; } }),
     );
     await waitFor(() => win.calls.some((c) => c[0] === "minimize"), "minimize dispatched");
     expect(prevented).toBe(1);
@@ -685,20 +910,155 @@ describe("ctx.windowControls trusted dispatch", () => {
     expect(oc.listenerCount("will-frame-navigate")).toBe(0);
   });
 
+  test("custom geometry mount sizes the view from plugin config", async () => {
+    const src = `
+      module.exports = {
+        activate: async (ctx) => { await ctx.windowControls.mount(); ctx.logger.info("WC-READY"); },
+      };
+    `;
+    const { win } = loadPlugins({
+      plugins: [pluginEntry(PID, WC_GRANTS, src, { "region-height": 40, "left-offset": 10 })],
+    });
+    await waitFor(() => pluginMessages(PID, "info", "WC-READY").length > 0, "mounted");
+    expect(FakeWebContentsView.created).toHaveLength(1);
+    expect(FakeWebContentsView.created[0].bounds).toEqual({ x: 18, y: 0, width: 72, height: 40 });
+    // Served document carries the instance geometry (24px cells in a 40px row,
+    // 14px vector lights, m=8, x=8+10=18).
+    expect(overlayNavigations).toHaveLength(1);
+    const servedHtml = decodeURIComponent(
+      overlayNavigations[0].slice("data:text/html;charset=utf-8,".length),
+    );
+    expect(servedHtml).toContain("width:24px;height:24px");
+    expect(servedHtml).toContain('width="14" height="14"');
+    // Dispatch still works through the custom view.
+    const token = overlayTokenForWindow(win);
+    const view = overlayViewForWindow(win);
+    expect(view.webContents.openWindow({ url: `tronhawk-wc://${token}/minimize` })).toEqual({ action: "deny" });
+    await waitFor(() => win.calls.some((c) => c[0] === "minimize"), "minimize dispatched");
+  });
+
+  test("config revision destroys the old view and rebuilds under the new geometry", async () => {
+    const src = `
+      module.exports = {
+        activate: async (ctx) => { await ctx.windowControls.mount(); ctx.logger.info("WC-READY"); },
+      };
+    `;
+    const { contents, win } = loadPlugins({
+      plugins: [pluginEntry(PID, WC_GRANTS, src)],
+    });
+    await waitFor(() => pluginMessages(PID, "info", "WC-READY").length > 0, "mounted r1");
+    expect(overlayViewForWindow(win).webContents).not.toBeNull();
+    const oldView = overlayViewForWindow(win);
+    expect(oldView.bounds).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    // Same plugin, new config height: fingerprint changes, VM respawns, the
+    // old view is destroyed and a fresh one mounts under the new geometry
+    // (H=48 -> m=12, x=12).
+    applyPlan(planFor("r2", [pluginEntry(PID, WC_GRANTS, src, { "region-height": 48 })]));
+    await waitFor(() => FakeWebContentsView.created.length >= 2, "rebuilt view constructed");
+    await waitFor(() => pluginMessages(PID, "info", "WC-READY").length >= 2, "remounted r2");
+    const newView = overlayViewForWindow(win);
+    expect(newView).not.toBe(oldView);
+    expect(newView.bounds).toEqual({ x: 12, y: 0, width: 72, height: 48 });
+    expect(oldView.webContents.isDestroyed()).toBe(true);
+    expect(win.contentView.children).toHaveLength(1);
+    expect(win.contentView.children[0]).toBe(newView);
+  });
+
+  test("multi-owner geometry conflict fails closed, first view intact", async () => {
+    const srcA = `
+      module.exports = {
+        activate: async (ctx) => {
+          try { await ctx.windowControls.mount(); ctx.logger.info("A-READY"); }
+          catch (e) { ctx.logger.info("A-FAILED:" + String((e && e.message) || e)); }
+        },
+      };
+    `;
+    const srcB = `
+      module.exports = {
+        activate: async (ctx) => {
+          try { await ctx.windowControls.mount(); ctx.logger.info("B-READY"); }
+          catch (e) { ctx.logger.info("B-FAILED:" + String((e && e.message) || e)); }
+        },
+      };
+    `;
+    const { win } = loadPlugins({
+      plugins: [
+        pluginEntry(PID, WC_GRANTS, srcA),
+        pluginEntry(PID2, WC_GRANTS, srcB, { "region-height": 40 }),
+      ],
+    });
+    await waitFor(() => pluginMessages(PID, "info", "A-READY").length > 0, "A mounted");
+    await waitFor(() => pluginMessages(PID2, "info", "B-FAILED").length > 0, "B rejected");
+    expect(pluginMessages(PID2, "info", "B-FAILED")[0][2]).toContain("geometry conflict");
+    expect(pluginMessages(PID2, "info", "B-READY")).toHaveLength(0);
+    // First owner's default-geometry view is untouched and functional.
+    expect(FakeWebContentsView.created).toHaveLength(1);
+    expect(win.contentView.children).toHaveLength(1);
+    expect(FakeWebContentsView.created[0].bounds).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    const rec = testing.windows().get(win.webContents.id);
+    expect(rec.windowControlsHost.owners.size).toBe(1);
+    const token = overlayTokenForWindow(win);
+    const oc = overlayViewForWindow(win).webContents;
+    expect(oc.openWindow({ url: `tronhawk-wc://${token}/close` })).toEqual({ action: "deny" });
+    await waitFor(() => win.calls.some((c) => c[0] === "close"), "close dispatched");
+  });
+
+  test("conflicting mount during in-flight load fails closed without joining", async () => {
+    loadDelayMs = 120;
+    const srcA = `
+      module.exports = {
+        activate: async (ctx) => {
+          try { await ctx.windowControls.mount(); ctx.logger.info("A-READY"); }
+          catch (e) { ctx.logger.info("A-FAILED"); }
+        },
+      };
+    `;
+    const srcB = `
+      module.exports = {
+        activate: async (ctx) => {
+          try { await ctx.windowControls.mount(); ctx.logger.info("B-READY"); }
+          catch (e) { ctx.logger.info("B-FAILED"); }
+        },
+      };
+    `;
+    const { win } = loadPlugins({
+      plugins: [
+        pluginEntry(PID, WC_GRANTS, srcA),
+        pluginEntry(PID2, WC_GRANTS, srcB, { "region-height": 40 }),
+      ],
+    });
+    await sleep(30); // A mounts into the in-flight load; B must not join it.
+    await waitFor(() => pluginMessages(PID2, "info", "B-FAILED").length > 0, "B rejected");
+    await waitFor(() => pluginMessages(PID, "info", "A-READY").length > 0, "A mounted");
+    expect(pluginMessages(PID2, "info", "B-READY")).toHaveLength(0);
+    expect(FakeWebContentsView.created).toHaveLength(1);
+    expect(win.contentView.children).toHaveLength(1);
+  });
+
   test("overlay view is exactly content-sized with explicit transparency", () => {
-    // CSS contract: border-box 12px circles (1px ring inside 12px), chromeless
-    // transparent content-sized document, overflow clipped (never scrollbars).
-    expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain("box-sizing:border-box");
+    // CSS contract: 24x24 transparent hit cells (flex-centered links) tiling
+    // the 72px width in an H-tall row (m=(H-24)/2), one 14px inline SVG per
+    // link (circle + hover-only glyph, no text, no font dependency),
+    // chromeless transparent document, overflow clipped.
     expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain("background:transparent");
     expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain("display:inline-block");
     expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain("overflow:hidden");
-    // No independent pill base: no container background, no rounded box.
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain("width:24px;height:24px");
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain(".wc a svg{display:block;}");
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain(".wc a .wc-glyph{display:none;}");
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain(".wc a:hover .wc-glyph{display:block;}");
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).toContain("outline:2px solid #0a84ff");
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).not.toContain("::after");
+    // No independent pill base: no container background, no rounded box, no gaps.
     expect(wc.WINDOW_CONTROLS_VIEW_CSS).not.toContain("rgba(20,24,32,0.55)");
     expect(wc.WINDOW_CONTROLS_VIEW_CSS).not.toContain("border-radius:10px");
-    // Bounds match the painted content exactly: 8 + 3*12 + 2*8 + 8 = 68 wide,
-    // 6 + 12 + 6 = 24 tall — no painted pixel outside, no transparent margin
-    // to swallow page clicks, no overflow to scroll.
-    expect(wc.WINDOW_CONTROLS_VIEW_BOUNDS).toEqual({ x: 12, y: 12, width: 68, height: 24 });
+    expect(wc.WINDOW_CONTROLS_VIEW_CSS).not.toContain("gap:8px");
+    // Default region: 72x30 at (3, 0) — three 24px cells at m=3 (y=3..27),
+    // 14px vector lights (inset 5, visual gap 10, pitch 24). No painted
+    // pixel outside the view; the only transparent bands are the 3px
+    // top/bottom centering strips inside it — no side margins, no overflow
+    // to scroll.
+    expect(wc.WINDOW_CONTROLS_VIEW_BOUNDS).toEqual({ x: 3, y: 0, width: 72, height: 30 });
   });
 
   test("overlay webContents never enters target discovery (no recursion)", async () => {
@@ -796,29 +1156,34 @@ describe("ctx.windowControls trusted dispatch", () => {
     // No page IPC channel exists: host listens nowhere for it.
     contents.emit("ipc-message", {}, "tronhawk-window-controls", "close");
     // Main-page navigation to the token URL is never listened on.
-    contents.emit("will-navigate", willNavigateEvent(contents), `tronhawk-wc://${token}/close`);
-    // Missing event / missing sender is ignored without side effects (strict
-    // fail-closed sender check): never dispatched, never preventDefaulted.
-    let foreignPrevented = 0;
-    const foreignPrevent = () => { foreignPrevented++; };
-    oc.emit("will-navigate", null, `tronhawk-wc://${token}/close`);
-    oc.emit("will-navigate", undefined, `tronhawk-wc://${token}/close`);
-    oc.emit("will-navigate", {}, `tronhawk-wc://${token}/close`);
-    oc.emit("will-navigate", { sender: null, preventDefault: foreignPrevent }, `tronhawk-wc://${token}/close`);
+    contents.emit("will-navigate", willNavigateDetails(`tronhawk-wc://${token}/close`));
+    // Missing or malformed details are ignored without side effects: never
+    // dispatched, never preventDefaulted.
+    oc.emit("will-navigate", null);
+    oc.emit("will-navigate", undefined);
+    oc.emit("will-navigate", {});
+    // A non-main-frame navigation is blocked first (the overlay never leaves
+    // its trusted document) but never dispatched.
+    let framedPrevented = 0;
+    oc.emit(
+      "will-navigate",
+      willNavigateDetails(`tronhawk-wc://${token}/close`, {
+        isMainFrame: false,
+        preventDefault: () => { framedPrevented++; },
+      }),
+    );
     // Overlay navigation with a guessed token is rejected (but still blocked
     // first so the overlay never leaves its trusted document).
     let rejectedPrevented = 0;
-    const rejectedNav = (sender, url) =>
-      oc.emit("will-navigate", { sender, preventDefault: () => { rejectedPrevented++; } }, url);
-    rejectedNav(oc, `tronhawk-wc://${"0".repeat(32)}/close`);
+    const rejectedNav = (url) =>
+      oc.emit("will-navigate", willNavigateDetails(url, { preventDefault: () => { rejectedPrevented++; } }));
+    rejectedNav(`tronhawk-wc://${"0".repeat(32)}/close`);
     // Overlay navigation with a bogus action is rejected.
-    rejectedNav(oc, `tronhawk-wc://${token}/bogus`);
+    rejectedNav(`tronhawk-wc://${token}/bogus`);
     expect(rejectedPrevented).toBe(2);
-    // Wrong sender is rejected without side effects.
-    oc.emit("will-navigate", willNavigateEvent(contents), `tronhawk-wc://${token}/close`);
     await sleep(30);
     expect(win.calls.length).toBe(before);
-    expect(foreignPrevented).toBe(0);
+    expect(framedPrevented).toBe(1);
   });
 
   test("maximize/unmaximize syncs the trusted overlay", async () => {

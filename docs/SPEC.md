@@ -154,6 +154,20 @@ Execution contexts:
 - **`ctx.config`** (main + renderer): per-application × per-plugin config carried into the plan
   snapshot; `get(key)` reads synchronously from that snapshot, `set(key, value)` is a no-op for
   sandboxed plugins — config is persisted only via the Manager settings form.
+- **Restricted declarative capability config** (`electron.windowControls`): the host reads
+  exactly `region-height` (H, default 30, clamped 30..64) and `left-offset` (L, default 0,
+  clamped 0..256) from the plan snapshot to size the overlay view (72xH at (m+L, 0)
+  where m=(H-24)/2, default (3,0,72,30); constant 14px vector lights in 24x24 hit
+  cells at pitch 24, gap 10, inset 5, vertical margin m=(H-24)/2). All values are CSS px (DIP), measured
+  the same way on every display — no conversions, no `devicePixelRatio`/`scaleFactor`
+  reads, no screen/window/viewport measurement, no automatic display adaptation
+  (physical pixels are never taken as CSS px: 14 CSS = 28 physical at DPR=2).
+  A plan revision with different values destroys the old view and rebuilds; co-owners
+  with conflicting geometries fail closed on `mount()`. Tooltip strings come from a
+  host-side en/zh table selected by `app.getLocale()` (`zh` prefix → Chinese, else
+  English), including the localized group label (`Window controls` / `窗口控件`);
+  optional `tooltip-*` string configs override individual entries when
+  non-empty (trimmed, capped, escaped).
 - **Developer mode** (`runtime.unsafe`): raw Electron/Node — opt-in via the Manager Settings view
   and off by default; a granted plugin executes with the real Node/Electron environment of the
   injected app (arbitrary code execution, outside the QuickJS sandbox).

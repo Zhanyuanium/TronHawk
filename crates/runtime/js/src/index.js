@@ -1278,9 +1278,8 @@ function buildCssApi(vm, pluginId, w, cleanupCallbacks) {
 // INDEPENDENT trusted WebContentsView (separate WebContents, safe
 // webPreferences, data-URL HTML, no <script>, no preload) and binds real user
 // clicks to the CURRENT BrowserWindow via interception on the OVERLAY view
-// only (registration-source boundary plus per-window-token-verified; the
-// `will-navigate` listener additionally requires event.sender to be exactly
-// the overlay WebContents): the overlay links carry
+// only (registration-source boundary plus per-window-token-verified): the
+// overlay links carry
 // `target="_blank"`, so every click arrives at the overlay view's
 // `setWindowOpenHandler` (verified, then always denied — the overlay never
 // opens windows nor leaves its trusted document), with `will-navigate` /
@@ -1304,20 +1303,41 @@ function buildCssApi(vm, pluginId, w, cleanupCallbacks) {
 // (never bare pluginId), plus per-instance `revoked` / `desiredMounted` /
 // `operationGeneration`. The shared view slot is `idle` / `loading` / `ready`:
 // concurrent mounts join the single in-flight load (one view, one load
-// promise, every waiter settled by it); only load success registers owners,
-// load failure rejects every waiter and clears view + listeners + token.
+// promise, every waiter settled by it) — but only for the SAME normalized
+// geometry; a conflicting geometry fails closed ("geometry conflict for
+// shared overlay view") instead of sharing the foreign view. Only load
+// success registers owners, load failure rejects every waiter and clears
+// view + listeners + token + geometry.
 // Every construction bumps `resourceGeneration` and captures its own
-// view/overlayContents/token; a superseded settle destroys only its own
-// capture and routes live waiters onto the current slot — never current host
-// fields. The last owner leaving removes the view and all listeners together.
-function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
+// view/overlayContents/token/geometry; a superseded settle destroys only its
+// own capture and routes live waiters onto the current slot (adopting only
+// geometry-matching waiters) — never current host fields. The last owner
+// leaving removes the view and all listeners together.
+function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks, configSnapshot) {
   const contents = w.contents;
+  // Geometry is normalized + frozen ONCE per API instance, before any view
+  // construction, from the read-only plugin.config snapshot of this plan
+  // revision. A newer revision respawns the VM with a new snapshot (via the
+  // fingerprint); the old view is destroyed and rebuilt under the new
+  // geometry. Sizes are DIP; the host never converts pixels or measures.
+  const instanceGeometry = windowControls.normalizeWindowControlsGeometry(configSnapshot);
+  // Frozen config snapshot retained for per-construction tooltip resolution
+  // (language table + tooltip-* overrides). Never mutated.
+  const instanceConfig =
+    configSnapshot && typeof configSnapshot === "object" ? configSnapshot : {};
   if (!w.windowControlsHost) {
     w.windowControlsHost = {
       owners: new Map(),
       view: null,
       overlayContents: null,
       token: null,
+      // Frozen normalized geometry of the CURRENT view slot (null when idle).
+      // A mount whose instance geometry differs from a live slot fails
+      // closed with a geometry conflict instead of sharing the view.
+      geometry: null,
+      // Tooltip strings of the CURRENT view (locale + overrides resolved at
+      // construction; co-owners share them until a rebuild).
+      labels: null,
       addedToWin: null,
       willNavigateListener: null,
       // `will-frame-navigate` twin of the above (fallback path on builds that
@@ -1381,10 +1401,26 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
       const win = currentBrowserWindow();
       const maximized =
         win && typeof win.isMaximized === "function" ? !!win.isMaximized() : false;
-      oc.executeJavaScript(windowControls.windowControlsSyncSnippet(maximized)).catch(() => {});
+      oc.executeJavaScript(windowControls.windowControlsSyncSnippet(maximized, host.labels)).catch(() => {});
     } catch (_e) {
       // Best effort — sync must never throw across the bridge.
     }
+  }
+
+  // Overlay tooltip language: app.getLocale() starting with "zh" selects the
+  // Chinese table, anything else (or unavailable) selects English. Read fresh
+  // at each construction so a rebuilt view picks up locale changes.
+  function currentWindowControlsLanguage() {
+    try {
+      const Electron = getElectronModule();
+      const app = Electron && Electron.app;
+      if (app && typeof app.getLocale === "function") {
+        return windowControls.resolveWindowControlsLanguage(app.getLocale());
+      }
+    } catch (_e) {
+      // Best effort — fall through to English.
+    }
+    return "en";
   }
 
   function detachViewFromWindow(view, win) {
@@ -1530,6 +1566,7 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
       overlayContents: host.overlayContents,
       willNavigateListener: host.willNavigateListener,
       willFrameNavigateListener: host.willFrameNavigateListener,
+      geometry: host.geometry,
       win: host.win,
       maximizeListener: host.maximizeListener,
       unmaximizeListener: host.unmaximizeListener,
@@ -1538,6 +1575,8 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
     host.view = null;
     host.overlayContents = null;
     host.token = null;
+    host.geometry = null;
+    host.labels = null;
     host.addedToWin = null;
     host.willNavigateListener = null;
     host.willFrameNavigateListener = null;
@@ -1653,10 +1692,29 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
         host.loadRes !== res &&
         Array.isArray(host.loadRes.waiters)
       ) {
-        host.loadRes.waiters.push(waiter);
+        // Adopt only onto a load for the SAME geometry; a conflicting
+        // geometry fails closed instead of sharing the foreign view.
+        if (windowControls.sameWindowControlsGeometry(waiter.geometry, host.loadRes.geometry)) {
+          host.loadRes.waiters.push(waiter);
+          continue;
+        }
+        try {
+          waiter.reject("geometry conflict for shared overlay view");
+        } catch (_e) {
+          // Best effort.
+        }
         continue;
       }
       if (!failureReason && host.loadState === "ready" && overlayViewHealthy()) {
+        // Same rule for the ready view: conflicting geometry fails closed.
+        if (!windowControls.sameWindowControlsGeometry(waiter.geometry, host.geometry)) {
+          try {
+            waiter.reject("geometry conflict for shared overlay view");
+          } catch (_e) {
+            // Best effort.
+          }
+          continue;
+        }
         owners.set(waiter.myKey, waiter.pluginId);
         try {
           waiter.resolve();
@@ -1677,11 +1735,11 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
   // Build the trusted overlay view synchronously up to loadURL, claim the
   // shared loading slot (host.loadRes + loadPromise), and attach the shared
   // settle exactly once. Every attempt bumps resourceGeneration and captures
-  // its own view/overlayContents/token; late settles of superseded attempts
-  // destroy only their own capture. On any construction failure all partial
-  // resources are destroyed and no host residue remains (fail-closed,
+  // its own view/overlayContents/token/geometry; late settles of superseded
+  // attempts destroy only their own capture. On any construction failure all
+  // partial resources are destroyed and no host residue remains (fail-closed,
   // registers no owner, rejects the caller).
-  function constructTrustedView(win) {
+  function constructTrustedView(win, geometry) {
     const Electron = getElectronModule();
     const ViewCtor = (Electron && Electron.WebContentsView) || null;
     if (!ViewCtor) return { ok: false, reason: "no trusted view constructor" };
@@ -1754,7 +1812,7 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
     }
     try {
       if (typeof partial.view.setBounds === "function")
-        partial.view.setBounds({ ...windowControls.WINDOW_CONTROLS_VIEW_BOUNDS });
+        partial.view.setBounds({ ...windowControls.windowControlsViewBounds(geometry) });
     } catch (_e) {
       // Cosmetic only — a mispositioned but functional overlay stays secure.
       pluginLog(pluginId, "warn", "windowControls: setBounds failed; overlay may be mispositioned");
@@ -1767,7 +1825,6 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
     } catch (_e) {
       // Best effort.
     }
-    const capturedContents = overlayContents;
     const capturedToken = token;
     // Shared validator + dispatcher for all interception paths (navigation
     // events + window-open). Each listener blocks/denies FIRST (overlay never
@@ -1819,15 +1876,17 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
         // Best effort.
       }
     };
-    const onWillNavigate = (event, url) => {
-      // Strict fail-closed sender check: only a real event whose sender is
-      // exactly the captured overlay WebContents can reach window ops. A
-      // missing event/sender or a foreign sender (page, other view) is
-      // ignored without side effects.
-      if (!event || event.sender !== capturedContents) return;
-      // Block the navigation FIRST: the overlay must never leave its trusted
-      // data-URL document, even for URLs rejected below.
-      blockFirst(event);
+    const onWillNavigate = (details) => {
+      // Real shape is a SINGLE param (Event<WebContentsWillNavigateEventParams>:
+      // url/isMainFrame, no sender — see electron.d.ts): the source boundary is
+      // that this listener is registered ONLY on the captured overlay
+      // WebContents, so any invocation originates from it. Block FIRST (the
+      // overlay must never leave its trusted data-URL document, even for URLs
+      // rejected below), then check frame role, URL, token.
+      if (!details) return;
+      blockFirst(details);
+      if (details.isMainFrame === false) return;
+      const url = typeof details.url === "string" ? details.url : "";
       dispatchOverlayNavigation("will-navigate", url);
     };
     // `will-frame-navigate` twin: same overlay-only interception for builds
@@ -1903,8 +1962,15 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
       partial.unmaximizeListener = null;
     }
     let loadP = null;
+    // Tooltip strings for THIS view: fresh locale per construction, plugin
+    // tooltip-* overrides on top. Co-owners share the first mounted view, so
+    // the first construction's labels win until a rebuild.
+    const labels = windowControls.resolveWindowControlsLabels(
+      currentWindowControlsLanguage(),
+      instanceConfig,
+    );
     try {
-      loadP = overlayContents.loadURL(windowControls.windowControlsViewDataUrl(token));
+      loadP = overlayContents.loadURL(windowControls.windowControlsViewDataUrl(token, geometry, labels));
     } catch (e) {
       return fail("overlay load threw: " + errorText(e));
     }
@@ -1917,6 +1983,7 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
       view: partial.view,
       overlayContents,
       token,
+      geometry,
       addedToWin: partial.addedToWin,
       willNavigateListener: onWillNavigate,
       willFrameNavigateListener: partial.willFrameNavigateListener,
@@ -1928,6 +1995,8 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
     };
     host.view = partial.view;
     host.overlayContents = overlayContents;
+    host.geometry = geometry;
+    host.labels = labels;
     host.addedToWin = partial.addedToWin;
     host.willNavigateListener = onWillNavigate;
     host.willFrameNavigateListener = partial.willFrameNavigateListener;
@@ -1968,6 +2037,10 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
     const waiter = {
       myKey,
       pluginId,
+      // Frozen normalized geometry of THIS instance: sharing (joining an
+      // in-flight load, reusing a ready view, stale adoption) requires an
+      // exact match, else the mount fails closed with a geometry conflict.
+      geometry: instanceGeometry,
       isValid: () =>
         !revoked &&
         desiredMounted &&
@@ -1996,13 +2069,23 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
       return handle;
     }
     // Join an in-flight load: one view, one load promise, every concurrent
-    // mount waits on it. Nobody registers an owner before load success.
+    // mount waits on it — but only for the SAME geometry. A conflicting
+    // geometry fails closed instead of sharing the foreign view.
     if (host.loadState === "loading" && host.loadRes && host.loadPromise) {
+      if (!windowControls.sameWindowControlsGeometry(waiter.geometry, host.loadRes.geometry)) {
+        Promise.resolve().then(() => waiter.reject("geometry conflict for shared overlay view"));
+        return handle;
+      }
       host.loadRes.waiters.push(waiter);
       return handle;
     }
-    // Reuse a healthy READY view (refcounted; load already succeeded).
+    // Reuse a healthy READY view (refcounted; load already succeeded) — same
+    // geometry only; a conflict fails closed.
     if (host.loadState === "ready" && overlayViewHealthy()) {
+      if (!windowControls.sameWindowControlsGeometry(waiter.geometry, host.geometry)) {
+        Promise.resolve().then(() => waiter.reject("geometry conflict for shared overlay view"));
+        return handle;
+      }
       owners.set(myKey, pluginId);
       syncOverlay();
       Promise.resolve().then(() => {
@@ -2022,7 +2105,7 @@ function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks) {
     // registers an owner — a `failed` load rejects every waiter and clears
     // view + listeners + token (fail-closed).
     uninstallHost();
-    const built = constructTrustedView(win);
+    const built = constructTrustedView(win, instanceGeometry);
     if (!built.ok) {
       Promise.resolve().then(() => waiter.reject(built.reason || "overlay unavailable"));
       return handle;
@@ -3047,7 +3130,10 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       storage.dispose();
     }
     if (hasPermission(plugin.granted, "electron.windowControls")) {
-      const wc = buildWindowControlsApi(vm, plugin.id, w, cleanupCallbacks);
+      // Read-only config snapshot of this plan revision: geometry is
+      // normalized + frozen per API instance before any construction.
+      const wcConfigSnapshot = Object.freeze({ ...(plugin.config || {}) });
+      const wc = buildWindowControlsApi(vm, plugin.id, w, cleanupCallbacks, wcConfigSnapshot);
       vm.setProp(ctx, "windowControls", wc);
       wc.dispose();
     }

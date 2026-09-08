@@ -269,6 +269,32 @@ return `undefined` without a host call) and return a `Promise<void>` delivered b
   **additional capability only**: an `entry.renderer` must still declare `renderer.script`
   (pack-time gate), and Core drops the renderer payload without an effective `renderer.script`
   grant or the Developer-mode `runtime.unsafe` escape hatch (`core.renderer.script_required`).
+- Restricted declarative capability config: the host reads exactly two config keys for
+  overlay geometry — `region-height` (default 30, clamped to 30..64) and `left-offset`
+  (default 0, clamped to 0..256) — from the read-only `plugin.config` snapshot of the
+  current plan revision (manifest schema defaults overlaid with stored values by Core).
+  All values are CSS px (DIP), measured the same way on every display; the host never
+  converts pixels, reads `devicePixelRatio` / `scaleFactor`, or measures screens,
+  windows, or viewports, and there is no automatic display adaptation (physical
+  pixels are never taken as CSS px: 14 CSS = 28 physical at DPR=2). Visual lights
+  are a constant 14px inline-SVG circle (24x24 hit cells, pitch 24, gap 10, inset 5,
+  view 72xH at (m+L, 0) where m=(H-24)/2, default (3,0,72,30)) with hover-only vector glyphs, sharing the
+  relocated-DOM visual language (same diameter 14, same pitch 24 at defaults, same focus
+  outline — the only difference is the control source: host-rendered links versus
+  the app's own buttons). A plan revision carrying different values destroys the old view
+  and rebuilds under the new geometry; co-owners with conflicting geometries fail
+  closed (`mount()` rejects) instead of sharing a view.
+- Tooltip strings come from a host-side table (`en`: Close/Minimize/Maximize/
+  Restore plus the group label `Window controls`; `zh`: 关闭/最小化/最大化/
+  还原 plus `窗口控件`), selected by `app.getLocale()`
+  (a `zh` prefix selects Chinese, anything else English; structured for
+  prefix matching so new languages only add table entries). Four optional
+  string configs (`tooltip-close/minimize/maximize/restore`, default empty)
+  override individual entries when non-empty (trimmed, capped at 128 chars);
+  empty values fall back to the language table. Strings ride the overlay
+  `aria-label`/`title` (attribute-escaped), the localized group `aria-label`,
+  and the maximize/restore sync flip;
+  `mount()` stays argument-free.
 
 ```js
 module.exports = {
