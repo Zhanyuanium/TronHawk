@@ -152,6 +152,7 @@ const dictionaries = {
     "perm.renderer.css": "Allows the plugin’s renderer CSS to be applied.",
     "perm.renderer.script": "Allows the plugin’s renderer script to run.",
     "perm.electron.window": "Allows the plugin to work with managed application windows.",
+    "perm.electron.windowControls": "Allows the plugin to show fixed-style traffic lights bound to the current window (minimize / maximize / close).",
     "perm.runtime.unsafe": "Grants raw Node.js + Electron in the target app — arbitrary code execution. Developer mode only.",
     "perm.default": "Requested by this plugin.",
 
@@ -417,6 +418,7 @@ const dictionaries = {
     "perm.renderer.css": "允许将插件的渲染器 CSS 应用到页面。",
     "perm.renderer.script": "允许插件的渲染器脚本运行。",
     "perm.electron.window": "允许插件操作受管理的应用窗口。",
+    "perm.electron.windowControls": "允许插件显示固定样式红绿灯并绑定当前窗口的最小化 / 最大化 / 关闭。",
     "perm.runtime.unsafe": "在目标应用中授予原始 Node.js + Electron —— 可执行任意代码，仅开发者模式生效。",
     "perm.default": "由该插件申请。",
 

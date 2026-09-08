@@ -22,6 +22,7 @@ a plugin on an API that is marked *future*. The authoritative runtime behavior l
 | both | async `activate` / `deactivate` (module lifecycle) | Implemented — a hook may return `undefined` synchronously or a Promise the runtime **drains** before the plugin is considered activated/deactivated (ADR 0008); lifecycle-event callbacks stay synchronous `undefined` |
 | renderer | `ctx.dom.query` / `ctx.dom.observe` (`renderer.dom`) | Implemented — async host functions (ADR 0008): `query` returns a Promise of a serialized `DomElement` snapshot (never a live node), `observe` polls on a 500 ms cadence and delivers snapshots to a synchronous callback |
 | renderer | `ctx.storage.get` / `ctx.storage.set` (`renderer.storage`) | Implemented — renderer-only, host-namespaced string storage (`tronhawk:<pluginId>:<key>`), values host-bounded (ADR 0008) |
+| renderer | `ctx.windowControls.mount` / `ctx.windowControls.unmount` (`electron.windowControls`) | Implemented — host-hosted declarative traffic-light overlay: fixed styles, current-window minimize / toggle-maximize / close, maximized-state sync, cleanup on unmount/deactivate/revision/navigation/destroy; no plugin handle, no generic DOM, no single close |
 | main | `ctx.window.setVibrancy` / `setMica` (`electron.window`) | Implemented — macOS vibrancy via `setVibrancy`, Windows 11 Mica via `setBackgroundMaterial`; structured-log no-op on other platforms or when the Electron API is absent |
 | main | `ctx.webContents.*` | Future |
 | both | `ctx.session.*` | Future |
@@ -66,7 +67,8 @@ Optional: `css` (inline CSS string, or `entry.css` file) for CSS-only themes,
 `renderer.script` permission in `permissions[]` — this is a pack/install-time
 **declaration gate** enforced by `tronhawk-package`
 (`validate_manifest_schema` rejects `entry.renderer` without
-`renderer.script`). `renderer.dom` / `renderer.storage` / `renderer.css` are
+`renderer.script`). `renderer.dom` / `renderer.storage` / `renderer.css` /
+`electron.windowControls` are
 **additional capabilities only** and never substitute for the gate; neither
 does `runtime.unsafe` at declaration time. At runtime Core `execution_plan`
 unlocks the renderer payload when the effective grants include
@@ -98,6 +100,7 @@ NOT the SDK npm version.
 | `renderer.dom` | `ctx.dom.query()` / `ctx.dom.observe()` | medium |
 | `renderer.storage` | `ctx.storage.get()` / `set()` — renderer-only, host-namespaced per-plugin keyspace | low |
 | `electron.window` | `ctx.window.setOpacity()` / `setVibrancy()` / `setMica()` | high |
+| `electron.windowControls` | `ctx.windowControls.mount()` / `unmount()` — host-hosted fixed-style traffic lights bound to the current window | high |
 | `electron.webContents` | DevTools, navigation, preload | — |
 | `electron.session` | User-Agent, proxy, cookies (future) | — |
 | `electron.ipc` | observe / intercept IPC (future) | high |
@@ -109,7 +112,7 @@ NOT the SDK npm version.
 `ctx.script.setDocumentTitle()` capability: without it in the effective grants
 the renderer payload never runs (Core drops it and records
 `core.renderer.script_required`). `renderer.dom` / `renderer.storage` /
-`renderer.css` grant only their own host APIs on top of a gated renderer entry
+`renderer.css` / `electron.windowControls` grant only their own host APIs on top of a gated renderer entry
 and never unlock execution by themselves; `runtime.unsafe` unlocks the payload
 at runtime in developer mode but does **not** waive the pack-time declaration
 gate (`entry.renderer` must still declare `renderer.script`).
@@ -133,7 +136,7 @@ statement returns `undefined`) **or return a Promise**; when a hook returns a Pr
 ## Renderer API (`RendererContext`)
 
 ```ts
-interface RendererContext extends PluginContext { css; dom; script; storage; }
+interface RendererContext extends PluginContext { css; dom; script; storage; windowControls; }
 ```
 
 - `ctx.css.insert(css)` / `ctx.css.remove(id)` — stylesheets carry owner plugin id + unique id
@@ -152,6 +155,8 @@ interface RendererContext extends PluginContext { css; dom; script; storage; }
   The host serializes the title as data and does not execute plugin-provided JavaScript source.
 - `ctx.storage.get(key)` / `ctx.storage.set(key, value)` — requires `renderer.storage`; renderer-only
   host-namespaced string storage. See [Storage](#storage).
+- `ctx.windowControls.mount()` / `ctx.windowControls.unmount()` — requires `electron.windowControls`;
+  renderer-only declarative traffic lights. See [Window controls](#window-controls).
 
 ## Main API (`MainContext`)
 
@@ -227,6 +232,76 @@ host as `tronhawk:<pluginId>:<key>` — a plugin can only read and write its **o
 another plugin's, and never the page's raw `localStorage`/IndexedDB (do not touch those from a
 sandboxed plugin). Values are host-bounded. `get(key)` resolves the stored value, or `null` when
 absent; `set(key, value)` persists it. This is per-install plugin state, not a page-data bridge.
+
+## Window controls
+
+`ctx.windowControls` is a renderer-only declarative overlay (requires `electron.windowControls`,
+Level 2, high risk). The plugin may only call `await ctx.windowControls.mount()` /
+`await ctx.windowControls.unmount()` — both take **no arguments** (extra arguments warn and
+return `undefined` without a host call) and return a `Promise<void>` delivered by the host pump:
+
+- The host renders the buttons in an INDEPENDENT, host-controlled `WebContentsView`
+  (a separate `WebContents` with locked-down `webPreferences`, a `data:`-URL document,
+  no `<script>`, no preload) sized exactly to the controls. The target page's DOM is
+  never touched: there is no styling API, no generic DOM access, and no single-close
+  primitive.
+- A real user click navigates the overlay to `tronhawk-wc://<per-window-token>/<action>`;
+  the overlay links carry `target="_blank"`, so every click arrives at the overlay
+  view's `setWindowOpenHandler` (verified, then always denied — the overlay never
+  opens windows nor leaves its trusted document), with `will-navigate` /
+  `will-frame-navigate` interception as the fallback path on builds that navigate
+  custom-scheme clicks instead (a twin-dedup keeps one click to one op); the host
+  requires the event
+  sender to be exactly that overlay `WebContents`, blocks the navigation first (the
+  overlay never leaves its trusted document), then verifies the unguessable
+  per-window token before resolving the **current** `BrowserWindow` (never a
+  plugin-supplied handle) and calling `minimize` /
+  `isMaximized() ? unmaximize() : maximize()` / `close`. Page navigations, forged
+  URLs, and foreign senders are ignored. No page `ipcRenderer` or app preload is
+  involved at any point.
+- The host syncs the maximize/restore label on `maximize` / `unmaximize` and tears the
+  overlay down (view + listeners + token) on `unmount`, plugin `deactivate`,
+  plan-revision revocation, navigation (old instances are revoked; the next `mount`
+  builds a fresh view), and window destroy. `mount()` fails closed — rejecting
+  without registering an owner — when no live window or trusted view is available,
+  or the overlay document fails to load.
+- Like `renderer.dom` / `renderer.storage` / `renderer.css`, `electron.windowControls` is an
+  **additional capability only**: an `entry.renderer` must still declare `renderer.script`
+  (pack-time gate), and Core drops the renderer payload without an effective `renderer.script`
+  grant or the Developer-mode `runtime.unsafe` escape hatch (`core.renderer.script_required`).
+- Restricted declarative capability config: the host reads exactly two config keys for
+  overlay geometry — `region-height` (default 30, clamped to 30..64) and `left-offset`
+  (default 0, clamped to 0..256) — from the read-only `plugin.config` snapshot of the
+  current plan revision (manifest schema defaults overlaid with stored values by Core).
+  All values are CSS px (DIP), measured the same way on every display; the host never
+  converts pixels, reads `devicePixelRatio` / `scaleFactor`, or measures screens,
+  windows, or viewports, and there is no automatic display adaptation (physical
+  pixels are never taken as CSS px: 14 CSS = 28 physical at DPR=2). Visual lights
+  are a constant 14px inline-SVG circle (24x24 hit cells, pitch 24, gap 10, inset 5,
+  view 72xH at (m+L, 0) where m=(H-24)/2, default (3,0,72,30)) with hover-only vector glyphs, sharing the
+  relocated-DOM visual language (same diameter 14, same pitch 24 at defaults, same focus
+  outline — the only difference is the control source: host-rendered links versus
+  the app's own buttons). A plan revision carrying different values destroys the old view
+  and rebuilds under the new geometry; co-owners with conflicting geometries fail
+  closed (`mount()` rejects) instead of sharing a view.
+- Tooltip strings come from a host-side table (`en`: Close/Minimize/Maximize/
+  Restore plus the group label `Window controls`; `zh`: 关闭/最小化/最大化/
+  还原 plus `窗口控件`), selected by `app.getLocale()`
+  (a `zh` prefix selects Chinese, anything else English; structured for
+  prefix matching so new languages only add table entries). Four optional
+  string configs (`tooltip-close/minimize/maximize/restore`, default empty)
+  override individual entries when non-empty (trimmed, capped at 128 chars);
+  empty values fall back to the language table. Strings ride the overlay
+  `aria-label`/`title` (attribute-escaped), the localized group `aria-label`,
+  and the maximize/restore sync flip;
+  `mount()` stays argument-free.
+
+```js
+module.exports = {
+  async activate(ctx) { await ctx.windowControls.mount(); },
+  async deactivate(ctx) { await ctx.windowControls.unmount(); },
+};
+```
 
 ## Config
 

@@ -139,11 +139,14 @@ Execution contexts:
   and callback CPU deadlines. `renderer.script` only allows the host-owned document-title setter
   (ADR 0002); `renderer.dom` query/observe is implemented as async host functions returning
   serialized `DomElement` snapshots (ADR 0008); renderer-only `ctx.storage` is host-namespaced per
-  plugin (`tronhawk:<pluginId>:<key>`); raw localStorage / IndexedDB (future).
+  plugin (`tronhawk:<pluginId>:<key>`); `electron.windowControls` mounts a host-hosted declarative
+  traffic-light overlay (fixed style, current-window minimize / toggle-maximize / close, no plugin
+  handle); raw localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
   Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
 - **Async host functions** (ADR 0008): `ctx.network.request` (main + renderer), `ctx.dom.query`
-  (renderer), and `ctx.storage` (renderer) are real Promise APIs backed by an **in-process
+  (renderer), `ctx.storage` (renderer), and `ctx.windowControls.mount` / `unmount`
+  (renderer, `electron.windowControls`) are real Promise APIs backed by an **in-process
   host-driven pending-job pump** over the synchronous QuickJS VM (`vm.newPromise()` +
   `executePendingJobs()`). `activate`/`deactivate` may return a Promise the runtime drains.
   Lifecycle-**event** callbacks (`onCreated`/`onLoad`/`onRendererReady`/`onUnload`) and
@@ -151,6 +154,20 @@ Execution contexts:
 - **`ctx.config`** (main + renderer): per-application × per-plugin config carried into the plan
   snapshot; `get(key)` reads synchronously from that snapshot, `set(key, value)` is a no-op for
   sandboxed plugins — config is persisted only via the Manager settings form.
+- **Restricted declarative capability config** (`electron.windowControls`): the host reads
+  exactly `region-height` (H, default 30, clamped 30..64) and `left-offset` (L, default 0,
+  clamped 0..256) from the plan snapshot to size the overlay view (72xH at (m+L, 0)
+  where m=(H-24)/2, default (3,0,72,30); constant 14px vector lights in 24x24 hit
+  cells at pitch 24, gap 10, inset 5, vertical margin m=(H-24)/2). All values are CSS px (DIP), measured
+  the same way on every display — no conversions, no `devicePixelRatio`/`scaleFactor`
+  reads, no screen/window/viewport measurement, no automatic display adaptation
+  (physical pixels are never taken as CSS px: 14 CSS = 28 physical at DPR=2).
+  A plan revision with different values destroys the old view and rebuilds; co-owners
+  with conflicting geometries fail closed on `mount()`. Tooltip strings come from a
+  host-side en/zh table selected by `app.getLocale()` (`zh` prefix → Chinese, else
+  English), including the localized group label (`Window controls` / `窗口控件`);
+  optional `tooltip-*` string configs override individual entries when
+  non-empty (trimmed, capped, escaped).
 - **Developer mode** (`runtime.unsafe`): raw Electron/Node — opt-in via the Manager Settings view
   and off by default; a granted plugin executes with the real Node/Electron environment of the
   injected app (arbitrary code execution, outside the QuickJS sandbox).
@@ -202,6 +219,7 @@ privileged API verifies permission first.
 | `renderer.dom` | read DOM via serialized `DomElement` snapshots (`query`/`observe`) | medium |
 | `renderer.storage` | read/write this plugin's own host-namespaced storage (strings, bounded) | low |
 | `electron.window` | modify window (`setOpacity`, `setVibrancy`) | high |
+| `electron.windowControls` | host-hosted declarative traffic lights (`ctx.windowControls.mount` / `unmount`, fixed style, current-window minimize / toggle-maximize / close) | high |
 | `electron.webContents` | page load, DevTools (future) | — |
 | `electron.session` | UA, proxy, cookies (future) | — |
 | `electron.ipc` | observe / intercept IPC (future) | high |

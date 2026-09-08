@@ -128,12 +128,52 @@ export interface StorageAPI {
   set(key: string, value: string): Promise<void>;
 }
 
+/** Declared plugin permission ids (stable public contract). Known set mirrors
+ *  `KNOWN_PERMISSIONS` in `crates/package` (pack-time authority); implemented
+ *  subset is `renderer.css` / `renderer.script` / `renderer.dom` /
+ *  `renderer.storage` / `electron.window` / `electron.windowControls` /
+ *  `network.access` / `runtime.unsafe` (see `docs/PLUGIN-SDK.md`); future
+ *  (no host surface yet) is `electron.webContents` / `electron.session` /
+ *  `electron.ipc` / `network.proxy`. */
+export type PluginPermission =
+  | "renderer.css"
+  | "renderer.script"
+  | "renderer.dom"
+  | "renderer.storage"
+  | "electron.window"
+  | "electron.windowControls"
+  | "electron.webContents"
+  | "electron.session"
+  | "electron.ipc"
+  | "network.access"
+  | "network.proxy"
+  | "runtime.unsafe";
+
+/** Host-hosted declarative window-controls overlay (requires
+ *  `electron.windowControls`). The plugin may only `mount`/`unmount` a
+ *  fixed-style traffic-light cluster; the host builds the buttons, binds the
+ *  current `BrowserWindow`'s `minimize` / toggle-maximize / `close`, syncs
+ *  maximized state, and cleans up. No window handle is accepted, no generic
+ *  DOM is exposed, and there is no single-close primitive. */
+export interface WindowControlsAPI {
+  /** Mount the fixed-style traffic lights for the current window. Idempotent:
+   *  resolving immediately when already mounted. Rejects without the
+   *  `electron.windowControls` grant. */
+  mount(): Promise<void>;
+  /** Remove the traffic lights for the current window. Idempotent: resolving
+   *  immediately when not mounted. Rejects without the
+   *  `electron.windowControls` grant. */
+  unmount(): Promise<void>;
+}
+
 export interface RendererContext extends PluginContext {
   css: CssAPI;
   dom: DomAPI;
   script: ScriptAPI;
   /** Renderer-only host-namespaced string storage. Requires the `renderer.storage` permission. */
   storage: StorageAPI;
+  /** Host-hosted declarative traffic lights. Requires the `electron.windowControls` permission. */
+  windowControls: WindowControlsAPI;
 }
 
 // --- Main context (MVP) ---
@@ -214,6 +254,7 @@ export function createMockRendererContext(
     dom: { query: async () => null, observe: () => () => {} },
     script: { setDocumentTitle: () => {} },
     storage: { get: async () => null, set: async () => {} },
+    windowControls: { mount: async () => {}, unmount: async () => {} },
     ...overrides,
   };
 }

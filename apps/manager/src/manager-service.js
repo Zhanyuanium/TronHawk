@@ -6,6 +6,7 @@ const permissionRisk = {
   "renderer.css": "low",
   "renderer.script": "medium",
   "electron.window": "high",
+  "electron.windowControls": "high",
   "runtime.unsafe": "high",
 };
 

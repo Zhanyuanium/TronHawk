@@ -14,6 +14,7 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "renderer.dom",
     "renderer.storage",
     "electron.window",
+    "electron.windowControls",
     "electron.webContents",
     "electron.session",
     "electron.ipc",
@@ -231,10 +232,10 @@ pub fn validate_manifest_schema_for_host(
     // `renderer.script`. Runtime — Core `execution_plan` (see
     // `core.renderer.script_required`) runs renderer JS only with an effective
     // `renderer.script` grant or the Developer-mode `runtime.unsafe` escape hatch.
-    // `renderer.dom` / `renderer.storage` / `renderer.css` are additional capabilities
-    // only and never substitute for the gate at either layer, so accepting a
-    // `renderer.dom`-only manifest here would be "packable but never runs". No new
-    // permission name is introduced in 0.1 and no new required manifest field is added.
+    // `renderer.dom` / `renderer.storage` / `renderer.css` / `electron.windowControls`
+    // are additional capabilities only and never substitute for the gate at either
+    // layer, so accepting a `renderer.dom`-only manifest here would be "packable but
+    // never runs". No new required manifest field is added.
     let has_renderer = m.entry.as_ref().and_then(|e| e.renderer.as_ref()).is_some();
     if has_renderer && !m.permissions.iter().any(|p| p == "renderer.script") {
         return Err("an `entry.renderer` entry requires the `renderer.script` permission \
@@ -242,7 +243,7 @@ pub fn validate_manifest_schema_for_host(
             runtime contract: `renderer.script` is the execution gate for renderer JS — \
             Core `execution_plan` drops the renderer payload without an effective \
             `renderer.script` grant or the `runtime.unsafe` escape hatch; \
-            `renderer.dom`/`renderer.storage`/`renderer.css` are additional capabilities only, \
+            `renderer.dom`/`renderer.storage`/`renderer.css`/`electron.windowControls` are additional capabilities only, \
             see `core.renderer.script_required`)".to_string());
     }
 
@@ -2457,9 +2458,25 @@ mod tests {
     }
 
     #[test]
+    fn window_controls_permission_is_known() {
+        assert!(KNOWN_PERMISSIONS.contains(&"electron.windowControls"));
+        // A manifest declaring only the new permission passes the known-check
+        // (no entry, so no execution-gate rejection).
+        let m = serde_json::json!({
+            "id": "com.example.test",
+            "name": "Test",
+            "version": "1.0.0",
+            "author": "A",
+            "tronhawk": "^0.1",
+            "permissions": ["electron.windowControls"]
+        });
+        validate_manifest_schema(&m).unwrap();
+    }
+
+    #[test]
     fn renderer_entry_requires_renderer_script_execution_gate() {
         // Positive: declaring `renderer.script` passes schema validation, alone and alongside
-        // the additional capabilities.
+        // the additional capabilities (including the host-hosted window-controls overlay).
         validate_manifest_schema(&manifest_with_renderer_entry(
             serde_json::json!(["renderer.script"]),
         ))
@@ -2469,18 +2486,22 @@ mod tests {
             "renderer.dom",
             "renderer.storage",
             "renderer.css",
+            "electron.windowControls",
         ])))
         .unwrap();
         // Negative (pack-time layer): anything without a declared `renderer.script` is
         // rejected — including the pre-0.1 split (`renderer.dom`-only) that used to be
-        // "packable but never runs", and `runtime.unsafe`-only (the escape hatch unlocks
-        // the payload at runtime but never substitutes for the pack-time declaration).
+        // "packable but never runs", a windowControls-only entry (additional capability
+        // only, never the execution gate), and `runtime.unsafe`-only (the escape hatch
+        // unlocks the payload at runtime but never substitutes for the pack-time
+        // declaration).
         for permissions in [
             serde_json::json!([]),
             serde_json::json!(["renderer.dom"]),
             serde_json::json!(["renderer.dom", "renderer.storage"]),
             serde_json::json!(["renderer.css"]),
             serde_json::json!(["renderer.storage"]),
+            serde_json::json!(["electron.windowControls"]),
             serde_json::json!(["runtime.unsafe"]),
         ] {
             let m = manifest_with_renderer_entry(permissions);
@@ -2503,6 +2524,14 @@ mod tests {
                 "message must reference the Core execution_plan side, got: {err}"
             );
         }
+        // A windowControls-only renderer entry is "packable but never runs": it fails
+        // the same gate and the message names it as an additional capability only.
+        let wc_only = manifest_with_renderer_entry(serde_json::json!(["electron.windowControls"]));
+        let wc_err = validate_manifest_schema(&wc_only).unwrap_err();
+        assert!(
+            wc_err.contains("electron.windowControls"),
+            "gate message must name windowControls as additional-only, got: {wc_err}"
+        );
         // No renderer entry needs no script gate.
         validate_manifest_schema(&manifest_json("^0.1")).unwrap();
     }

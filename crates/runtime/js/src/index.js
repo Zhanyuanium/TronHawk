@@ -28,6 +28,31 @@ const adapters = require("./adapters");
 // constructor — the only way to rewrite window options before the real constructor runs.
 const shim = require("./electron-require-shim");
 
+// Host-hosted declarative window-controls overlay (electron.windowControls).
+// The template + pure helpers live in window-controls.js (never an ADAPTERS
+// generic adapter; wco.js behavior unchanged).
+const windowControls = require("./window-controls");
+
+// Implemented capability sets (mirror crates/core/src/daemon.rs
+// IMPLEMENTED_* — the runtime itself gates only by `granted`, Core having
+// already intersected with the support level). Level ownership:
+// `electron.windowControls` is Level 2 (not Level 1, not developer-only);
+// devMode adds only `runtime.unsafe`.
+const IMPLEMENTED_RENDERER_CAPABILITIES = ["renderer.css", "renderer.script"];
+const IMPLEMENTED_LEVEL_TWO_CAPABILITIES = [
+  "renderer.css",
+  "renderer.script",
+  "renderer.dom",
+  "renderer.storage",
+  "electron.window",
+  "electron.windowControls",
+  "network.access",
+];
+const IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES = [
+  ...IMPLEMENTED_LEVEL_TWO_CAPABILITIES,
+  "runtime.unsafe",
+];
+
 const MAX_LOG_MESSAGE_BYTES = 1024;
 let runtimeLogSink = (level, message) => console.log(`[tronhawk-runtime][${level}] ${message}`);
 let pluginLogSink = (pluginId, level, message) =>
@@ -60,6 +85,16 @@ let currentPlan = { revision: "", plugins: [] };
 let planGeneration = 0;
 // webContents.id -> { contents, keys: Map(pluginId -> { css, key }), gens: Map(pluginId -> n) }
 const windows = new Map();
+// Host-internal surfaces (window-controls overlay views) excluded from target
+// discovery. The overlay's WebContents reports getType() === "window" exactly
+// like a real target, so type filtering alone cannot exclude it:
+// - internalOverlayConstructionDepth: synchronous guard held while
+//   `new WebContentsView()` runs; covers `web-contents-created` fired
+//   re-entrantly inside construction (before the fresh contents exists).
+// - internalOverlayContents: live overlay WebContents registry; covers
+//   later/async emissions. Entries are removed when the view is destroyed.
+const internalOverlayContents = new Set();
+let internalOverlayConstructionDepth = 0;
 let appRef = null;
 // Adapter selected by the current start(); the did-finish-load handler consults it for the
 // optional `renderer.gate(win, ready)` timing seam (Path A). No gate -> default timing.
@@ -418,6 +453,11 @@ const pendingOps = new Map();
 // vm -> { draining: true } — re-entrancy guard, true only while a drain is pumping this VM.
 const vmDrains = new WeakMap();
 let nextOpId = 1;
+// Per-renderer-instance sequence for window-controls ownership tokens.
+// Each buildWindowControlsApi call mints one unique instanceKey; owners are
+// keyed by instanceKey (never bare pluginId) so a revoked instance's late
+// continuations can never touch a newer generation's registration.
+let windowControlsInstanceSeq = 0;
 // Test seam: number of drains that actually ran (guard passed). reset() clears it.
 let pumpDrainCount = 0;
 
@@ -1230,6 +1270,905 @@ function buildCssApi(vm, pluginId, w, cleanupCallbacks) {
     });
   }
   return css;
+}
+
+// `ctx.windowControls` — renderer-only declarative traffic-light overlay
+// (requires `electron.windowControls`). The plugin may only `mount()` /
+// `unmount()` a fixed-style cluster; the host renders the buttons in an
+// INDEPENDENT trusted WebContentsView (separate WebContents, safe
+// webPreferences, data-URL HTML, no <script>, no preload) and binds real user
+// clicks to the CURRENT BrowserWindow via interception on the OVERLAY view
+// only (registration-source boundary plus per-window-token-verified): the
+// overlay links carry
+// `target="_blank"`, so every click arrives at the overlay view's
+// `setWindowOpenHandler` (verified, then always denied — the overlay never
+// opens windows nor leaves its trusted document), with `will-navigate` /
+// `will-frame-navigate` interception as the fallback path on builds that
+// navigate custom-scheme link clicks instead. Rationale: on newer Electron,
+// custom-scheme clicks from a `data:` document emit NO navigation event at
+// all (observed on 43: no will-*, no did-start-navigation), which left the
+// lights visible but dead under navigation-only interception. A twin-dedup
+// (same action sighted through another path within a short window is
+// skipped) keeps one click to one op. The target
+// page's WebContents is never injected and never listened on for window
+// actions: page forgeries (`ipc-message`, forged navigations, DOM events)
+// cannot reach window ops. No window handle is accepted (extra args warn +
+// return `undefined`), no generic DOM is exposed, and there is no
+// single-close primitive. Each op is a QuickJS Promise delivered by the pump
+// (ADR 0008). Fail-closed: without a live BrowserWindow or a trusted view,
+// `mount()` rejects and registers no owner. Not an ADAPTERS adapter;
+// `wco.js` behavior unchanged.
+//
+// Ownership: per-window `owners` is a Map keyed by per-instance unique token
+// (never bare pluginId), plus per-instance `revoked` / `desiredMounted` /
+// `operationGeneration`. The shared view slot is `idle` / `loading` / `ready`:
+// concurrent mounts join the single in-flight load (one view, one load
+// promise, every waiter settled by it) — but only for the SAME normalized
+// geometry; a conflicting geometry fails closed ("geometry conflict for
+// shared overlay view") instead of sharing the foreign view. Only load
+// success registers owners, load failure rejects every waiter and clears
+// view + listeners + token + geometry.
+// Every construction bumps `resourceGeneration` and captures its own
+// view/overlayContents/token/geometry; a superseded settle destroys only its
+// own capture and routes live waiters onto the current slot (adopting only
+// geometry-matching waiters) — never current host fields. The last owner
+// leaving removes the view and all listeners together.
+function buildWindowControlsApi(vm, pluginId, w, cleanupCallbacks, configSnapshot) {
+  const contents = w.contents;
+  // Geometry is normalized + frozen ONCE per API instance, before any view
+  // construction, from the read-only plugin.config snapshot of this plan
+  // revision. A newer revision respawns the VM with a new snapshot (via the
+  // fingerprint); the old view is destroyed and rebuilt under the new
+  // geometry. Sizes are DIP; the host never converts pixels or measures.
+  const instanceGeometry = windowControls.normalizeWindowControlsGeometry(configSnapshot);
+  // Frozen config snapshot retained for per-construction tooltip resolution
+  // (language table + tooltip-* overrides). Never mutated.
+  const instanceConfig =
+    configSnapshot && typeof configSnapshot === "object" ? configSnapshot : {};
+  if (!w.windowControlsHost) {
+    w.windowControlsHost = {
+      owners: new Map(),
+      view: null,
+      overlayContents: null,
+      token: null,
+      // Frozen normalized geometry of the CURRENT view slot (null when idle).
+      // A mount whose instance geometry differs from a live slot fails
+      // closed with a geometry conflict instead of sharing the view.
+      geometry: null,
+      // Tooltip strings of the CURRENT view (locale + overrides resolved at
+      // construction; co-owners share them until a rebuild).
+      labels: null,
+      addedToWin: null,
+      willNavigateListener: null,
+      // `will-frame-navigate` twin of the above (fallback path on builds that
+      // navigate custom-scheme link clicks). Both listeners share one
+      // validator + a twin-dedup so a single click dispatches at most once.
+      willFrameNavigateListener: null,
+      // Primary click path: per-view `setWindowOpenHandler` (overlay links
+      // carry `target="_blank"`). Dies with the contents on teardown.
+      windowOpenHandler: null,
+      // Last dispatched overlay action + sighting path + timestamp for the
+      // twin-dedup above.
+      lastNavDispatch: null,
+      win: null,
+      maximizeListener: null,
+      unmaximizeListener: null,
+      installed: false,
+      // Shared-load slot: idle (no view) | loading (one loadURL in flight,
+      // concurrent mounts join it) | ready (view usable, refcounted reuse).
+      loadState: "idle",
+      loadPromise: null,
+      // Current construction's captured resources + waiter list. Every
+      // construction bumps resourceGeneration; late settles whose generation
+      // no longer matches are stale and may only destroy their OWN captured
+      // view — never current host fields.
+      loadRes: null,
+      resourceGeneration: 0,
+    };
+  }
+  const host = w.windowControlsHost;
+  const owners = host.owners;
+
+  windowControlsInstanceSeq += 1;
+  const instanceKey = pluginId + "#" + windowControlsInstanceSeq + "@" + contents.id;
+  let revoked = false;
+  let desiredMounted = false;
+  let operationGeneration = 0;
+
+  function currentBrowserWindow() {
+    try {
+      const live = liveBrowserWindowForContentsId(contents.id);
+      if (live) return live;
+    } catch (_e) {
+      // Fall through to null.
+    }
+    return null;
+  }
+
+  function getElectronModule() {
+    try {
+      return require("electron");
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function syncOverlay() {
+    try {
+      const oc = host.overlayContents;
+      if (!oc || typeof oc.executeJavaScript !== "function") return;
+      if (typeof oc.isDestroyed === "function" && oc.isDestroyed()) return;
+      const win = currentBrowserWindow();
+      const maximized =
+        win && typeof win.isMaximized === "function" ? !!win.isMaximized() : false;
+      oc.executeJavaScript(windowControls.windowControlsSyncSnippet(maximized, host.labels)).catch(() => {});
+    } catch (_e) {
+      // Best effort — sync must never throw across the bridge.
+    }
+  }
+
+  // Overlay tooltip language: app.getLocale() starting with "zh" selects the
+  // Chinese table, anything else (or unavailable) selects English. Read fresh
+  // at each construction so a rebuilt view picks up locale changes.
+  function currentWindowControlsLanguage() {
+    try {
+      const Electron = getElectronModule();
+      const app = Electron && Electron.app;
+      if (app && typeof app.getLocale === "function") {
+        return windowControls.resolveWindowControlsLanguage(app.getLocale());
+      }
+    } catch (_e) {
+      // Best effort — fall through to English.
+    }
+    return "en";
+  }
+
+  function detachViewFromWindow(view, win) {
+    if (!view || !win) return;
+    try {
+      if (win.contentView && typeof win.contentView.removeChildView === "function") {
+        win.contentView.removeChildView(view);
+        return;
+      }
+    } catch (_e) {
+      // Fall through to legacy seam.
+    }
+    try {
+      if (typeof win.removeBrowserView === "function") win.removeBrowserView(view);
+    } catch (_e) {
+      // Best effort.
+    }
+  }
+
+  // Best-effort teardown of EXPLICITLY captured view resources. Operates on
+  // the passed references only — never on live host fields — so a stale load
+  // settle can destroy exactly the view it built without touching a newer
+  // generation. Never throws.
+  function destroyViewResources(res) {
+    if (!res) return;
+    try {
+      if (res.willNavigateListener && res.overlayContents) {
+        const oc = res.overlayContents;
+        try {
+          if (typeof oc.removeListener === "function")
+            oc.removeListener("will-navigate", res.willNavigateListener);
+          else if (typeof oc.off === "function")
+            oc.off("will-navigate", res.willNavigateListener);
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+    } catch (_e) {
+      // Best effort.
+    }
+    try {
+      if (res.willFrameNavigateListener && res.overlayContents) {
+        const oc = res.overlayContents;
+        try {
+          if (typeof oc.removeListener === "function")
+            oc.removeListener("will-frame-navigate", res.willFrameNavigateListener);
+          else if (typeof oc.off === "function")
+            oc.off("will-frame-navigate", res.willFrameNavigateListener);
+        } catch (_e) {
+          // Best effort.
+        }
+      }
+    } catch (_e) {
+      // Best effort.
+    }
+    try {
+      if (res.win && typeof res.win.removeListener === "function") {
+        if (res.maximizeListener) res.win.removeListener("maximize", res.maximizeListener);
+        if (res.unmaximizeListener)
+          res.win.removeListener("unmaximize", res.unmaximizeListener);
+      }
+    } catch (_e) {
+      // Best effort.
+    }
+    try {
+      if (res.view) {
+        if (res.addedToWin) detachViewFromWindow(res.view, res.addedToWin);
+        const live = currentBrowserWindow();
+        if (live && live !== res.addedToWin) detachViewFromWindow(res.view, live);
+      }
+    } catch (_e) {
+      // Best effort.
+    }
+    try {
+      const oc = res.overlayContents;
+      if (oc) {
+        // Unregister the host-internal surface on every teardown path.
+        try {
+          internalOverlayContents.delete(oc);
+        } catch (_e) {
+          // Best effort.
+        }
+        let dead = false;
+        try {
+          dead = typeof oc.isDestroyed === "function" ? !!oc.isDestroyed() : false;
+        } catch (_e) {
+          dead = true;
+        }
+        if (!dead) {
+          if (typeof oc.close === "function") oc.close();
+          else if (typeof oc.destroy === "function") oc.destroy();
+        }
+      }
+    } catch (_e) {
+      // Best effort.
+    }
+    // Partial constructions (unusable/missing webContents): destroy the view
+    // shell itself when it exposes a closer. Never throws.
+    try {
+      const v = res.view;
+      if (v && (!res.overlayContents || v.webContents !== res.overlayContents)) {
+        if (typeof v.close === "function") v.close();
+        else if (typeof v.destroy === "function") v.destroy();
+      }
+    } catch (_e) {
+      // Best effort.
+    }
+  }
+
+  function isWaiterValid(waiter) {
+    try {
+      return !!waiter.isValid();
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function hasValidLoadWaiters() {
+    return !!(
+      host.loadState === "loading" &&
+      host.loadRes &&
+      Array.isArray(host.loadRes.waiters) &&
+      host.loadRes.waiters.some(isWaiterValid)
+    );
+  }
+
+  function isCapturedDestroyed(res) {
+    try {
+      const oc = res && res.overlayContents;
+      return !!oc && typeof oc.isDestroyed === "function" && !!oc.isDestroyed();
+    } catch (_e) {
+      return true;
+    }
+  }
+
+  // Full teardown of the CURRENT host slot: snapshot current resources, clear
+  // host fields first (bumping the generation orphans any in-flight settle),
+  // then destroy the snapshot. In-flight settles arriving late observe the
+  // generation mismatch and fall into the stale path (own-view-only destroy).
+  function uninstallHost() {
+    const res = {
+      view: host.view,
+      overlayContents: host.overlayContents,
+      willNavigateListener: host.willNavigateListener,
+      willFrameNavigateListener: host.willFrameNavigateListener,
+      geometry: host.geometry,
+      win: host.win,
+      maximizeListener: host.maximizeListener,
+      unmaximizeListener: host.unmaximizeListener,
+      addedToWin: host.addedToWin,
+    };
+    host.view = null;
+    host.overlayContents = null;
+    host.token = null;
+    host.geometry = null;
+    host.labels = null;
+    host.addedToWin = null;
+    host.willNavigateListener = null;
+    host.willFrameNavigateListener = null;
+    host.windowOpenHandler = null;
+    host.lastNavDispatch = null;
+    host.win = null;
+    host.maximizeListener = null;
+    host.unmaximizeListener = null;
+    host.installed = false;
+    host.loadState = "idle";
+    host.loadPromise = null;
+    host.loadRes = null;
+    host.resourceGeneration += 1;
+    destroyViewResources(res);
+  }
+
+  // Ready only after the shared loadURL resolves. A view still loading (or a
+  // leftover from a torn-down generation) is never reused as healthy.
+  function overlayViewHealthy() {
+    if (host.loadState !== "ready") return false;
+    if (!host.installed || !host.view || !host.overlayContents || !host.token) return false;
+    try {
+      const oc = host.overlayContents;
+      if (typeof oc.isDestroyed === "function" && oc.isDestroyed()) return false;
+    } catch (_e) {
+      return false;
+    }
+    return true;
+  }
+
+  // Settle the shared load owned by `res`. Attached once per construction;
+  // concurrent mounts join via res.waiters and are all settled here.
+  function settleSharedLoadSuccess(res) {
+    if (host.loadRes !== res || host.resourceGeneration !== res.generation || host.loadState !== "loading") {
+      settleStaleLoad(res, null);
+      return;
+    }
+    if (w.dead || windows.get(contents.id) !== w || contentsDestroyed(w) || isCapturedDestroyed(res)) {
+      failCurrentLoad(res, "window destroyed");
+      return;
+    }
+    host.loadState = "ready";
+    host.loadPromise = null;
+    syncOverlay();
+    const waiters = Array.isArray(res.waiters) ? res.waiters : [];
+    res.waiters = [];
+    for (const waiter of waiters) {
+      // Only load success registers an owner — and only for still-valid
+      // waiters. Superseded waiters resolve harmlessly (their VMs are gone or
+      // detached; settleOp no-ops on missing ops).
+      if (isWaiterValid(waiter)) owners.set(waiter.myKey, waiter.pluginId);
+      try {
+        waiter.resolve();
+      } catch (_e) {
+        // Best effort — one bad waiter must not starve the rest.
+      }
+    }
+    // Nobody claimed the view (every waiter revoked/unmounted mid-load):
+    // tear it down so no ownerless overlay lingers.
+    if (owners.size === 0) {
+      uninstallHost();
+    }
+  }
+
+  function settleSharedLoadFailure(res, e) {
+    if (host.loadRes !== res || host.resourceGeneration !== res.generation) {
+      settleStaleLoad(res, errorText(e));
+      return;
+    }
+    failCurrentLoad(res, errorText(e));
+  }
+
+  // Current-slot load failure (or window death mid-load): reject every valid
+  // waiter, resolve the superseded ones harmlessly, and clear the whole slot
+  // (view + listeners + token) so a retry starts clean.
+  function failCurrentLoad(res, reason) {
+    const waiters = Array.isArray(res.waiters) ? res.waiters : [];
+    res.waiters = [];
+    if (host.loadRes === res) {
+      uninstallHost();
+    } else {
+      destroyViewResources(res);
+    }
+    for (const waiter of waiters) {
+      try {
+        if (isWaiterValid(waiter)) waiter.reject(reason);
+        else waiter.resolve();
+      } catch (_e) {
+        // Best effort.
+      }
+    }
+  }
+
+  // A superseded construction settled late. Destroy ONLY our own captured
+  // view; route still-valid waiters onto the live slot (adopt into the
+  // current load, or register on the current ready view); superseded waiters
+  // resolve harmlessly. Never touches current host fields.
+  function settleStaleLoad(res, failureReason) {
+    const waiters = Array.isArray(res.waiters) ? res.waiters : [];
+    res.waiters = [];
+    for (const waiter of waiters) {
+      if (!isWaiterValid(waiter)) {
+        try {
+          waiter.resolve();
+        } catch (_e) {
+          // Best effort.
+        }
+        continue;
+      }
+      if (
+        host.loadState === "loading" &&
+        host.loadRes &&
+        host.loadRes !== res &&
+        Array.isArray(host.loadRes.waiters)
+      ) {
+        // Adopt only onto a load for the SAME geometry; a conflicting
+        // geometry fails closed instead of sharing the foreign view.
+        if (windowControls.sameWindowControlsGeometry(waiter.geometry, host.loadRes.geometry)) {
+          host.loadRes.waiters.push(waiter);
+          continue;
+        }
+        try {
+          waiter.reject("geometry conflict for shared overlay view");
+        } catch (_e) {
+          // Best effort.
+        }
+        continue;
+      }
+      if (!failureReason && host.loadState === "ready" && overlayViewHealthy()) {
+        // Same rule for the ready view: conflicting geometry fails closed.
+        if (!windowControls.sameWindowControlsGeometry(waiter.geometry, host.geometry)) {
+          try {
+            waiter.reject("geometry conflict for shared overlay view");
+          } catch (_e) {
+            // Best effort.
+          }
+          continue;
+        }
+        owners.set(waiter.myKey, waiter.pluginId);
+        try {
+          waiter.resolve();
+        } catch (_e) {
+          // Best effort.
+        }
+        continue;
+      }
+      try {
+        waiter.reject(failureReason || "superseded");
+      } catch (_e) {
+        // Best effort.
+      }
+    }
+    destroyViewResources(res);
+  }
+
+  // Build the trusted overlay view synchronously up to loadURL, claim the
+  // shared loading slot (host.loadRes + loadPromise), and attach the shared
+  // settle exactly once. Every attempt bumps resourceGeneration and captures
+  // its own view/overlayContents/token/geometry; late settles of superseded
+  // attempts destroy only their own capture. On any construction failure all
+  // partial resources are destroyed and no host residue remains (fail-closed,
+  // registers no owner, rejects the caller).
+  function constructTrustedView(win, geometry) {
+    const Electron = getElectronModule();
+    const ViewCtor = (Electron && Electron.WebContentsView) || null;
+    if (!ViewCtor) return { ok: false, reason: "no trusted view constructor" };
+    if (!win) return { ok: false, reason: "no live window" };
+    const generation = ++host.resourceGeneration;
+    let token = null;
+    try {
+      token = windowControls.generateWindowControlsToken();
+    } catch (e) {
+      return { ok: false, reason: "token failure: " + errorText(e) };
+    }
+    // Claim the loading slot up front so concurrent mounts join this exact
+    // load instead of building a second view.
+    host.token = token;
+    host.loadState = "loading";
+    const partial = {
+      view: null,
+      overlayContents: null,
+      willNavigateListener: null,
+      willFrameNavigateListener: null,
+      // Single-slot window-open handler (no removal API; dies with the
+      // contents, which every teardown path destroys).
+      windowOpenHandler: null,
+      win,
+      maximizeListener: null,
+      unmaximizeListener: null,
+      addedToWin: null,
+    };
+    const fail = (reason) => {
+      destroyViewResources(partial);
+      if (host.resourceGeneration === generation && host.loadState === "loading" && host.token === token) {
+        host.token = null;
+        host.loadState = "idle";
+      }
+      return { ok: false, reason };
+    };
+    // Synchronous internal-construction guard: the platform may fire
+    // `web-contents-created` re-entrantly inside `new ViewCtor()`, before the
+    // fresh WebContents can be registered below. The global handler excludes
+    // everything created under this guard first (try/finally: always balanced).
+    internalOverlayConstructionDepth += 1;
+    try {
+      partial.view = new ViewCtor({
+        webPreferences: { ...windowControls.WINDOW_CONTROLS_SAFE_PREFERENCES },
+      });
+    } catch (e) {
+      return fail("view construct failed: " + errorText(e));
+    } finally {
+      internalOverlayConstructionDepth -= 1;
+    }
+    const overlayContents = partial.view && partial.view.webContents;
+    if (!overlayContents || typeof overlayContents.on !== "function") {
+      return fail("no overlay webContents");
+    }
+    partial.overlayContents = overlayContents;
+    // Register the overlay surface as host-internal from here on: later
+    // `web-contents-created` emissions for it never enter target discovery.
+    // destroyViewResources unregisters on every teardown path.
+    internalOverlayContents.add(overlayContents);
+    try {
+      if (win.contentView && typeof win.contentView.addChildView === "function") {
+        win.contentView.addChildView(partial.view);
+        partial.addedToWin = win;
+      } else {
+        return fail("no contentView seam");
+      }
+    } catch (e) {
+      partial.addedToWin = null;
+      return fail("addChildView failed: " + errorText(e));
+    }
+    try {
+      if (typeof partial.view.setBounds === "function")
+        partial.view.setBounds({ ...windowControls.windowControlsViewBounds(geometry) });
+    } catch (_e) {
+      // Cosmetic only — a mispositioned but functional overlay stays secure.
+      pluginLog(pluginId, "warn", "windowControls: setBounds failed; overlay may be mispositioned");
+    }
+    // Explicit transparent view background where supported, so no opaque
+    // letterboxing surrounds the content-sized overlay. Cosmetic only.
+    try {
+      if (typeof partial.view.setBackgroundColor === "function")
+        partial.view.setBackgroundColor("#00000000");
+    } catch (_e) {
+      // Best effort.
+    }
+    const capturedToken = token;
+    // Shared validator + dispatcher for all interception paths (navigation
+    // events + window-open). Each listener blocks/denies FIRST (overlay never
+    // leaves its trusted data-URL document), then path-appropriate
+    // origin/URL/token/action checks run. Twin-dedup: one click can surface
+    // through several paths; the second sighting (same action, other path,
+    // within a short window) is skipped so one click dispatches at most
+    // once — while repeats through the SAME path always dispatch (rapid
+    // maximize-then-restore stays live).
+    const dispatchOverlayNavigation = (seenVia, url) => {
+      const parsed = windowControls.parseWindowControlsNavigation(url);
+      if (!parsed) return;
+      if (parsed.token !== capturedToken) {
+        pluginLog(pluginId, "warn", "windowControls: rejected navigation with bad token");
+        return;
+      }
+      const now = Date.now();
+      const last = host.lastNavDispatch;
+      if (
+        last &&
+        last.action === parsed.action &&
+        last.seenVia !== seenVia &&
+        now - last.at < 500
+      )
+        return;
+      host.lastNavDispatch = { action: parsed.action, seenVia, at: now };
+      const targetWin = currentBrowserWindow();
+      if (!targetWin) {
+        pluginLog(pluginId, "warn", "windowControls: no live window for action " + parsed.action);
+        return;
+      }
+      let ok = false;
+      try {
+        ok = windowControls.applyWindowControlsAction(targetWin, parsed.action);
+      } catch (_e) {
+        ok = false;
+      }
+      if (ok) {
+        pluginLog(pluginId, "info", "windowControls: action " + parsed.action);
+        syncOverlay();
+      } else {
+        pluginLog(pluginId, "warn", "windowControls: action failed " + parsed.action);
+      }
+    };
+    const blockFirst = (event) => {
+      try {
+        if (event && typeof event.preventDefault === "function") event.preventDefault();
+      } catch (_e) {
+        // Best effort.
+      }
+    };
+    const onWillNavigate = (details) => {
+      // Real shape is a SINGLE param (Event<WebContentsWillNavigateEventParams>:
+      // url/isMainFrame, no sender — see electron.d.ts): the source boundary is
+      // that this listener is registered ONLY on the captured overlay
+      // WebContents, so any invocation originates from it. Block FIRST (the
+      // overlay must never leave its trusted data-URL document, even for URLs
+      // rejected below), then check frame role, URL, token.
+      if (!details) return;
+      blockFirst(details);
+      if (details.isMainFrame === false) return;
+      const url = typeof details.url === "string" ? details.url : "";
+      dispatchOverlayNavigation("will-navigate", url);
+    };
+    // `will-frame-navigate` twin: same overlay-only interception for builds
+    // that navigate custom-scheme link clicks instead of windowing them.
+    // Real shape is a SINGLE param (Event<WebContentsWillFrameNavigateEventParams>:
+    // url/isMainFrame/frame, no sender — see electron.d.ts): the source
+    // boundary is that this listener is registered ONLY on the captured
+    // overlay WebContents, so any invocation originates from it. Block FIRST
+    // per the real details structure, then check frame role, URL, token.
+    // The overlay document has no subframes by construction; a non-main-frame
+    // navigation is blocked but never dispatched.
+    const onWillFrameNavigate = (details) => {
+      if (!details) return;
+      blockFirst(details);
+      if (details.isMainFrame === false) return;
+      const url = typeof details.url === "string" ? details.url : "";
+      dispatchOverlayNavigation("will-frame-navigate", url);
+    };
+    partial.willNavigateListener = onWillNavigate;
+    partial.willFrameNavigateListener = onWillFrameNavigate;
+    try {
+      overlayContents.on("will-navigate", onWillNavigate);
+    } catch (e) {
+      return fail("will-navigate install failed: " + errorText(e));
+    }
+    try {
+      // Best effort on old Electron without this event: `.on` with an unknown
+      // name never fires and never throws; the `will-navigate` listener above
+      // remains the dispatch path there.
+      overlayContents.on("will-frame-navigate", onWillFrameNavigate);
+    } catch (e) {
+      partial.willFrameNavigateListener = null;
+      pluginLog(pluginId, "warn", "windowControls: will-frame-navigate install failed: " + errorText(e));
+    }
+    // Primary click path: the overlay links carry `target="_blank"`, so every
+    // click arrives here as a window-open request — including on builds where
+    // custom-scheme clicks from a `data:` document emit no navigation event
+    // at all (observed on Electron 43). Verified with the same token check,
+    // then ALWAYS denied: the overlay never opens windows and never leaves
+    // its trusted document. Overlay-only (registered on this WebContents, so
+    // the page can never reach it); best effort when the API is absent.
+    const onWindowOpen = (details) => {
+      try {
+        const url = details && typeof details.url === "string" ? details.url : "";
+        dispatchOverlayNavigation("window-open", url);
+      } catch (_e) {
+        // Dispatch never throws, but deny unconditionally regardless.
+      }
+      return { action: "deny" };
+    };
+    partial.windowOpenHandler = null;
+    try {
+      if (typeof overlayContents.setWindowOpenHandler === "function") {
+        overlayContents.setWindowOpenHandler(onWindowOpen);
+        partial.windowOpenHandler = onWindowOpen;
+      }
+    } catch (e) {
+      partial.windowOpenHandler = null;
+      pluginLog(pluginId, "warn", "windowControls: window-open install failed: " + errorText(e));
+    }
+    // Maximize/unmaximize sync is cosmetic: install best-effort, never fail
+    // the mount for it. Stored refs let every fail path remove partial installs.
+    partial.maximizeListener = () => syncOverlay();
+    partial.unmaximizeListener = () => syncOverlay();
+    try {
+      if (typeof win.on === "function") win.on("maximize", partial.maximizeListener);
+    } catch (_e) {
+      partial.maximizeListener = null;
+    }
+    try {
+      if (typeof win.on === "function") win.on("unmaximize", partial.unmaximizeListener);
+    } catch (_e) {
+      partial.unmaximizeListener = null;
+    }
+    let loadP = null;
+    // Tooltip strings for THIS view: fresh locale per construction, plugin
+    // tooltip-* overrides on top. Co-owners share the first mounted view, so
+    // the first construction's labels win until a rebuild.
+    const labels = windowControls.resolveWindowControlsLabels(
+      currentWindowControlsLanguage(),
+      instanceConfig,
+    );
+    try {
+      loadP = overlayContents.loadURL(windowControls.windowControlsViewDataUrl(token, geometry, labels));
+    } catch (e) {
+      return fail("overlay load threw: " + errorText(e));
+    }
+    if (!loadP || typeof loadP.then !== "function") {
+      return fail("overlay load unavailable");
+    }
+    // Publish the construction and attach the shared settle exactly once.
+    const res = {
+      generation,
+      view: partial.view,
+      overlayContents,
+      token,
+      geometry,
+      addedToWin: partial.addedToWin,
+      willNavigateListener: onWillNavigate,
+      willFrameNavigateListener: partial.willFrameNavigateListener,
+      windowOpenHandler: partial.windowOpenHandler,
+      win,
+      maximizeListener: partial.maximizeListener,
+      unmaximizeListener: partial.unmaximizeListener,
+      waiters: [],
+    };
+    host.view = partial.view;
+    host.overlayContents = overlayContents;
+    host.geometry = geometry;
+    host.labels = labels;
+    host.addedToWin = partial.addedToWin;
+    host.willNavigateListener = onWillNavigate;
+    host.willFrameNavigateListener = partial.willFrameNavigateListener;
+    host.windowOpenHandler = partial.windowOpenHandler;
+    host.win = win;
+    host.maximizeListener = partial.maximizeListener;
+    host.unmaximizeListener = partial.unmaximizeListener;
+    host.installed = true;
+    host.loadRes = res;
+    host.loadPromise = Promise.resolve(loadP);
+    host.loadPromise.then(
+      () => settleSharedLoadSuccess(res),
+      (e) => settleSharedLoadFailure(res, e),
+    );
+    return { ok: true, loadP: host.loadPromise, res };
+  }
+
+  const api = vm.newObject();
+
+  const mount = vm.newFunction("mount", (...mountArgs) => {
+    if (mountArgs.length > 0) {
+      pluginLog(
+        pluginId,
+        "warn",
+        "windowControls.mount: takes no arguments (declarative overlay)",
+      );
+      return vm.undefined;
+    }
+    desiredMounted = true;
+    const myOp = ++operationGeneration;
+    const myKey = instanceKey;
+    const myVm = vm;
+    const { opId, handle } = newHostPromise(vm, pluginId, "windowControls.mount");
+    // Each waiter carries its own VM's settle closures (handles must come
+    // from the owning VM) plus a validity predicate over this instance's
+    // revoked/desiredMounted/generation and window liveness. The shared load
+    // settle calls them; no waiter is ever dropped silently.
+    const waiter = {
+      myKey,
+      pluginId,
+      // Frozen normalized geometry of THIS instance: sharing (joining an
+      // in-flight load, reusing a ready view, stale adoption) requires an
+      // exact match, else the mount fails closed with a geometry conflict.
+      geometry: instanceGeometry,
+      isValid: () =>
+        !revoked &&
+        desiredMounted &&
+        myOp === operationGeneration &&
+        !w.dead &&
+        windows.get(contents.id) === w &&
+        !contentsDestroyed(w),
+      resolve: () => settleOp(opId, "resolve", () => myVm.undefined),
+      reject: (reason) => settleOp(opId, "reject", () => myVm.newString(reason || "overlay unavailable")),
+    };
+    if (revoked) {
+      Promise.resolve().then(() => waiter.reject("revoked"));
+      return handle;
+    }
+    if (owners.has(myKey)) {
+      Promise.resolve().then(() => waiter.resolve());
+      return handle;
+    }
+    if (contentsDestroyed(w) || w.dead || windows.get(contents.id) !== w) {
+      Promise.resolve().then(() => waiter.reject("window destroyed"));
+      return handle;
+    }
+    const win = currentBrowserWindow();
+    if (!win) {
+      Promise.resolve().then(() => waiter.reject("no live window for overlay"));
+      return handle;
+    }
+    // Join an in-flight load: one view, one load promise, every concurrent
+    // mount waits on it — but only for the SAME geometry. A conflicting
+    // geometry fails closed instead of sharing the foreign view.
+    if (host.loadState === "loading" && host.loadRes && host.loadPromise) {
+      if (!windowControls.sameWindowControlsGeometry(waiter.geometry, host.loadRes.geometry)) {
+        Promise.resolve().then(() => waiter.reject("geometry conflict for shared overlay view"));
+        return handle;
+      }
+      host.loadRes.waiters.push(waiter);
+      return handle;
+    }
+    // Reuse a healthy READY view (refcounted; load already succeeded) — same
+    // geometry only; a conflict fails closed.
+    if (host.loadState === "ready" && overlayViewHealthy()) {
+      if (!windowControls.sameWindowControlsGeometry(waiter.geometry, host.geometry)) {
+        Promise.resolve().then(() => waiter.reject("geometry conflict for shared overlay view"));
+        return handle;
+      }
+      owners.set(myKey, pluginId);
+      syncOverlay();
+      Promise.resolve().then(() => {
+        if (!isWaiterValid(waiter)) {
+          // Superseded between call and settle: undo self, keep settle harmless.
+          owners.delete(myKey);
+          if (owners.size === 0) {
+            uninstallHost();
+          }
+        }
+        waiter.resolve();
+      });
+      return handle;
+    }
+    // Idle (or unusable leftover): drop remnants so the build starts clean,
+    // then construct a fresh trusted view. Only `mounted` (load success)
+    // registers an owner — a `failed` load rejects every waiter and clears
+    // view + listeners + token (fail-closed).
+    uninstallHost();
+    const built = constructTrustedView(win, instanceGeometry);
+    if (!built.ok) {
+      Promise.resolve().then(() => waiter.reject(built.reason || "overlay unavailable"));
+      return handle;
+    }
+    built.res.waiters.push(waiter);
+    return handle;
+  });
+  vm.setProp(api, "mount", mount);
+  mount.dispose();
+
+  const unmount = vm.newFunction("unmount", (...unmountArgs) => {
+    if (unmountArgs.length > 0) {
+      pluginLog(
+        pluginId,
+        "warn",
+        "windowControls.unmount: takes no arguments (declarative overlay)",
+      );
+      return vm.undefined;
+    }
+    desiredMounted = false;
+    operationGeneration += 1;
+    const myKey = instanceKey;
+    owners.delete(myKey);
+    // Stale unmounts delete only their own key: newer generations use
+    // different instanceKeys and are never touched here.
+    const { opId, handle } = newHostPromise(vm, pluginId, "windowControls.unmount");
+    const done = () => settleOp(opId, "resolve", () => vm.undefined);
+    if (owners.size > 0) {
+      Promise.resolve().then(done);
+      return handle;
+    }
+    // Last owner leaving removes the view and all listeners together —
+    // unless a load is in flight with other still-valid waiters, which own
+    // it now (their settle tears it down when nobody claims it).
+    if (!hasValidLoadWaiters()) {
+      uninstallHost();
+    }
+    Promise.resolve().then(done);
+    return handle;
+  });
+  vm.setProp(api, "unmount", unmount);
+  unmount.dispose();
+
+  if (Array.isArray(cleanupCallbacks)) {
+    cleanupCallbacks.push(() => {
+      try {
+        revoked = true;
+        desiredMounted = false;
+        operationGeneration += 1;
+        owners.delete(instanceKey);
+        // Revocation during a shared load must not kill a view other live
+        // instances are still waiting on: only tear down when no valid
+        // waiter remains (the shared settle then owns the outcome).
+        if (owners.size === 0 && !hasValidLoadWaiters()) {
+          uninstallHost();
+        }
+      } catch (_e) {
+        // A throwing host cleanup must not prevent VM disposal.
+      }
+    });
+  }
+
+  return api;
 }
 
 // `ctx.storage` — renderer-only async host API bridging the target page's localStorage, with a
@@ -2190,6 +3129,14 @@ function runRendererPlugin(plugin, w, generation, fingerprint) {
       vm.setProp(ctx, "storage", storage);
       storage.dispose();
     }
+    if (hasPermission(plugin.granted, "electron.windowControls")) {
+      // Read-only config snapshot of this plan revision: geometry is
+      // normalized + frozen per API instance before any construction.
+      const wcConfigSnapshot = Object.freeze({ ...(plugin.config || {}) });
+      const wc = buildWindowControlsApi(vm, plugin.id, w, cleanupCallbacks, wcConfigSnapshot);
+      vm.setProp(ctx, "windowControls", wc);
+      wc.dispose();
+    }
     vm.setProp(vm.global, "ctx", ctx);
     ctx.dispose();
 
@@ -2976,6 +3923,18 @@ function start(app, sinks = {}) {
   }
 
   app.on("web-contents-created", (_e, contents) => {
+    // Host-internal surfaces first: the window-controls overlay's WebContents
+    // reports getType() === "window" exactly like a real target, so the type
+    // check below cannot exclude it. The synchronous construction guard covers
+    // events fired re-entrantly inside `new WebContentsView()`; the registry
+    // covers later emissions. Excluded surfaces never enter `windows`: no
+    // plugins load in them and no nested overlay can recurse.
+    if (internalOverlayConstructionDepth > 0) return;
+    try {
+      if (contents && internalOverlayContents.has(contents)) return;
+    } catch (_e) {
+      // Best effort — fall through to the type check.
+    }
     if (contents.getType() !== "window") {
       return;
     }
@@ -3119,6 +4078,8 @@ function reset() {
   currentPlan = { revision: "", plugins: [] };
   planGeneration = 0;
   windows.clear();
+  internalOverlayContents.clear();
+  internalOverlayConstructionDepth = 0;
   appRef = null;
   activeAdapter = null;
   mainPlugins.clear();
@@ -3238,5 +4199,10 @@ module.exports = {
     maxRendererPluginsPerWindow: () => MAX_RENDERER_PLUGINS_PER_WINDOW,
     drainCount: () => pumpDrainCount,
     quickJSInterruptCount: (vm) => quickJSInterruptCounts.get(vm) || 0,
+    implementedRendererCapabilities: () => [...IMPLEMENTED_RENDERER_CAPABILITIES],
+    implementedLevelTwoCapabilities: () => [...IMPLEMENTED_LEVEL_TWO_CAPABILITIES],
+    implementedLevelTwoDeveloperCapabilities: () => [
+      ...IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES,
+    ],
   },
 };

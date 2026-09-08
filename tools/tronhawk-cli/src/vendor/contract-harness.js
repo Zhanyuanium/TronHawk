@@ -19,8 +19,9 @@
 //   host's watchAsyncActivate/drainThenableResult never inspect it — only a
 //   synchronous non-undefined value fails the void contract). Throw, rejection,
 //   CPU-deadline overrun, or settlement timeout fails.
-// - permission-gated ctx: `logger` always; `script`/`dom`/`css`/`storage` only with
-//   their renderer grants; `window` only with `electron.window`; `network` ALWAYS
+// - permission-gated ctx: `logger` always; `script`/`dom`/`css`/`storage`/
+//   `windowControls` only with their renderer grants; `window` only with
+//   `electron.window`; `network` ALWAYS
 //   present (granted impl, else the denied stub rejecting with
 //   NETWORK_ACCESS_DENIED — the exact string in index.js buildNetworkDeniedApi).
 // - enforcement: fresh per-operation CPU deadline (QUICKJS_CPU_DEADLINE_MS), 64 MiB
@@ -517,6 +518,23 @@ function buildCtx(vm, { pluginId, permissions, kind, logs, calls, ownedDeferreds
     vm.setProp(ctx, "storage", storage);
     storage.dispose();
   }
+  if (kind === "renderer" && hasPermission(permissions, "electron.windowControls")) {
+    const wc = vm.newObject();
+    const mount = vm.newFunction("mount", () => {
+      calls.windowControlsMount.push(true);
+      return settledResult("resolve", () => vm.undefined);
+    });
+    vm.setProp(wc, "mount", mount);
+    mount.dispose();
+    const unmount = vm.newFunction("unmount", () => {
+      calls.windowControlsUnmount.push(true);
+      return settledResult("resolve", () => vm.undefined);
+    });
+    vm.setProp(wc, "unmount", unmount);
+    unmount.dispose();
+    vm.setProp(ctx, "windowControls", wc);
+    wc.dispose();
+  }
   if (kind === "main" && hasPermission(permissions, "electron.window")) {
     const win = vm.newObject();
     const onCreated = vm.newFunction("onCreated", (cbHandle) => {
@@ -650,6 +668,8 @@ function emptyCalls() {
     cssInsert: [],
     domObserve: [],
     domDisconnect: [],
+    windowControlsMount: [],
+    windowControlsUnmount: [],
     windowOnCreated: [],
     windowSetOpacity: [],
     windowSetSize: [],

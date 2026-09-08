@@ -203,6 +203,45 @@ describe("permission-gated ctx", () => {
     expect(report.ok).toBe(true);
     expect(report.calls.windowOnCreated).toEqual([true]);
   });
+
+  test("renderer windowControls mount/unmount requires electron.windowControls", async () => {
+    const denied = await runContractCheck({
+      source: `module.exports = {
+        activate(ctx) {
+          return ctx.windowControls.mount().then(
+            () => ctx.logger.info("UNEXPECTED-RESOLVE"),
+            (e) => ctx.logger.info("DENIED:" + (e && e.message ? e.message : e)),
+          );
+        },
+        deactivate(ctx) {},
+      };`,
+      permissions: RENDERER_PERMS,
+      kind: "renderer",
+    });
+    // Without the grant ctx.windowControls is absent, so the entry throws a
+    // TypeError (cannot read mount of undefined) — still a failing contract.
+    expect(denied.ok).toBe(false);
+
+    const granted = await runContractCheck({
+      source: `module.exports = {
+        activate(ctx) {
+          return ctx.windowControls.mount().then(() => {
+            ctx.logger.info("WC-MOUNTED");
+            return ctx.windowControls.unmount().then(() => ctx.logger.info("WC-UNMOUNTED"));
+          });
+        },
+        deactivate(ctx) {},
+      };`,
+      permissions: [...RENDERER_PERMS, "electron.windowControls"],
+      kind: "renderer",
+    });
+    expect(granted.issues).toEqual([]);
+    expect(granted.ok).toBe(true);
+    expect(logText(granted)).toContain("WC-MOUNTED");
+    expect(logText(granted)).toContain("WC-UNMOUNTED");
+    expect(granted.calls.windowControlsMount).toEqual([true]);
+    expect(granted.calls.windowControlsUnmount).toEqual([true]);
+  });
 });
 
 describe("Gate 3: deadline-bounded promise drain", () => {

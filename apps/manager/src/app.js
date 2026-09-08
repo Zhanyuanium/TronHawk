@@ -48,7 +48,7 @@ const initials = (name) => (name || "?").split(/\s+/).map((word) => word[0]).joi
 const selectedApplication = () => state.applications.find((application) => application.id === state.selectedApplicationId) || state.applications[0];
 const policyFor = (plugin, applicationId = state.selectedApplicationId) => plugin.applicationPolicies.find((policy) => policy.applicationId === applicationId) || { applicationId, enabled: false, grants: [] };
 const grantsAvailableFor = (application) => {
-  if (application?.supportLevel === 2) return ["renderer.css", "renderer.script", "electron.window", ...(state.developerMode ? ["runtime.unsafe"] : [])];
+  if (application?.supportLevel === 2) return ["renderer.css", "renderer.script", "electron.window", "electron.windowControls", ...(state.developerMode ? ["runtime.unsafe"] : [])];
   if (application?.supportLevel === 1) return ["renderer.css", "renderer.script"];
   return [];
 };

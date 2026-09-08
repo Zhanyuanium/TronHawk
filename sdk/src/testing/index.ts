@@ -8,6 +8,7 @@
 export type { PluginPermission } from "./permissions";
 export {
   ALL_PERMISSIONS,
+  IMPLEMENTED_PERMISSIONS,
   deniedError,
   hasGrant,
   normalizeGrants,
@@ -39,6 +40,8 @@ export type {
   TestingApiName,
   TestingMainHarness,
   TestingRendererHarness,
+  WindowControlsMountRecord,
+  WindowControlsUnmountRecord,
 } from "./mocks";
 export {
   createTestingMainContext,
