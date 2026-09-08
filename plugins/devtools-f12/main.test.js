@@ -124,7 +124,7 @@ describe("devtools-f12", () => {
   test("missing ctx.raw warns once and attaches nothing", () => {
     const ctx = { logger: makeLogger() };
     plugin.activate(ctx);
-    expect(ctx.logger.warns.join("\n")).toMatch(/ctx\.raw absent/);
+    expect(ctx.logger.warns.join("\n")).toMatch(/did not provide ctx\.raw\.electron/);
     plugin.deactivate(ctx);
   });
 

@@ -131,6 +131,9 @@ function attachWindow(win, logger) {
     contents.on("before-input-event", handler);
     contents.on("destroyed", entry.destroyedHandler);
   } catch (err) {
+    // Roll back the half-attached listener so a selective failure cannot
+    // leave a live hook without a record.
+    detachWindowAttachment(entry, logger);
     logger.warn("devtools-f12: attach failed: " + describeError(err));
     return false;
   }
@@ -148,8 +151,11 @@ module.exports = {
     try {
       var electron = getElectron(ctx);
       if (!electron) {
+        // Unreachable through the real pipeline (without an effective
+        // `runtime.unsafe` grant the main payload never runs); kept as a
+        // broken-host guard.
         ctx.logger.warn(
-          "devtools-f12: ctx.raw absent (needs developer mode + runtime.unsafe grant); F12 not watched"
+          "devtools-f12: host did not provide ctx.raw.electron; F12 not watched"
         );
         return;
       }
