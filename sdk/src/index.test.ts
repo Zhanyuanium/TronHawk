@@ -43,6 +43,9 @@ test("mock renderer context exposes renderer APIs", () => {
   expect("execute" in ctx.script).toBe(false);
   expect(typeof ctx.storage.get).toBe("function");
   expect(typeof ctx.storage.set).toBe("function");
+  expect(typeof ctx.windowControls.mount).toBe("function");
+  expect(typeof ctx.windowControls.unmount).toBe("function");
+  expect("close" in ctx.windowControls).toBe(false);
   expect(typeof ctx.network.request).toBe("function");
   expect(typeof ctx.logger.info).toBe("function");
 });
@@ -58,6 +61,9 @@ test("mock renderer async APIs resolve; observe returns a disconnect", async () 
 
   expect(await ctx.storage.get("theme")).toBeNull();
   expect(await ctx.storage.set("theme", "dark")).toBeUndefined();
+
+  expect(await ctx.windowControls.mount()).toBeUndefined();
+  expect(await ctx.windowControls.unmount()).toBeUndefined();
 
   const res = await ctx.network.request({ url: "https://example.test/data" });
   expect(res.status).toBe(200);

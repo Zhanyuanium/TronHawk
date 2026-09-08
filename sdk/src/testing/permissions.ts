@@ -1,18 +1,41 @@
 // Permission identifiers for the SDK testing surface.
 //
-// Mirrors the implemented-permissions table in docs/PLUGIN-SDK.md. The
-// testing mocks fail closed on unknown ids: only the permissions listed in a
-// harness's `grants` are allowed, everything else is denied.
+// Known set mirrors `KNOWN_PERMISSIONS` in `crates/package` (the pack-time
+// authority) and the permissions tables in `docs/PLUGIN-SDK.md` / `SPEC.md` /
+// `THX-FORMAT.md`. Implemented subset (wired to a host API today):
+// `renderer.css` / `renderer.script` / `renderer.dom` / `renderer.storage` /
+// `electron.window` / `electron.windowControls` / `network.access` /
+// `runtime.unsafe`. Future (declared, no host surface yet): `electron.webContents`
+// / `electron.session` / `electron.ipc` / `network.proxy`. The testing mocks
+// fail closed on unknown ids: only the permissions listed in a harness's
+// `grants` are allowed, everything else is denied.
 
-/** Plugin permission ids recognized by the testing mocks. */
+/** Every known plugin permission id (pack-time authority: `tronhawk-package`). */
 export type PluginPermission =
   | "renderer.css"
   | "renderer.script"
   | "renderer.dom"
   | "renderer.storage"
   | "electron.window"
+  | "electron.windowControls"
+  | "electron.webContents"
+  | "electron.session"
+  | "electron.ipc"
   | "network.access"
+  | "network.proxy"
   | "runtime.unsafe";
+
+/** Permissions wired to a host API today (see `docs/PLUGIN-SDK.md`). */
+export const IMPLEMENTED_PERMISSIONS: readonly PluginPermission[] = [
+  "renderer.css",
+  "renderer.script",
+  "renderer.dom",
+  "renderer.storage",
+  "electron.window",
+  "electron.windowControls",
+  "network.access",
+  "runtime.unsafe",
+];
 
 /** Every known permission id. Useful for harnesses that need full grants. */
 export const ALL_PERMISSIONS: readonly PluginPermission[] = [
@@ -21,7 +44,12 @@ export const ALL_PERMISSIONS: readonly PluginPermission[] = [
   "renderer.dom",
   "renderer.storage",
   "electron.window",
+  "electron.windowControls",
+  "electron.webContents",
+  "electron.session",
+  "electron.ipc",
   "network.access",
+  "network.proxy",
   "runtime.unsafe",
 ];
 

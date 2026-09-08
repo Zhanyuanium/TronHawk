@@ -37,6 +37,8 @@ export type TestingApiName =
   | "script.setDocumentTitle"
   | "storage.get"
   | "storage.set"
+  | "windowControls.mount"
+  | "windowControls.unmount"
   | "network.request"
   | "window.onCreated"
   | "window.setOpacity"
@@ -91,6 +93,12 @@ export interface StorageSetRecord {
   key: string;
   value: string;
 }
+export interface WindowControlsMountRecord {
+  seq: number;
+}
+export interface WindowControlsUnmountRecord {
+  seq: number;
+}
 
 /** Successful-call records for a renderer harness, plus the ordered log. */
 export interface RendererCalls {
@@ -102,6 +110,8 @@ export interface RendererCalls {
   networkRequest: NetworkRequestRecord[];
   storageGet: StorageGetRecord[];
   storageSet: StorageSetRecord[];
+  windowControlsMount: WindowControlsMountRecord[];
+  windowControlsUnmount: WindowControlsUnmountRecord[];
   ordered: OrderedCall[];
 }
 
@@ -255,6 +265,8 @@ export function createTestingRendererContext(
     networkRequest: [],
     storageGet: [],
     storageSet: [],
+    windowControlsMount: [],
+    windowControlsUnmount: [],
     ordered,
   };
   const loggerMessages: LoggerMessage[] = [];
@@ -368,6 +380,28 @@ export function createTestingRendererContext(
         if (denied) throw deniedError("renderer.storage", "storage.set");
         calls.storageSet.push({ seq, key, value });
         storage.set(key, value);
+      },
+    },
+    windowControls: {
+      mount: async (): Promise<void> => {
+        const denied = !granted.has("electron.windowControls");
+        const seq = record("windowControls.mount", [], denied);
+        if (denied)
+          throw deniedError(
+            "electron.windowControls",
+            "windowControls.mount",
+          );
+        calls.windowControlsMount.push({ seq });
+      },
+      unmount: async (): Promise<void> => {
+        const denied = !granted.has("electron.windowControls");
+        const seq = record("windowControls.unmount", [], denied);
+        if (denied)
+          throw deniedError(
+            "electron.windowControls",
+            "windowControls.unmount",
+          );
+        calls.windowControlsUnmount.push({ seq });
       },
     },
     ...(granted.has("runtime.unsafe")

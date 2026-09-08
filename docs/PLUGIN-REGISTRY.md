@@ -105,7 +105,9 @@ is `low`.
 | `renderer.css` | low |
 | `renderer.script` | medium |
 | `renderer.dom` | medium |
+| `renderer.storage` | low |
 | `electron.window` | high |
+| `electron.windowControls` | high |
 | `electron.webContents` | medium |
 | `electron.session` | medium |
 | `electron.ipc` | high |

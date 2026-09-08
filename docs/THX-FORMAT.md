@@ -55,8 +55,9 @@ Top-level shape (unknown fields are rejected):
   - `permissions`: array of known permission strings (default `[]`); unknown
     or duplicate entries are rejected. Known values:
     `renderer.css`, `renderer.script`, `renderer.dom`, `renderer.storage`,
-    `electron.window`, `electron.webContents`, `electron.session`,
-    `electron.ipc`, `network.access`, `network.proxy`, `runtime.unsafe`.
+    `electron.window`, `electron.windowControls`, `electron.webContents`,
+    `electron.session`, `electron.ipc`, `network.access`, `network.proxy`,
+    `runtime.unsafe`.
   - `css` (inline CSS string) **or** `entry.css` (CSS file path) — the two are
     mutually exclusive. A CSS source requires the `renderer.css` permission.
     CSS is **data** injected via `insertCSS`, never executed as JS.
@@ -65,7 +66,7 @@ Top-level shape (unknown fields are rejected):
     when the runtime escape hatch applies. At runtime `renderer.script` is the
     execution gate for renderer JS (an effective `renderer.script` grant or the
     Developer-mode `runtime.unsafe` escape hatch; `renderer.dom` /
-    `renderer.storage` / `renderer.css` are additional
+    `renderer.storage` / `renderer.css` / `electron.windowControls` are additional
     capabilities only and never substitute for the gate at either layer; without
     the gate Core `execution_plan` drops the renderer payload and records
     `core.renderer.script_required`). Entries are executable

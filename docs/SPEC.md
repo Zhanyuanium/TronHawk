@@ -139,11 +139,14 @@ Execution contexts:
   and callback CPU deadlines. `renderer.script` only allows the host-owned document-title setter
   (ADR 0002); `renderer.dom` query/observe is implemented as async host functions returning
   serialized `DomElement` snapshots (ADR 0008); renderer-only `ctx.storage` is host-namespaced per
-  plugin (`tronhawk:<pluginId>:<key>`); raw localStorage / IndexedDB (future).
+  plugin (`tronhawk:<pluginId>:<key>`); `electron.windowControls` mounts a host-hosted declarative
+  traffic-light overlay (fixed style, current-window minimize / toggle-maximize / close, no plugin
+  handle); raw localStorage / IndexedDB (future).
 - **Main** (Node/Electron): BrowserWindow, session, webContents, IPC — via TronHawk APIs, not raw
   Electron; window APIs (`setOpacity`/`setSize`/`setPosition`) run via the QuickJS sandbox.
 - **Async host functions** (ADR 0008): `ctx.network.request` (main + renderer), `ctx.dom.query`
-  (renderer), and `ctx.storage` (renderer) are real Promise APIs backed by an **in-process
+  (renderer), `ctx.storage` (renderer), and `ctx.windowControls.mount` / `unmount`
+  (renderer, `electron.windowControls`) are real Promise APIs backed by an **in-process
   host-driven pending-job pump** over the synchronous QuickJS VM (`vm.newPromise()` +
   `executePendingJobs()`). `activate`/`deactivate` may return a Promise the runtime drains.
   Lifecycle-**event** callbacks (`onCreated`/`onLoad`/`onRendererReady`/`onUnload`) and
@@ -202,6 +205,7 @@ privileged API verifies permission first.
 | `renderer.dom` | read DOM via serialized `DomElement` snapshots (`query`/`observe`) | medium |
 | `renderer.storage` | read/write this plugin's own host-namespaced storage (strings, bounded) | low |
 | `electron.window` | modify window (`setOpacity`, `setVibrancy`) | high |
+| `electron.windowControls` | host-hosted declarative traffic lights (`ctx.windowControls.mount` / `unmount`, fixed style, current-window minimize / toggle-maximize / close) | high |
 | `electron.webContents` | page load, DevTools (future) | — |
 | `electron.session` | UA, proxy, cookies (future) | — |
 | `electron.ipc` | observe / intercept IPC (future) | high |

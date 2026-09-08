@@ -34,16 +34,19 @@ const IMPLEMENTED_LEVEL_TWO_CAPABILITIES: &[&str] = &[
     "renderer.dom",
     "renderer.storage",
     "electron.window",
+    "electron.windowControls",
     "network.access",
 ];
 /// Level-2 capability set while Developer mode is enabled: the normal Level-2 set plus
 /// `runtime.unsafe`. Developer mode never bypasses the support level — Level 0/1 are unchanged.
+/// `electron.windowControls` is a normal Level-2 capability (not a developer-only add-on).
 const IMPLEMENTED_LEVEL_TWO_DEVELOPER_CAPABILITIES: &[&str] = &[
     "renderer.css",
     "renderer.script",
     "renderer.dom",
     "renderer.storage",
     "electron.window",
+    "electron.windowControls",
     "network.access",
     "runtime.unsafe",
 ];
@@ -1975,9 +1978,9 @@ impl CoreService {
             // validation): pack-time — `entry.renderer` MUST declare `renderer.script`;
             // runtime — the effective grant must contain `renderer.script` or the
             // Developer-mode `runtime.unsafe` escape hatch. `renderer.dom` /
-            // `renderer.storage` / `renderer.css` are additional capabilities only and never
-            // substitute for the gate at either layer. Without the gate the renderer payload
-            // is dropped here and never runs.
+            // `renderer.storage` / `renderer.css` / `electron.windowControls` are additional
+            // capabilities only and never substitute for the gate at either layer. Without
+            // the gate the renderer payload is dropped here and never runs.
             //
             // The drop event is edge-triggered: this function is recomputed on every ~2s
             // runtime poll (plus log/network authorization recomputes), so
@@ -2003,7 +2006,7 @@ impl CoreService {
                          execution gate for renderer JS, `runtime.unsafe` is the Developer-mode \
                          escape hatch that unlocks it at runtime; pack-time rule `tronhawk-package` \
                          still requires `entry.renderer` to declare `renderer.script`; \
-                         `renderer.dom`/`renderer.storage`/`renderer.css` are additional \
+                         `renderer.dom`/`renderer.storage`/`renderer.css`/`electron.windowControls` are additional \
                          capabilities only)"
                     );
                     self.append_core_event(
@@ -3638,6 +3641,71 @@ mod tests {
             serde_json::json!(["electron.window"])
         );
         assert_eq!(two_plan["plugins"][0]["main"], "main source");
+    }
+
+    #[test]
+    fn window_controls_is_level_two_and_passes_through_effective_grants() {
+        // `electron.windowControls` is a normal Level-2 capability (high risk, host-hosted
+        // declarative overlay): grantable at Level 2 with or without Developer mode, never
+        // at Level 1/0, and Developer mode adds only `runtime.unsafe`.
+        assert!(capabilities_for_support_level(2, false).contains(&"electron.windowControls"));
+        assert!(capabilities_for_support_level(2, true).contains(&"electron.windowControls"));
+        assert!(!capabilities_for_support_level(1, false).contains(&"electron.windowControls"));
+        assert!(!capabilities_for_support_level(1, true).contains(&"electron.windowControls"));
+        assert!(capabilities_for_support_level(0, false).is_empty());
+
+        let temp = TempRoot::new("window-controls-level");
+        let level_one = temp.executable("One.exe");
+        let level_two = temp.executable("Two.exe");
+        let package = temp.package_with_permissions(
+            "plugin",
+            "com.example.daemon",
+            "1.0.0",
+            &[
+                "renderer.css",
+                "renderer.script",
+                "electron.windowControls",
+                "runtime.unsafe",
+            ],
+        );
+        let (service, control) = service(&temp);
+        let one_id = register(&service, &control, &level_one, 1);
+        let two_id = register(&service, &control, &level_two, 2);
+        install_package(&service, &control, &package);
+
+        // Level 1 cannot grant the overlay (unavailable at support level).
+        assert_eq!(
+            error_code(set_policy(
+                &service,
+                &control,
+                &one_id,
+                true,
+                &["electron.windowControls"],
+            )),
+            -32602
+        );
+        // Level 2 grants it with or without Developer mode (no dev-only gate).
+        ok(set_policy(
+            &service,
+            &control,
+            &two_id,
+            true,
+            &["renderer.script", "electron.windowControls"],
+        ));
+        let token = launch_token(&service, &control, &level_two);
+        let execution = plan(&service, &token);
+        assert_eq!(
+            execution["plugins"][0]["granted"],
+            serde_json::json!(["renderer.script", "electron.windowControls"])
+        );
+        // The renderer payload survives because the `renderer.script` execution gate is
+        // satisfied; `electron.windowControls` is an additional capability only and never
+        // substitutes for the gate (a windowControls-only grant still drops the payload,
+        // covered by the script_required gate test).
+        assert_eq!(
+            execution["plugins"][0]["renderer"],
+            serde_json::json!("renderer source")
+        );
     }
 
     #[test]

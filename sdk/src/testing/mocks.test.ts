@@ -29,6 +29,10 @@ test("renderer mocks deny by default: no grants, no silent success", async () =>
     /renderer\.storage not granted/,
   );
   await expect(ctx.storage.set("k", "v")).rejects.toThrow(/not granted/);
+  await expect(ctx.windowControls.mount()).rejects.toThrow(
+    /electron\.windowControls not granted/,
+  );
+  await expect(ctx.windowControls.unmount()).rejects.toThrow(/not granted/);
   await expect(
     ctx.network.request({ url: "https://example.test/" }),
   ).rejects.toThrow(/network\.access not granted/);
@@ -52,6 +56,33 @@ test("renderer mocks allow grant-by-grant: css only", async () => {
   await expect(ctx.dom.query("a")).rejects.toThrow(/not granted/);
   expect(() => ctx.script.setDocumentTitle("t")).toThrow(/not granted/);
   await expect(ctx.storage.get("k")).rejects.toThrow(/not granted/);
+  await expect(ctx.windowControls.mount()).rejects.toThrow(/not granted/);
+});
+
+test("windowControls mocks gate mount/unmount by electron.windowControls", async () => {
+  const denied = createTestingRendererContext({ grants: ["renderer.script"] });
+  await expect(denied.ctx.windowControls.mount()).rejects.toThrow(
+    /electron\.windowControls not granted/,
+  );
+  await expect(denied.ctx.windowControls.unmount()).rejects.toThrow(
+    /electron\.windowControls not granted/,
+  );
+  expect(denied.calls.ordered.every((c) => c.denied)).toBe(true);
+  expect(denied.calls.windowControlsMount).toEqual([]);
+  expect(denied.calls.windowControlsUnmount).toEqual([]);
+
+  const granted = createTestingRendererContext({
+    grants: ["electron.windowControls"],
+  });
+  await granted.ctx.windowControls.mount();
+  await granted.ctx.windowControls.unmount();
+  expect(granted.calls.windowControlsMount).toHaveLength(1);
+  expect(granted.calls.windowControlsUnmount).toHaveLength(1);
+  expect(granted.calls.ordered.map((c) => c.api)).toEqual([
+    "windowControls.mount",
+    "windowControls.unmount",
+  ]);
+  expect(granted.calls.ordered.every((c) => !c.denied)).toBe(true);
 });
 
 test("main mocks gate window/events by electron.window", async () => {
