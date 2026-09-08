@@ -113,56 +113,67 @@ tests/             集成测试（pwsh tests/integration.ps1）
 
 ### 构建 Rust workspace
 
-```sh
+```pwsh
 bun install          # 链接 JS workspaces（sdk、plugins/*、tools/*）
-cargo build --workspace
 ```
 
-构建运行时 JS 包（新克隆后跑一次即可 ——
+先构建运行时 JS 包（新克隆后跑一次即可 ——
 `crates/runtime/assets/runtime.js` 是 gitignored 的构建产物）：
 
-```sh
-cd crates/runtime/js && bun install && bun run build
+```pwsh
+Push-Location crates/runtime/js; bun install; bun run build; Pop-Location
+```
+
+再构建 Manager 内嵌的 sidecar 二进制，并 stage 到
+`apps/manager/src-tauri/binaries/`（构建/测试完整 workspace 之前必需 ——
+`tauri-build` 会校验 `tauri.conf.json` 里 `externalBin`/`resources` 路径存在）：
+
+```pwsh
+cargo build -p tronhawk-core -p tronhawk-injector
+Push-Location apps/manager; bun install; bun run stage:core; Pop-Location
+```
+
+然后完整 workspace（含 Tauri Manager）才能构建：
+
+```pwsh
+cargo build --workspace
 ```
 
 ### 跑测试
 
-```sh
+完整 workspace 的 Rust 测试同样要求先完成上面的 stage（Manager 构建脚本会校验已 stage 的 sidecar）：
+
+```pwsh
 cargo test --workspace                # Rust 单元测试
 
-cd sdk && bun test && bun run typecheck   # SDK 测试 + 类型检查
-cd plugins/ui-tweaks && bun run typecheck
+Push-Location sdk; bun test; bun run typecheck; Pop-Location   # SDK 测试 + 类型检查
+Push-Location plugins/ui-tweaks; bun run typecheck; Pop-Location
 
 pwsh tests/integration.ps1            # 端到端：经注入器启动 test-app
 ```
 
 ### 试用 SDK 和示例插件
 
-```sh
-cd sdk && bun install && bun test
-cd plugins/ui-tweaks                # 看 manifest.json + src/ 了解插件形状
+```pwsh
+Push-Location sdk; bun install; bun test; Pop-Location
 ```
 
 ### 跑 Manager（Tauri 图形界面）
 
-```sh
-cd apps/manager
-bun install
-bun run tauri dev
+```pwsh
+Push-Location apps/manager; bun install; bun run stage:core; bun run tauri dev; Pop-Location
 ```
 
 打出应用包（先 stage Core sidecar）：
 
-```sh
-cd apps/manager && bun run bundle
+```pwsh
+Push-Location apps/manager; bun run bundle; Pop-Location
 ```
 
 ### 跑确定性测试应用（Electron）
 
-```sh
-cd apps/test-app
-bun install
-bun start
+```pwsh
+Push-Location apps/test-app; bun install; bun start; Pop-Location
 ```
 
 `apps/test-app` 是插件开发和集成验证用的确定性 Electron 夹具：固定的

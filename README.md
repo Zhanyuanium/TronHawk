@@ -124,56 +124,69 @@ tests/             Integration tests (pwsh tests/integration.ps1)
 
 ### Build the Rust workspace
 
-```sh
+```pwsh
 bun install          # link the JS workspaces (sdk, plugins/*, tools/*)
-cargo build --workspace
 ```
 
-Build the runtime JS bundle (required once per fresh clone —
+Build the runtime JS bundle first (required once per fresh clone —
 `crates/runtime/assets/runtime.js` is a gitignored build artifact):
 
-```sh
-cd crates/runtime/js && bun install && bun run build
+```pwsh
+Push-Location crates/runtime/js; bun install; bun run build; Pop-Location
+```
+
+Then build the sidecar binaries the Manager embeds, and stage them into
+`apps/manager/src-tauri/binaries/` (required before building/testing the
+full workspace — `tauri-build` validates that the `externalBin`/`resources`
+paths in `tauri.conf.json` exist):
+
+```pwsh
+cargo build -p tronhawk-core -p tronhawk-injector
+Push-Location apps/manager; bun install; bun run stage:core; Pop-Location
+```
+
+Now the full workspace (including the Tauri Manager) builds:
+
+```pwsh
+cargo build --workspace
 ```
 
 ### Run the tests
 
-```sh
+Same staging prerequisite as above applies before the workspace-wide
+Rust tests (the Manager build script validates the staged sidecars):
+
+```pwsh
 cargo test --workspace                # Rust unit tests
 
-cd sdk && bun test && bun run typecheck   # SDK tests + typecheck
-cd plugins/ui-tweaks && bun run typecheck
+Push-Location sdk; bun test; bun run typecheck; Pop-Location   # SDK tests + typecheck
+Push-Location plugins/ui-tweaks; bun run typecheck; Pop-Location
 
 pwsh tests/integration.ps1            # end-to-end: launch test-app via injector
 ```
 
 ### Try the SDK and example plugins
 
-```sh
-cd sdk && bun install && bun test
-cd plugins/ui-tweaks                # read manifest.json + src/ for the shape
+```pwsh
+Push-Location sdk; bun install; bun test; Pop-Location
 ```
 
 ### Run the Manager (Tauri GUI)
 
-```sh
-cd apps/manager
-bun install
-bun run tauri dev
+```pwsh
+Push-Location apps/manager; bun install; bun run stage:core; bun run tauri dev; Pop-Location
 ```
 
 To produce an app bundle (stages the Core sidecar first):
 
-```sh
-cd apps/manager && bun run bundle
+```pwsh
+Push-Location apps/manager; bun run bundle; Pop-Location
 ```
 
 ### Run the deterministic test app (Electron)
 
-```sh
-cd apps/test-app
-bun install
-bun start
+```pwsh
+Push-Location apps/test-app; bun install; bun start; Pop-Location
 ```
 
 `apps/test-app` is the deterministic Electron fixture used for plugin

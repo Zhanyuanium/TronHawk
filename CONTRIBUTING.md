@@ -30,36 +30,49 @@ public plugin API.
 ```sh
 git clone <your-fork>
 bun install                # link JS workspaces: sdk, plugins/*, tools/*
-cargo build --workspace    # build the Rust workspace
+```
+
+Build the runtime JS bundle first (gitignored artifact), then the
+sidecars, stage them for the Manager, and only then build the full
+workspace (`tauri-build` validates the staged `tauri.conf.json`
+`externalBin`/`resources` paths):
+
+```pwsh
+Push-Location crates/runtime/js; bun install; bun run build; Pop-Location
+cargo build -p tronhawk-core -p tronhawk-injector
+Push-Location apps/manager; bun install; bun run stage:core; Pop-Location
+cargo build --workspace
 ```
 
 The Manager and test-app keep their own JS dependency trees:
 
-```sh
-cd apps/manager   && bun install   # Tauri GUI
-cd apps/test-app  && bun install   # Electron fixture (downloads Electron)
+```pwsh
+Push-Location apps/manager; bun install; Pop-Location   # Tauri GUI
+Push-Location apps/test-app; bun install; Pop-Location  # Electron fixture (downloads Electron)
 ```
 
 ## Running tests
 
-Rust:
+Rust (requires the same runtime.js + sidecar staging as Setup above,
+otherwise the Manager build script fails on the missing
+`src-tauri/binaries/` paths):
 
-```sh
+```pwsh
 cargo test --workspace
 cargo build --workspace
 ```
 
 TypeScript (SDK) and example plugins:
 
-```sh
-cd sdk && bun test && bun run typecheck
-cd plugins/ui-tweaks && bun run typecheck
+```pwsh
+Push-Location sdk; bun test; bun run typecheck; Pop-Location
+Push-Location plugins/ui-tweaks; bun run typecheck; Pop-Location
 ```
 
 Scaffolder CLI (`tools/create-tronhawk-plugin`):
 
-```sh
-cd tools/create-tronhawk-plugin && bun test
+```pwsh
+Push-Location tools/create-tronhawk-plugin; bun test; Pop-Location
 ```
 
 Integration (launches `apps/test-app` through the injector against a real Core
@@ -69,9 +82,12 @@ daemon and verifies durable logs):
 pwsh tests/integration.ps1
 ```
 
-CI (`.github/workflows/ci.yml`) runs these same checks on push/PR: `cargo
-test` + `cargo build` (Windows), SDK typecheck/tests + example-plugin
-typecheck (bun), and the integration script (Windows).
+CI (`.github/workflows/ci.yml`) runs these same checks on push/PR:
+`runtime.js` bundle build + `cargo build -p tronhawk-core
+-p tronhawk-injector`, sidecar staging into
+`apps/manager/src-tauri/binaries/`, then `cargo test --workspace` +
+`cargo build --workspace` (Windows), SDK typecheck/tests +
+example-plugin typecheck (bun), and the integration script (Windows).
 
 ## Development workflow
 
