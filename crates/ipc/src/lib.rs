@@ -11,6 +11,8 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+#[cfg(feature = "async-client")]
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 
 /// Protocol version carried in every message.
 pub const PROTOCOL_VERSION: &str = "0.1";
@@ -286,6 +288,50 @@ fn next_call_id() -> u64 {
     NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Build one outbound request with a freshly allocated per-call `id`. Shared by the sync
+/// (`call`) and async (`call_async`) clients so both sides allocate ids and lay out the
+/// envelope identically.
+fn new_request(secret: &str, method: &str, params: serde_json::Value) -> Request {
+    Request {
+        version: PROTOCOL_VERSION.into(),
+        id: next_call_id(),
+        method: method.to_owned(),
+        params,
+        secret: secret.to_owned(),
+    }
+}
+
+/// Encode one request frame: canonical `serde_json::to_string` plus a single trailing `\n`.
+/// Shared by the sync and async clients so the wire bytes are identical.
+fn encode_request_frame(request: &Request) -> Result<Vec<u8>, String> {
+    let mut line = serde_json::to_string(request)
+        .map_err(|error| format!("failed to encode the Core request: {error}"))?;
+    line.push('\n');
+    Ok(line.into_bytes())
+}
+
+/// Validate the `getServerProof` payload against `token`/`challenge`. Shared by the sync
+/// (`verify_server`) and async (`verify_server_async`) identity probes so error strings and
+/// proof checks can never drift apart.
+fn validate_server_proof(
+    response: &serde_json::Value,
+    token: &str,
+    challenge: &str,
+) -> Result<(), String> {
+    let proof = response
+        .get("proof")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Core returned a malformed server proof".to_owned())?;
+    if !is_lowercase_hex(proof) || proof.len() != 64 {
+        return Err("Core returned an invalid server proof".into());
+    }
+    let expected = compute_server_proof(token, challenge);
+    if !constant_time_eq(proof.as_bytes(), expected.as_bytes()) {
+        return Err("Core server identity verification failed".into());
+    }
+    Ok(())
+}
+
 /// Perform one bounded, newline-delimited JSON-RPC round-trip against the local Core daemon on
 /// `127.0.0.1:port`, authenticating with `secret`. The request carries a freshly allocated
 /// per-call `id`; the response is validated to carry the matching `id`, a supported protocol
@@ -302,14 +348,8 @@ pub fn call(
     params: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
-    let id = next_call_id();
-    let request = Request {
-        version: PROTOCOL_VERSION.into(),
-        id,
-        method: method.to_owned(),
-        params,
-        secret: secret.to_owned(),
-    };
+    let request = new_request(secret, method, params);
+    let id = request.id;
 
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let mut stream = TcpStream::connect_timeout(&address.into(), timeout)
@@ -319,11 +359,9 @@ pub fn call(
         .and_then(|_| stream.set_write_timeout(Some(timeout)))
         .map_err(|error| format!("failed to configure the Core connection: {error}"))?;
 
-    let request_line = serde_json::to_string(&request)
-        .map_err(|error| format!("failed to encode the Core request: {error}"))?;
+    let request_bytes = encode_request_frame(&request)?;
     stream
-        .write_all(request_line.as_bytes())
-        .and_then(|_| stream.write_all(b"\n"))
+        .write_all(&request_bytes)
         .and_then(|_| stream.flush())
         .map_err(|error| format!("failed to send the Core request: {error}"))?;
 
@@ -398,18 +436,7 @@ pub fn verify_server(port: u16, token: &str, timeout: Duration) -> Result<(), St
         serde_json::json!({ "challenge": challenge }),
         timeout,
     )?;
-    let proof = response
-        .get("proof")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Core returned a malformed server proof".to_owned())?;
-    if !is_lowercase_hex(proof) || proof.len() != 64 {
-        return Err("Core returned an invalid server proof".into());
-    }
-    let expected = compute_server_proof(token, &challenge);
-    if !constant_time_eq(proof.as_bytes(), expected.as_bytes()) {
-        return Err("Core server identity verification failed".into());
-    }
-    Ok(())
+    validate_server_proof(&response, token, &challenge)
 }
 
 /// Perform one authenticated control RPC, but only after the peer has proven it holds the
@@ -426,6 +453,147 @@ pub fn call_control(
 ) -> Result<serde_json::Value, String> {
     verify_server(port, token, timeout)?;
     call(port, token, method, params, timeout)
+}
+
+/// Read one newline-terminated frame over an async buffered stream, enforcing the same size
+/// cap as the sync [`read_frame`]. The returned string includes the terminating newline when
+/// the frame is complete, so callers can tell a complete frame apart from a final partial
+/// frame delivered at EOF. Content length (excluding the newline) is what counts against
+/// [`MAX_FRAME_SIZE`]. Byte-for-byte the same framing rule as the sync path; only the I/O
+/// polling is async.
+#[cfg(feature = "async-client")]
+async fn read_frame_async(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None); // EOF with no data
+            }
+            // A final partial frame without a trailing newline.
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > MAX_FRAME_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if buf.len() + available.len() > MAX_FRAME_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
+        }
+        let chunk: Vec<u8> = available.to_vec();
+        let len = chunk.len();
+        buf.extend_from_slice(&chunk);
+        reader.consume(len);
+    }
+}
+
+/// Async variant of [`call`]: one bounded, newline-delimited JSON-RPC round-trip against the
+/// local Core daemon on `127.0.0.1:port`, authenticating with `secret`.
+///
+/// The wire format is identical to the sync path — the request is built by [`new_request`],
+/// encoded by [`encode_request_frame`], and the response is validated by
+/// [`decode_response_frame`] — so the daemon cannot tell the two clients apart. `timeout`
+/// bounds connect, send, and read individually (the same per-operation semantics as the sync
+/// socket timeouts); every failure maps to the same `String` prefixes as [`call`].
+#[cfg(feature = "async-client")]
+pub async fn call_async(
+    port: u16,
+    secret: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout_duration: Duration,
+) -> Result<serde_json::Value, String> {
+    let request = new_request(secret, method, params);
+    let id = request.id;
+    let request_bytes = encode_request_frame(&request)?;
+
+    let mut stream = tokio::time::timeout(
+        timeout_duration,
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|elapsed| format!("Core is unavailable at 127.0.0.1:{port}: {elapsed}"))?
+    .map_err(|error| format!("Core is unavailable at 127.0.0.1:{port}: {error}"))?;
+
+    tokio::time::timeout(timeout_duration, async {
+        stream.write_all(&request_bytes).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|elapsed| format!("failed to send the Core request: {elapsed}"))?
+    .map_err(|error: std::io::Error| format!("failed to send the Core request: {error}"))?;
+
+    let mut reader = tokio::io::BufReader::new(stream);
+    let frame = tokio::time::timeout(timeout_duration, read_frame_async(&mut reader))
+        .await
+        .map_err(|elapsed| format!("failed to read the Core response: {elapsed}"))?
+        .map_err(|error: std::io::Error| {
+            format!("failed to read the Core response: {error}")
+        })?;
+    let frame = match frame {
+        Some(frame) => frame,
+        None => return Err("Core closed the connection without a response".into()),
+    };
+    if !frame.ends_with('\n') {
+        return Err("Core returned an unterminated response frame".into());
+    }
+    decode_response_frame(&frame, id)
+}
+
+/// Async variant of [`verify_server`]: ask the peer to prove it holds `token` before any
+/// secret is disclosed to it. Challenge generation, proof comparison, error strings, and the
+/// `timeout` budget are identical to the sync probe.
+#[cfg(feature = "async-client")]
+pub async fn verify_server_async(
+    port: u16,
+    token: &str,
+    timeout_duration: Duration,
+) -> Result<(), String> {
+    let mut challenge_bytes = [0_u8; 32];
+    OsRng
+        .try_fill_bytes(&mut challenge_bytes)
+        .map_err(|error| format!("failed to generate a server-proof challenge: {error}"))?;
+    let challenge = hex_encode(&challenge_bytes);
+
+    let response = call_async(
+        port,
+        "",
+        "getServerProof",
+        serde_json::json!({ "challenge": challenge }),
+        timeout_duration,
+    )
+    .await?;
+    validate_server_proof(&response, token, &challenge)
+}
+
+/// Async variant of [`call_control`]: verify the peer via [`verify_server_async`] and only
+/// then send the control token via [`call_async`]. The token is never sent to an unverified
+/// peer.
+///
+/// **Control-token calls MUST use `call_control_async`, never bare [`call_async`]** — a bare
+/// call leaks the control credential to whatever process happens to own the port.
+#[cfg(feature = "async-client")]
+pub async fn call_control_async(
+    port: u16,
+    token: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout_duration: Duration,
+) -> Result<serde_json::Value, String> {
+    verify_server_async(port, token, timeout_duration).await?;
+    call_async(port, token, method, params, timeout_duration).await
 }
 
 fn is_lowercase_hex(value: &str) -> bool {
@@ -934,5 +1102,229 @@ mod tests {
             .expect("timed out waiting for the slow response");
         assert!(slow_response.contains("\"slow\":true"));
         drop(server);
+    }
+
+    #[test]
+    fn sync_and_async_share_the_same_request_encoding() {
+        let request = Request {
+            version: PROTOCOL_VERSION.into(),
+            id: 42,
+            method: "ping".into(),
+            params: serde_json::json!({ "a": 1 }),
+            secret: "secret".into(),
+        };
+        let encoded = encode_request_frame(&request).unwrap();
+        let expected = format!("{}\n", serde_json::to_string(&request).unwrap());
+        assert_eq!(encoded, expected.into_bytes());
+        assert!(encoded.ends_with(b"\n"));
+    }
+
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_client_round_trip_ok_against_a_sync_server() {
+        let port = spawn_reply_server(|request| {
+            json_frame(&serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": request["id"],
+                "result": { "ok": true }
+            }))
+        });
+        let result = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!({ "ok": true }));
+    }
+
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_client_surfaces_rpc_error_with_the_sync_prefix() {
+        let port = spawn_reply_server(|request| {
+            json_frame(&serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": request["id"],
+                "error": { "code": -32601, "message": "not found" }
+            }))
+        });
+        let error = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("(-32601)"), "error: {error}");
+        assert!(error.contains("not found"), "error: {error}");
+    }
+
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_client_rejects_bad_frames_with_sync_errors() {
+        // Wrong id.
+        let port = spawn_reply_server(|request| {
+            json_frame(&serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": request["id"].as_u64().unwrap() + 1,
+                "result": { "unexpected": true }
+            }))
+        });
+        let error = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("id did not match"), "error: {error}");
+
+        // Unterminated frame.
+        let port =
+            spawn_reply_server(|_| b"{\"version\":\"0.1\",\"id\":1,\"result\":null}".to_vec());
+        let error = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unterminated"), "error: {error}");
+
+        // Oversized frame.
+        let port = spawn_reply_server(|_| {
+            let mut oversized = vec![b'x'; MAX_FRAME_SIZE + 1];
+            oversized.push(b'\n');
+            oversized
+        });
+        let error = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("frame too large"), "error: {error}");
+    }
+
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_client_reports_connection_refused_like_sync() {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("Core is unavailable"), "error: {error}");
+    }
+
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_client_times_out_a_hung_server_with_the_sync_prefix() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = stream.write_all(b"{\"version\":\"0.1\",\"id\":1,\"result\":null}\n");
+        });
+        let error = call_async(
+            port,
+            "secret",
+            "ping",
+            serde_json::json!({}),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("failed to read the Core response"),
+            "error: {error}"
+        );
+    }
+
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_call_control_probes_identity_before_sending_the_token() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "ab".repeat(32);
+        let server_token = token.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut probe = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut probe)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(probe.trim_end()).unwrap();
+            assert_eq!(request["method"], "getServerProof");
+            assert_eq!(request["secret"], "");
+            let challenge = request["params"]["challenge"].as_str().unwrap();
+            let reply = serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": request["id"],
+                "result": { "proof": compute_server_proof(&server_token, challenge) }
+            });
+            let mut stream = stream;
+            stream
+                .write_all(serde_json::to_string(&reply).unwrap().as_bytes())
+                .and_then(|_| stream.write_all(b"\n"))
+                .unwrap();
+
+            let (stream, _) = listener.accept().unwrap();
+            let mut control = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut control)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(control.trim_end()).unwrap();
+            assert_eq!(request["method"], "getManagerSnapshot");
+            assert_eq!(request["secret"], server_token);
+            let reply = serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": request["id"],
+                "result": { "ok": true }
+            });
+            let mut stream = stream;
+            stream
+                .write_all(serde_json::to_string(&reply).unwrap().as_bytes())
+                .and_then(|_| stream.write_all(b"\n"))
+                .unwrap();
+        });
+
+        let result = call_control_async(
+            port,
+            &token,
+            "getManagerSnapshot",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!({ "ok": true }));
+        server.join().unwrap();
     }
 }

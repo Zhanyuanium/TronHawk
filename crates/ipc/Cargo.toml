@@ -9,3 +9,15 @@ serde_json = "1"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+# Async client only (`call_async`, `verify_server_async`, `call_control_async`). Sync
+# consumers (the Core daemon, the injector launcher) build without Tokio by default.
+tokio = { version = "1", features = ["net", "time", "io-util", "rt"], optional = true }
+
+[dev-dependencies]
+# Test-only Tokio: the async client tests (`#[tokio::test]`) need `macros`; sync tests use
+# std only and never touch this.
+tokio = { version = "1", features = ["net", "time", "io-util", "rt", "macros"] }
+
+[features]
+default = []
+async-client = ["dep:tokio"]

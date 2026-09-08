@@ -11,7 +11,7 @@ const supportLevelInput = document.querySelector("#support-level");
 const removeApplicationDialog = document.querySelector("#remove-application-dialog");
 const removeApplicationForm = document.querySelector("#remove-application-form");
 
-const state = {
+let state = {
   view: "applications", status: "loading", applications: [], plugins: [], filter: "all",
   selectedPluginId: undefined, selectedApplicationId: undefined, removePluginId: null,
   removeApplicationId: null,
@@ -48,7 +48,7 @@ const initials = (name) => (name || "?").split(/\s+/).map((word) => word[0]).joi
 const selectedApplication = () => state.applications.find((application) => application.id === state.selectedApplicationId) || state.applications[0];
 const policyFor = (plugin, applicationId = state.selectedApplicationId) => plugin.applicationPolicies.find((policy) => policy.applicationId === applicationId) || { applicationId, enabled: false, grants: [] };
 const grantsAvailableFor = (application) => {
-  if (application?.supportLevel === 2) return ["renderer.css", "renderer.script", "electron.window", ...(state.developerMode ? ["runtime.unsafe"] : [])];
+  if (application?.supportLevel === 2) return ["renderer.css", "renderer.script", "renderer.dom", "renderer.storage", "electron.window", "electron.windowControls", "network.access", ...(state.developerMode ? ["runtime.unsafe"] : [])];
   if (application?.supportLevel === 1) return ["renderer.css", "renderer.script"];
   return [];
 };
@@ -272,16 +272,60 @@ function logRow(event) {
   return `<li class="log-row"><div class="log-event-meta"><div><span class="log-time">${formatLogTimestamp(event.timestampMs)}</span><span class="log-level ${level}">${escapeHtml(event.level)}</span></div><div class="log-context"><span class="log-stream stream-${stream}">${escapeHtml(event.stream)}</span><span class="log-context-item">${t("logs.appContext", { name: escapeHtml(applicationName) })}</span>${plugin}</div></div><div class="log-event-body"><code>${escapeHtml(event.code)}</code><p>${escapeHtml(event.message)}</p></div></li>`;
 }
 
+let renderedPageKey = "";
+let pendingFocusSelector = "";
 function render() {
+  // Arrival belongs to navigation, not a save, background read, or busy-state update.
+  const pageKey = JSON.stringify([state.status, state.view, state.selectedApplicationId, state.view === "permissions" ? state.selectedPluginId : null]);
+  const samePage = pageKey === renderedPageKey;
+  const active = document.activeElement;
+  const scrollPositions = samePage ? [document.scrollingElement, ...appRoot.querySelectorAll(".content, .plugin-picker")].filter(Boolean).map((element) => ({
+    selector: element === document.scrollingElement ? null : `.${element.classList[0]}`,
+    top: element.scrollTop, left: element.scrollLeft,
+  })) : [];
+  if (!samePage) pendingFocusSelector = "";
+  else if (appRoot.contains(active)) {
+    // Data attributes identify controls across replacement, including plugin × grant pairs.
+    pendingFocusSelector = active.id ? `#${CSS.escape(active.id)}` : [...active.attributes]
+      .filter(({ name }) => name.startsWith("data-"))
+      .map(({ name, value }) => `[${name}="${CSS.escape(value)}"]`).join("");
+  } else if (active !== document.body) pendingFocusSelector = "";
   const body = state.status === "loading" ? loading() : state.status === "error" ? failure() : state.view === "applications" ? renderApplications() : state.view === "plugins" ? renderPlugins() : state.view === "permissions" ? renderPermissions() : state.view === "settings" ? renderSettings() : renderLogs();
+  appRoot.classList.toggle("is-page-update", samePage);
   appRoot.innerHTML = state.status === "ready" ? layout(body) : `<main class="content"><div class="page">${body}</div></main>`;
+  for (const change of pendingPolicyChanges.values()) patchPolicyControl(change, true);
+  renderedPageKey = pageKey;
+  const replacement = pendingFocusSelector && appRoot.querySelector(pendingFocusSelector);
+  if (replacement && !replacement.disabled) {
+    replacement.focus({ preventScroll: true });
+    pendingFocusSelector = "";
+  }
+  for (const { selector, top, left } of scrollPositions) {
+    const element = selector ? appRoot.querySelector(selector) : document.scrollingElement;
+    if (element) { element.scrollTop = top; element.scrollLeft = left; }
+  }
 }
 
+let policyRevision = 0;
 async function refreshSnapshot(initial = false) {
+  const revisionAtStart = policyRevision;
   if (initial) { state.status = "loading"; render(); }
+  // Always surface read errors through load()/perform(), including concurrent mutations.
   const snapshot = await service.getSnapshot();
-  state.applications = snapshot.applications;
-  state.plugins = snapshot.plugins;
+  state = { ...state, ...snapshot };
+  for (const [scope, queue] of policyWriteQueues) {
+    const plugin = state.plugins.find((entry) => entry.id === queue.pluginId);
+    const application = state.applications.find((entry) => entry.id === queue.applicationId);
+    if (!queue.changes.length && queue.revision <= revisionAtStart) {
+      if (!plugin || !application) { policyWriteQueues.delete(scope); continue; }
+      queue.committed = copyPolicy(policyFor(plugin, queue.applicationId));
+      queue.desired = copyPolicy(queue.committed);
+      policyWriteQueues.delete(scope);
+    } else {
+      // Protect only this policy, not unrelated install/remove/settings results.
+      publishCommittedPolicy(queue);
+    }
+  }
   state.developerMode = Boolean(snapshot.developerMode);
   if (!state.applications.some((application) => application.id === state.selectedApplicationId)) state.selectedApplicationId = state.applications[0]?.id;
   if (!state.plugins.some((plugin) => plugin.id === state.selectedPluginId)) state.selectedPluginId = state.plugins[0]?.id;
@@ -348,6 +392,109 @@ async function perform(action, successMessage, canceledMessage = null) {
     render();
   }
   return completed;
+}
+
+// A policy write replaces enabled AND grants. Queue by application/plugin, but keep only
+// the individual changed control disabled. Pending overlays also survive unrelated renders.
+const pendingPolicyChanges = new Map();
+// Scope-owned canonical state is independent of the replaceable display snapshot.
+const policyWriteQueues = new Map();
+const copyPolicy = (policy) => ({ enabled: policy.enabled, grants: [...policy.grants] });
+function applyPolicyChange(policy, change) {
+  return {
+    enabled: change.grant === undefined ? change.checked : policy.enabled,
+    grants: change.grant === undefined ? [...policy.grants] : change.checked
+      ? [...new Set([...policy.grants, change.grant])] : policy.grants.filter((grant) => grant !== change.grant),
+  };
+}
+function publishCommittedPolicy(queue) {
+  const plugin = state.plugins.find((entry) => entry.id === queue.pluginId);
+  if (plugin) {
+    const stored = plugin.applicationPolicies.find((entry) => entry.applicationId === queue.applicationId);
+    const policy = copyPolicy(queue.committed);
+    if (stored) Object.assign(stored, policy);
+    else plugin.applicationPolicies.push({ applicationId: queue.applicationId, ...policy });
+  }
+  const application = state.applications.find((entry) => entry.id === queue.applicationId);
+  if (application) application.enabledPluginCount = state.plugins.filter((entry) => policyFor(entry, queue.applicationId).enabled).length;
+}
+function patchPolicyControl(change, pending) {
+  if (state.selectedApplicationId !== change.applicationId) return;
+  const selector = change.grant === undefined
+    ? `[data-toggle-policy="${CSS.escape(change.pluginId)}"]`
+    : `[data-plugin-id="${CSS.escape(change.pluginId)}"][data-toggle-grant="${CSS.escape(change.grant)}"]`;
+  const input = appRoot.querySelector(selector);
+  const plugin = state.plugins.find((entry) => entry.id === change.pluginId);
+  if (!input || !plugin) return;
+  const policy = policyFor(plugin, change.applicationId);
+  const checked = pending ? change.checked : change.grant === undefined ? policy.enabled : policy.grants.includes(change.grant);
+  const available = change.grant === undefined ? selectedApplication()?.supportLevel > 0 : grantsAvailableFor(selectedApplication()).includes(change.grant);
+  input.checked = checked;
+  input.disabled = pending || state.busy || !available;
+  if (change.grant === undefined) {
+    const label = t(checked ? "plugin.toggle.disableFor" : "plugin.toggle.enableFor", { name: plugin.name });
+    input.setAttribute("aria-label", label);
+    input.closest("label").title = available ? label : t("plugin.toggle.disabled");
+    const count = plugin.applicationPolicies.length;
+    input.closest(".plugin-card").querySelector(".plugin-target").textContent = t(count === 1 ? "plugin.policyOne" : "plugin.policyOther", { count });
+  } else {
+    input.setAttribute("aria-label", t(checked ? "permission.revokeAria" : "permission.grantAria", { permission: change.grant }));
+    input.nextElementSibling.textContent = t(!available ? "permission.unavailable" : checked ? "permission.granted" : "permission.withheld");
+  }
+}
+function patchPolicyFeedback() {
+  const page = appRoot.querySelector(".page");
+  if (!page) return;
+  page.querySelector(":scope > .error-banner, :scope > .success-banner")?.remove();
+  page.insertAdjacentHTML("afterbegin", feedback());
+}
+async function togglePolicyControl(input) {
+  const applicationId = state.selectedApplicationId;
+  const pluginId = input.dataset.togglePolicy ?? input.dataset.pluginId;
+  const grant = input.dataset.toggleGrant;
+  const scope = JSON.stringify([applicationId, pluginId]);
+  const key = JSON.stringify([applicationId, pluginId, grant ?? null]);
+  if (!applicationId || !state.plugins.some((plugin) => plugin.id === pluginId)) return;
+  if (pendingPolicyChanges.has(key)) { patchPolicyControl(pendingPolicyChanges.get(key), true); return; }
+  const change = { applicationId, pluginId, grant, checked: input.checked };
+  let queue = policyWriteQueues.get(scope);
+  if (!queue) {
+    const committed = copyPolicy(policyFor(state.plugins.find((plugin) => plugin.id === pluginId), applicationId));
+    queue = { applicationId, pluginId, committed, desired: copyPolicy(committed), changes: [], tail: Promise.resolve() };
+    policyWriteQueues.set(scope, queue);
+  }
+  queue.changes.push(change);
+  queue.desired = queue.changes.reduce(applyPolicyChange, queue.committed);
+  queue.revision = ++policyRevision;
+  pendingPolicyChanges.set(key, change);
+  patchPolicyControl(change, true);
+  state.operationError = ""; state.notice = "";
+  patchPolicyFeedback();
+  const write = queue.tail.then(async () => {
+    try {
+      // Apply only this intent to the last Core-confirmed result, never to display state
+      // or to unconfirmed successor intents. Core's canonical response becomes the base.
+      const policy = applyPolicyChange(queue.committed, change);
+      const canonical = await service.setApplicationPluginPolicy(applicationId, pluginId, policy);
+      queue.committed = copyPolicy(canonical);
+      state.notice = t("msg.pluginPolicyUpdated");
+    } catch (error) {
+      state.operationError = errorMessage(error);
+    } finally {
+      // Mark this scope as newer than reads started before settlement (success or failure).
+      queue.revision = ++policyRevision;
+      queue.changes.shift();
+      // Drop only the settled intent; replay all successors on the canonical base.
+      queue.desired = queue.changes.reduce(applyPolicyChange, queue.committed);
+      publishCommittedPolicy(queue);
+      pendingPolicyChanges.delete(key);
+      patchPolicyControl(change, false);
+      patchPolicyFeedback();
+    }
+  });
+  // Keep canonical state after draining; only an accepted, idle snapshot may rebase it.
+  queue.tail = write.catch(() => {});
+  await write;
 }
 async function loadCoreAutostart() {
   if (state.coreAutostart !== undefined || state.coreAutostartLoading) return;
@@ -475,19 +622,9 @@ appRoot.addEventListener("change", async (event) => {
     }
     return;
   }
-  if (event.target.matches("[data-toggle-policy]")) {
-    const plugin = state.plugins.find((entry) => entry.id === event.target.dataset.togglePolicy);
-    const policy = plugin && policyFor(plugin);
-    if (plugin && policy) await perform(() => service.setApplicationPluginPolicy(state.selectedApplicationId, plugin.id, { enabled: event.target.checked, grants: policy.grants }), t("msg.pluginPolicyUpdated"));
-  }
-  if (event.target.matches("[data-toggle-grant]")) {
-    const plugin = state.plugins.find((entry) => entry.id === event.target.dataset.pluginId);
-    const policy = plugin && policyFor(plugin);
-    if (plugin && policy) {
-      const grant = event.target.dataset.toggleGrant;
-      const grants = event.target.checked ? [...new Set([...policy.grants, grant])] : policy.grants.filter((entry) => entry !== grant);
-      await perform(() => service.setApplicationPluginPolicy(state.selectedApplicationId, plugin.id, { enabled: policy.enabled, grants }), t("msg.pluginPolicyUpdated"));
-    }
+  if (event.target.matches("[data-toggle-policy], [data-toggle-grant]")) {
+    await togglePolicyControl(event.target);
+    return;
   }
   if (event.target.matches("[data-config-field]")) {
     const plugin = state.plugins.find((entry) => entry.id === event.target.dataset.pluginId);

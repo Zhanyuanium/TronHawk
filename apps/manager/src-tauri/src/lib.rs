@@ -54,11 +54,45 @@ fn deserialize_query_logs_result(value: Value) -> Result<QueryLogsResultDto, Str
     serde_json::from_value(value).map_err(|_| "Core returned an invalid log result".to_owned())
 }
 
+/// Internal file-picker outcome. User cancellation (`Some(None)`) and a dropped callback
+/// (`None`, e.g. the dialog owner vanished before answering) both stay externally visible as
+/// `Ok(None)`; the split exists only for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerOutcome {
+    Selected,
+    Cancelled,
+    Abandoned,
+}
+
+fn classify_picker_outcome<T>(received: Option<Option<T>>) -> (PickerOutcome, Option<T>) {
+    match received {
+        Some(Some(selected)) => (PickerOutcome::Selected, Some(selected)),
+        Some(None) => (PickerOutcome::Cancelled, None),
+        None => (PickerOutcome::Abandoned, None),
+    }
+}
+
+fn log_picker_outcome(outcome: PickerOutcome, context: &str) {
+    #[cfg(debug_assertions)]
+    match outcome {
+        PickerOutcome::Selected => {}
+        PickerOutcome::Cancelled => {
+            eprintln!("[manager][debug] {context}: file picker cancelled by user")
+        }
+        PickerOutcome::Abandoned => {
+            eprintln!("[manager][debug] {context}: file picker callback dropped without selection")
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (outcome, context);
+}
+
 #[tauri::command]
-fn get_manager_snapshot(state: State<'_, ManagerState>) -> Result<Value, String> {
+async fn get_manager_snapshot(state: State<'_, ManagerState>) -> Result<Value, String> {
     state
         .core
         .call("getManagerSnapshot", json!({}))
+        .await
         .and_then(redact_manager_snapshot)
 }
 
@@ -67,15 +101,15 @@ fn get_manager_snapshot(state: State<'_, ManagerState>) -> Result<Value, String>
 /// handed straight to the co-located injector launcher, and only a fixed `{ "launched": true }`
 /// acknowledgment (or a fixed, path-free error) ever crosses the WebView boundary.
 #[tauri::command]
-fn launch_application(
+async fn launch_application(
     state: State<'_, ManagerState>,
     application_id: String,
 ) -> Result<Value, String> {
-    state.core.launch(&application_id)
+    state.core.launch(&application_id).await
 }
 
 #[tauri::command]
-fn query_logs(
+async fn query_logs(
     state: State<'_, ManagerState>,
     application_id: Option<String>,
     stream: Option<LogStream>,
@@ -97,12 +131,13 @@ fn query_logs(
                 "limit": limit,
             }),
         )
+        .await
         .map_err(|_| "failed to query Core logs".to_owned())?;
     deserialize_query_logs_result(result)
 }
 
 #[tauri::command]
-fn register_application(
+async fn register_application(
     app: AppHandle,
     state: State<'_, ManagerState>,
     support_level: u8,
@@ -113,7 +148,16 @@ fn register_application(
     #[cfg(not(windows))]
     let picker = picker.add_filter("Applications", &["*"]);
 
-    let Some(selected) = picker.blocking_pick_file() else {
+    // Non-blocking dialog: the callback resolves a oneshot-style channel the async command
+    // awaits, so neither the WebView event loop nor the command worker is parked. Cancel/close
+    // delivers `None` and preserves the `Ok(None)` contract.
+    let (tx, mut rx) = tauri::async_runtime::channel::<Option<tauri_plugin_dialog::FilePath>>(1);
+    picker.pick_file(move |selected| {
+        let _ = tx.try_send(selected);
+    });
+    let (outcome, selected) = classify_picker_outcome(rx.recv().await);
+    log_picker_outcome(outcome, "register_application");
+    let Some(selected) = selected else {
         return Ok(None);
     };
     let path = selected
@@ -122,13 +166,16 @@ fn register_application(
     let path = path
         .to_str()
         .ok_or_else(|| "the selected application path is not valid Unicode".to_owned())?;
-    let result = state.core.call(
-        "registerApplication",
-        json!({
-            "executablePath": path,
-            "supportLevel": support_level,
-        }),
-    )?;
+    let result = state
+        .core
+        .call(
+            "registerApplication",
+            json!({
+                "executablePath": path,
+                "supportLevel": support_level,
+            }),
+        )
+        .await?;
     Ok(Some(redact_application_registration(result)?))
 }
 
@@ -157,40 +204,46 @@ fn redact_application_record(application: &mut Value, context: &str) -> Result<(
 }
 
 #[tauri::command]
-fn set_application_plugin_policy(
+async fn set_application_plugin_policy(
     state: State<'_, ManagerState>,
     application_id: String,
     plugin_id: String,
     enabled: bool,
     grants: Vec<String>,
 ) -> Result<Value, String> {
-    state.core.call(
-        "setApplicationPluginPolicy",
-        json!({
-            "applicationId": application_id,
-            "pluginId": plugin_id,
-            "enabled": enabled,
-            "grants": grants,
-        }),
-    )
+    state
+        .core
+        .call(
+            "setApplicationPluginPolicy",
+            json!({
+                "applicationId": application_id,
+                "pluginId": plugin_id,
+                "enabled": enabled,
+                "grants": grants,
+            }),
+        )
+        .await
 }
 
 /// Reads the stored per-plugin config (schema defaults merged with stored values) for one
 /// application. A thin passthrough to Core's `getPluginConfig` control RPC; the returned object
 /// holds only schema-declared scalar values, never paths or credentials.
 #[tauri::command]
-fn get_plugin_config(
+async fn get_plugin_config(
     state: State<'_, ManagerState>,
     application_id: String,
     plugin_id: String,
 ) -> Result<Value, String> {
-    state.core.call(
-        "getPluginConfig",
-        json!({
-            "applicationId": application_id,
-            "pluginId": plugin_id,
-        }),
-    )
+    state
+        .core
+        .call(
+            "getPluginConfig",
+            json!({
+                "applicationId": application_id,
+                "pluginId": plugin_id,
+            }),
+        )
+        .await
 }
 
 /// Replaces the whole stored config object for one application + plugin. A thin passthrough to
@@ -198,7 +251,7 @@ fn get_plugin_config(
 /// schema and rejects unknown keys or type mismatches, so the config field is validated to be a
 /// JSON object here before it is ever forwarded.
 #[tauri::command]
-fn set_plugin_config(
+async fn set_plugin_config(
     state: State<'_, ManagerState>,
     application_id: String,
     plugin_id: String,
@@ -207,21 +260,28 @@ fn set_plugin_config(
     if !config.is_object() {
         return Err("plugin config must be a JSON object".to_owned());
     }
-    state.core.call(
-        "setPluginConfig",
-        json!({
-            "applicationId": application_id,
-            "pluginId": plugin_id,
-            "config": config,
-        }),
-    )
+    state
+        .core
+        .call(
+            "setPluginConfig",
+            json!({
+                "applicationId": application_id,
+                "pluginId": plugin_id,
+                "config": config,
+            }),
+        )
+        .await
 }
 
 #[tauri::command]
-fn remove_plugin(state: State<'_, ManagerState>, plugin_id: String) -> Result<Value, String> {
+async fn remove_plugin(
+    state: State<'_, ManagerState>,
+    plugin_id: String,
+) -> Result<Value, String> {
     state
         .core
         .call("removePlugin", json!({ "pluginId": plugin_id }))
+        .await
 }
 
 /// Removes a registered application (its registration and per-plugin policy/config only; any
@@ -229,14 +289,17 @@ fn remove_plugin(state: State<'_, ManagerState>, plugin_id: String) -> Result<Va
 /// passthrough to Core's `removeApplication` control RPC; the response is `{ "removed": true }`
 /// and unknown ids surface as a Core -32602 error.
 #[tauri::command]
-fn remove_application(
+async fn remove_application(
     state: State<'_, ManagerState>,
     application_id: String,
 ) -> Result<Value, String> {
-    state.core.call(
-        "removeApplication",
-        json!({ "applicationId": application_id }),
-    )
+    state
+        .core
+        .call(
+            "removeApplication",
+            json!({ "applicationId": application_id }),
+        )
+        .await
 }
 
 /// Reads whether the application currently has a TronHawk transparent-launch (IFEO) registration.
@@ -244,65 +307,85 @@ fn remove_application(
 /// launcher, no elevation) and never returns paths. The response is
 /// `{ "applicationId", "registered", "owned" }`.
 #[tauri::command]
-fn get_iefo_registration(
+async fn get_iefo_registration(
     state: State<'_, ManagerState>,
     application_id: String,
 ) -> Result<Value, String> {
-    state.core.call(
-        "getIefoRegistration",
-        json!({ "applicationId": application_id }),
-    )
+    state
+        .core
+        .call(
+            "getIefoRegistration",
+            json!({ "applicationId": application_id }),
+        )
+        .await
 }
 
 /// Enables/disables the application's transparent-launch (IFEO) registration. Core relaunches
 /// the injector launcher elevated (UAC), so this command uses an extended RPC timeout; the
 /// response is `{ "applicationId", "registered", "cancelled" }`.
 #[tauri::command]
-fn set_iefo_registration(
+async fn set_iefo_registration(
     state: State<'_, ManagerState>,
     application_id: String,
     enabled: bool,
 ) -> Result<Value, String> {
-    state.core.call_elevated(
-        "setIefoRegistration",
-        json!({ "applicationId": application_id, "enabled": enabled }),
-    )
+    state
+        .core
+        .call_elevated(
+            "setIefoRegistration",
+            json!({ "applicationId": application_id, "enabled": enabled }),
+        )
+        .await
 }
 
 #[tauri::command]
-fn set_developer_mode(state: State<'_, ManagerState>, enabled: bool) -> Result<Value, String> {
+async fn set_developer_mode(
+    state: State<'_, ManagerState>,
+    enabled: bool,
+) -> Result<Value, String> {
     state
         .core
         .call("setDeveloperMode", json!({ "enabled": enabled }))
+        .await
 }
 
 /// Reads the effective Core autostart state (persisted preference OR the presence of the HKCU
 /// Run entry). A thin passthrough to Core's `getCoreAutostart` control RPC.
 #[tauri::command]
-fn get_core_autostart(state: State<'_, ManagerState>) -> Result<Value, String> {
-    state.core.call("getCoreAutostart", json!({}))
+async fn get_core_autostart(state: State<'_, ManagerState>) -> Result<Value, String> {
+    state.core.call("getCoreAutostart", json!({})).await
 }
 
 /// Enables/disables Core boot autostart: Core reconciles its HKCU Run entry and persists the
 /// preference. A thin passthrough to Core's `setCoreAutostart` control RPC.
 #[tauri::command]
-fn set_core_autostart(state: State<'_, ManagerState>, enabled: bool) -> Result<Value, String> {
+async fn set_core_autostart(
+    state: State<'_, ManagerState>,
+    enabled: bool,
+) -> Result<Value, String> {
     state
         .core
         .call("setCoreAutostart", json!({ "enabled": enabled }))
+        .await
 }
 
 #[tauri::command]
-fn install_plugin(
+async fn install_plugin(
     app: AppHandle,
     state: State<'_, ManagerState>,
 ) -> Result<Option<Value>, String> {
-    let Some(selected) = app
-        .dialog()
+    // Non-blocking dialog (see `register_application`): await the callback channel so cancel
+    // still yields `Ok(None)` without parking any command thread.
+    let (tx, mut rx) = tauri::async_runtime::channel::<Option<tauri_plugin_dialog::FilePath>>(1);
+    app.dialog()
         .file()
         .add_filter("TronHawk plugin", &["thx"])
-        .blocking_pick_file()
-    else {
+        .pick_file(move |selected| {
+            let _ = tx.try_send(selected);
+        });
+    let (outcome, selected) = classify_picker_outcome(rx.recv().await);
+    log_picker_outcome(outcome, "install_plugin");
+    let Some(selected) = selected else {
         return Ok(None);
     };
     let path = selected
@@ -314,6 +397,7 @@ fn install_plugin(
     state
         .core
         .call("installPlugin", json!({ "path": path }))
+        .await
         .map(Some)
 }
 
@@ -348,6 +432,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_cancel_and_drop_stay_distinct_but_both_yield_no_selection() {
+        let (cancelled, cancelled_selection) = classify_picker_outcome(Some(None::<u8>));
+        assert_eq!(cancelled, PickerOutcome::Cancelled);
+        assert!(cancelled_selection.is_none());
+
+        let (abandoned, abandoned_selection) = classify_picker_outcome(None::<Option<u8>>);
+        assert_eq!(abandoned, PickerOutcome::Abandoned);
+        assert!(abandoned_selection.is_none());
+
+        assert_ne!(cancelled, abandoned);
+
+        let (selected, selection) = classify_picker_outcome(Some(Some(7_u8)));
+        assert_eq!(selected, PickerOutcome::Selected);
+        assert_eq!(selection, Some(7_u8));
+    }
 
     #[test]
     fn application_registration_result_does_not_expose_the_selected_path() {
