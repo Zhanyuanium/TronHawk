@@ -5,8 +5,11 @@ import { t } from "./i18n.js";
 const permissionRisk = {
   "renderer.css": "low",
   "renderer.script": "medium",
+  "renderer.dom": "medium",
+  "renderer.storage": "low",
   "electron.window": "high",
   "electron.windowControls": "high",
+  "network.access": "medium",
   "runtime.unsafe": "high",
 };
 
@@ -102,7 +105,9 @@ export function createManagerService() {
     getPermissionDetails(permission) {
       const risk = permissionRisk[permission];
       if (!risk) return [t("perm.default"), "unknown"];
-      return [t(`perm.${permission}`), risk];
+      const key = `perm.${permission}`;
+      const description = t(key);
+      return [description === key ? t("perm.default") : description, risk];
     },
   };
 }

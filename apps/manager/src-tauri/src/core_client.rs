@@ -2,9 +2,8 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::thread;
 use std::time::{Duration, Instant};
+use tauri::async_runtime::Mutex;
 
 const DEFAULT_IPC_PORT: u16 = 17_777;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -27,6 +26,11 @@ const IPC_PORT_ENV: &str = "TRONHAWK_IPC_PORT";
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll interval while waiting for the launcher to exit.
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Second-layer bound for reaping the launcher after it has been killed (or after `try_wait`
+/// failed). The kill-then-`wait()` reap normally returns at once, but the reap itself must also
+/// be bounded so the command returns in finite time on every path. Worst-case wall clock for
+/// the command is therefore `LAUNCH_TIMEOUT + LAUNCH_REAP_TIMEOUT`.
+const LAUNCH_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fixed, path-free failure strings for the launch-with-extensions flow. Some of them cross the
 /// WebView boundary on failure, so none may ever embed the registered executable path or any
@@ -45,6 +49,14 @@ pub(crate) struct CoreClient {
     startup: Mutex<()>,
 }
 
+/// Startup gate: a single async mutex held across the whole
+/// "re-verify -> spawn -> wait-for-ready" sequence (never just a flag flip).
+/// The first holder verifies-then-maybe-spawns while every concurrent caller queues on the
+/// lock; each waiter re-verifies after acquiring and reuses the running Core without spawning
+/// again, so there is exactly one spawn per startup episode. Awaiting an async mutex never
+/// parks an OS thread, and dropping the future (cancellation) drops the guard, so a cancelled
+/// starter never wedges the gate — the next caller simply retries. Probes are serialized
+/// behind the gate instead of N followers polling at once (no probe herd).
 impl CoreClient {
     pub(crate) fn from_environment() -> Self {
         Self::new(storage_root(), ipc_port())
@@ -58,48 +70,63 @@ impl CoreClient {
         }
     }
 
-    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.ensure_core_available()?;
+    pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.ensure_core_available().await?;
         let token = self.read_control_token()?;
-        self.call_with_token(method, params, &token)
+        // True async IPC: `call_control_async` awaits Tokio TCP + timeouts without parking a
+        // thread. Timeouts unchanged (probe + RPC share RPC_TIMEOUT).
+        tronhawk_ipc::call_control_async(self.port, &token, method, params, RPC_TIMEOUT).await
     }
 
     /// Control RPCs that may wait on a UAC prompt use a much more generous timeout than a normal
     /// round-trip (see [`ELEVATED_RPC_TIMEOUT`]). Used by the IFEO registration toggle.
-    pub(crate) fn call_elevated(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.ensure_core_available()?;
+    pub(crate) async fn call_elevated(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        self.ensure_core_available().await?;
         let token = self.read_control_token()?;
-        tronhawk_ipc::call_control(
-            self.port,
-            &token,
-            method,
-            params,
-            ELEVATED_RPC_TIMEOUT,
-        )
+        // True async IPC: the 15-minute UAC wait is a Tokio timeout, not a parked thread, so no
+        // dedicated OS thread or handoff channel is needed. Timeout and return semantics are
+        // unchanged: the same `call_control` wire flow with `ELEVATED_RPC_TIMEOUT`.
+        tronhawk_ipc::call_control_async(self.port, &token, method, params, ELEVATED_RPC_TIMEOUT)
+            .await
     }
 
     /// One authenticated control RPC over the shared `tronhawk-ipc` client. The client first
     /// makes the peer prove it holds the control token (`verify_server`) and only then sends the
     /// token, so the credential never reaches a port-squatter.
+    ///
+    /// Test-only: production paths use the async `call`/`call_elevated` above. Gated so the
+    /// production build carries no dead code.
+    #[cfg(test)]
     fn call_with_token(&self, method: &str, params: Value, token: &str) -> Result<Value, String> {
         tronhawk_ipc::call_control(self.port, token, method, params, RPC_TIMEOUT)
     }
 
-    fn ensure_core_available(&self) -> Result<(), String> {
+    async fn ensure_core_available(&self) -> Result<(), String> {
+        // The gate is held across re-verification, spawn, and the readiness wait. A caller that
+        // queued behind an in-flight starter re-verifies first: if Core is up it is reused with
+        // no second spawn (so the initial check cannot race a concurrent spawn — no TOCTOU),
+        // and if the starter failed fast the waiter retries and deterministically observes the
+        // same concrete error rather than a generic follower timeout. The guard is released on
+        // drop — including future cancellation — so a cancelled starter stays retryable.
+        let _gate = self.startup.lock().await;
         // Reachability is not "Core is available": only a peer that proves it holds the control
         // token counts. If a daemon already passes identity verification, reuse it.
-        if self.verified_core().is_some() {
+        if self.verified_core().await.is_some() {
             return Ok(());
         }
+        self.start_core_and_wait().await
+        // `_gate` drops here: success leaves a verified Core for the next waiter to reuse,
+        // failure leaves the gate free so a later command can pull Core up again.
+    }
 
-        let _guard = self
-            .startup
-            .lock()
-            .map_err(|_| "Core startup state is unavailable".to_owned())?;
-        if self.verified_core().is_some() {
-            return Ok(());
-        }
-
+    /// Spawn Core once and poll (still holding the startup gate) up to `STARTUP_TIMEOUT` for
+    /// identity verification. Called only while the gate is held, so no second spawner can
+    /// slip in mid-sequence.
+    async fn start_core_and_wait(&self) -> Result<(), String> {
         let executable = core_executable().ok_or_else(|| {
             "Core is unavailable and no approved Core executable was found".to_owned()
         })?;
@@ -114,19 +141,23 @@ impl CoreClient {
 
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < deadline {
-            if self.verified_core().is_some() {
+            if self.verified_core().await.is_some() {
                 return Ok(());
             }
-            thread::sleep(STARTUP_POLL_INTERVAL);
+            // Async sleep: yields the command worker instead of parking a thread.
+            tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
         }
         Err("Core did not pass server identity verification in time".into())
     }
 
     /// Returns the control token only when a peer on `self.port` proves it holds that token;
     /// otherwise `None` (missing token file, unreachable, or an impostor that fails the probe).
-    fn verified_core(&self) -> Option<String> {
+    /// True async probe (2s): `verify_server_async` awaits Tokio TCP without parking a thread.
+    async fn verified_core(&self) -> Option<String> {
         let token = self.read_control_token().ok()?;
-        tronhawk_ipc::verify_server(self.port, &token, PROBE_TIMEOUT).ok()?;
+        tronhawk_ipc::verify_server_async(self.port, &token, PROBE_TIMEOUT)
+            .await
+            .ok()?;
         Some(token)
     }
 
@@ -153,8 +184,10 @@ impl CoreClient {
     /// (redaction only happens at the WebView boundary in `lib.rs`), handed to the launcher as its
     /// single positional argument, and never returned here: the caller only ever sees a fixed
     /// `{ "launched": true }` acknowledgment or a fixed, path-free error.
-    pub(crate) fn launch(&self, application_id: &str) -> Result<Value, String> {
-        let snapshot = self.call("getManagerSnapshot", serde_json::json!({}))?;
+    pub(crate) async fn launch(&self, application_id: &str) -> Result<Value, String> {
+        let snapshot = self
+            .call("getManagerSnapshot", serde_json::json!({}))
+            .await?;
         let executable_path = extract_executable_path(&snapshot, application_id)?;
         let application = application_record(&snapshot, application_id)?;
         ensure_supported_launch_level(application)?;
@@ -175,14 +208,24 @@ impl CoreClient {
         // A hung launcher (e.g. blocked reading the control credential or waiting on Core) must
         // not hold the Manager's Tauri command indefinitely. Poll up to LAUNCH_TIMEOUT, then kill
         // and reap so we never leak a zombie; on timeout return a fixed path-free error.
-        let outcome = wait_for_launcher(child, LAUNCH_TIMEOUT)?;
+        // Async wait: the poll interval yields instead of parking the command worker.
+        let outcome = wait_for_launcher(child, LAUNCH_TIMEOUT).await?;
 
         // Launcher diagnostics may legitimately mention target paths; write them to the Manager's
-        // own stderr only and never return them to the WebView.
-        let mut stderr = outcome.stderr;
-        let mut detail = String::new();
-        let _ = stderr.read_to_string(&mut detail);
-        if !outcome.exit_status.success() {
+        // own stderr only and never return them to the WebView. Drained on the blocking pool so
+        // the pipe read never stalls the async worker.
+        let LauncherOutcome {
+            exit_status,
+            mut stderr,
+        } = outcome;
+        let detail = tauri::async_runtime::spawn_blocking(move || {
+            let mut detail = String::new();
+            let _ = stderr.read_to_string(&mut detail);
+            detail
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if !exit_status.success() {
             if !detail.trim().is_empty() {
                 eprintln!("[manager] injector launcher reported an error:\n{detail}");
             }
@@ -201,10 +244,17 @@ struct LauncherOutcome {
 }
 
 /// Wait for the launcher child to exit, polling up to `timeout`. On a hang, kill + reap the child
-/// (no zombie) and return the fixed path-free LAUNCH_FAILED_ERROR; a start error returns
-/// LAUNCHER_START_ERROR. `stderr` is piped, so a child that only writes a short diagnostic before
-/// exiting will not fill the pipe buffer; the caller drains it after we return.
-fn wait_for_launcher(mut child: std::process::Child, timeout: Duration) -> Result<LauncherOutcome, String> {
+/// (no zombie, no live process) and return the fixed path-free LAUNCH_FAILED_ERROR; a `try_wait`
+/// failure is reaped the same way and returns LAUNCHER_START_ERROR. `stderr` is piped, so a child
+/// that only writes a short diagnostic before exiting will not fill the pipe buffer; the caller
+/// drains it after we return.
+/// Async: `try_wait`/`kill` are non-blocking; only the poll interval awaits (`tokio::time::sleep`),
+/// so a normal few-seconds launcher never parks a thread and the 30s hung-launcher bound holds.
+/// Every path returns within `timeout + LAUNCH_REAP_TIMEOUT` (see `kill_and_reap`).
+async fn wait_for_launcher(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<LauncherOutcome, String> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -214,19 +264,51 @@ fn wait_for_launcher(mut child: std::process::Child, timeout: Duration) -> Resul
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Terminate and reap so the child never lingers as a zombie.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Hung launcher: terminate and reap so it never lingers as a zombie or a
+                    // live process, then report the fixed path-free error.
                     eprintln!(
                         "[manager] injector launcher did not exit within {}s; terminated",
                         timeout.as_secs()
                     );
+                    kill_and_reap(child).await;
                     return Err(LAUNCH_FAILED_ERROR.to_owned());
                 }
-                thread::sleep(LAUNCH_POLL_INTERVAL);
+                tokio::time::sleep(LAUNCH_POLL_INTERVAL).await;
             }
-            Err(_) => return Err(LAUNCHER_START_ERROR.to_owned()),
+            Err(error) => {
+                // `try_wait` itself failed (e.g. an invalid handle): the child state is unknown,
+                // so still kill + reap under a bound before reporting — never leak a zombie or a
+                // live process on this path either. The reported error stays fixed/path-free.
+                eprintln!("[manager] failed to poll the injector launcher ({error}); terminating");
+                kill_and_reap(child).await;
+                return Err(LAUNCHER_START_ERROR.to_owned());
+            }
         }
+    }
+}
+
+/// Kill `child` and reap it within `LAUNCH_REAP_TIMEOUT`, so no path leaks a zombie or leaves
+/// the launcher running. A `kill()` failure is never silently ignored: it is logged and still
+/// followed by a bounded reap attempt (the process may have just exited on its own — the reap
+/// collects it — or it may be truly unkillable, in which case the reap bound is what keeps the
+/// command finite). OS-level details stay in the Manager's stderr; callers only ever map this
+/// to their fixed, path-free error.
+async fn kill_and_reap(mut child: std::process::Child) {
+    if let Err(error) = child.kill() {
+        eprintln!("[manager] failed to terminate the injector launcher ({error}); reaping");
+    }
+    // Synchronous reap off the executor: `wait()` blocks the calling thread, so run it on the
+    // blocking pool instead of parking this async worker. The outer `tokio::time::timeout` is
+    // the second layer that keeps even a stuck reap finite.
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    if tokio::time::timeout(LAUNCH_REAP_TIMEOUT, handle)
+        .await
+        .is_err()
+    {
+        eprintln!("[manager] timed out while reaping the injector launcher");
     }
 }
 
@@ -337,6 +419,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     const CONTROL_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -637,7 +720,9 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn a sleeping child");
-        let error = wait_for_launcher(child, Duration::from_millis(300)).unwrap_err();
+        let error =
+            tauri::async_runtime::block_on(wait_for_launcher(child, Duration::from_millis(300)))
+                .unwrap_err();
         assert_eq!(error, LAUNCH_FAILED_ERROR);
     }
 
@@ -651,7 +736,44 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn a quick child");
-        let outcome = wait_for_launcher(child, Duration::from_secs(5)).expect("quick child completes");
+        let outcome = tauri::async_runtime::block_on(wait_for_launcher(
+            child,
+            Duration::from_secs(5),
+        ))
+        .expect("quick child completes");
         assert!(outcome.exit_status.success());
+    }
+
+    #[test]
+    fn kill_and_reap_tolerates_a_kill_failure_and_still_returns_bounded() {
+        // Regression test for the abnormal-recovery path: killing an already-exited child fails, and
+        // that failure must be absorbed (logged, not ignored and not propagated) while the reap
+        // still completes within a bound instead of hanging or leaking a zombie.
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn a quick child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait().expect("poll the quick child") {
+                Some(_) => break,
+                None => {
+                    assert!(Instant::now() < deadline, "quick child never exited");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        // The process is gone, so `kill` inside `kill_and_reap` fails — the reap must still
+        // collect it and return promptly.
+        let started = Instant::now();
+        tauri::async_runtime::block_on(kill_and_reap(child));
+        assert!(
+            started.elapsed() < LAUNCH_REAP_TIMEOUT,
+            "reap after a kill failure took {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -44,6 +44,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 
 .content { min-width: 0; padding: 42px clamp(32px, 5vw, 76px) 32px; }
 .page { max-width: 1210px; margin: 0 auto; animation: arrive .42s both cubic-bezier(.2,.8,.2,1); }
+.is-page-update .page { animation: none; }
 .connection-notice { display: flex; align-items: center; gap: 10px; max-width: 1210px; margin: 0 auto 22px; padding: 10px 13px; color: #d2e7e0; border: 1px solid rgba(103, 218, 191, .25); border-radius: 10px; background: linear-gradient(90deg, rgba(35, 122, 103, .22), rgba(35, 122, 103, .06)); font-size: 12px; line-height: 1.45; }.connection-notice strong { color: #b9ffec; }.connection-notice-mark { display: grid; flex: none; width: 23px; height: 23px; place-items: center; color: #91ead9; border: 1px solid rgba(145,234,217,.28); border-radius: 50%; font: 500 13px "Cascadia Mono", monospace; }
 .page-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 34px; }
 .eyebrow { margin: 0 0 8px; color: #82e6d2; font: 500 11px/1.25 "DM Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }

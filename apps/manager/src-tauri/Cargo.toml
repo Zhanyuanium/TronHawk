@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tronhawk-ipc = { path = "../../../crates/ipc" }
+tronhawk-ipc = { path = "../../../crates/ipc", features = ["async-client"] }
