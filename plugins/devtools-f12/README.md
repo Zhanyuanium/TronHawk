@@ -29,5 +29,8 @@ is focused toggles DevTools for that window.
 - Turning developer mode **off purges every `runtime.unsafe` grant**; turning
   it back on does not restore them — grant again per application.
 - Diagnose via Core `queryLogs`: `devtools-f12 activated (windows watched: N)`
-  means the plugin is live; `ctx.raw absent` means developer mode or the
-  `runtime.unsafe` grant is missing.
+  means the plugin entered the execution plan and is live. No activation log
+  at all means it never entered the plan — check the plugin is enabled for
+  that application, the app is support level 2, developer mode is on, and the
+  `runtime.unsafe` grant is present (a missing grant drops the main payload
+  before the plugin ever runs).

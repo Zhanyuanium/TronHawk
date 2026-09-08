@@ -127,13 +127,13 @@ jobs:
           if (-not (Test-Path -LiteralPath "_thx_check/manifest.json" -PathType Leaf)) { throw "manifest.json missing in glass-window.thx" }
           Get-Content -LiteralPath "_thx_check/manifest.json" -Raw | ConvertFrom-Json | Out-Null
       - name: Pack devtools-f12 plugin
-        run: cargo run -p tronhawk-package --bin pack -- plugins/devtools-f12 devtools-f12.thx
+        run: cargo run -p tronhawk-package --bin tronhawk-pack -- pack plugins/devtools-f12 devtools-f12.thx
       - name: Validate devtools-f12 artifact
         shell: pwsh
         run: |
           if (-not (Test-Path -LiteralPath "devtools-f12.thx" -PathType Leaf)) { throw "devtools-f12.thx not found" }
           if ((Get-Item -LiteralPath "devtools-f12.thx").Length -eq 0) { throw "devtools-f12.thx is empty" }
-          cargo run -p tronhawk-package --bin pack -- inspect devtools-f12.thx
+          cargo run -p tronhawk-package --bin tronhawk-pack -- inspect devtools-f12.thx
 
   standalone-acceptance:
     # External-plugin flow with NO workspace link and NO Cargo context.

@@ -9,16 +9,20 @@
 //
 // Requires developer mode + the `runtime.unsafe` grant: `ctx.raw.electron` is
 // the real Electron module of the injected app (see docs/PLUGIN-SDK.md §ctx.raw
-// and ADR 0007). Without the grant this plugin logs a warning and does nothing.
+// and ADR 0007). The grant is also the execution gate: without an effective
+// `runtime.unsafe` grant Core drops the main payload, so the plugin never runs
+// at all (the `ctx.raw absent` branch below is unreachable through the real
+// pipeline and only guards against a broken host context).
 //
 // Lifecycle: every attached listener is tracked in `state` and removed in
 // `deactivate`, so disabling the plugin or revoking `runtime.unsafe` leaves no
-// live hooks behind.
+// live hooks behind. Attachments of closed windows are released eagerly via
+// the `webContents` `destroyed` event instead of accumulating until deactivate.
 var state = {
   active: false,
   // { app, handler } for the single `browser-window-created` subscription.
   appSubscription: null,
-  // [{ contents, handler }] — one entry per attached webContents.
+  // [{ contents, handler, destroyedHandler }] — one entry per attached webContents.
   windowAttachments: [],
 };
 
@@ -65,18 +69,32 @@ function toggleWebContentsDevTools(contents, logger) {
   }
 }
 
+function removeListener(target, event, handler) {
+  if (!target) {
+    return;
+  }
+  if (typeof target.off === "function") {
+    target.off(event, handler);
+  } else if (typeof target.removeListener === "function") {
+    target.removeListener(event, handler);
+  }
+}
+
 function detachWindowAttachment(entry, logger) {
   try {
-    var contents = entry.contents;
-    if (contents) {
-      if (typeof contents.off === "function") {
-        contents.off("before-input-event", entry.handler);
-      } else if (typeof contents.removeListener === "function") {
-        contents.removeListener("before-input-event", entry.handler);
-      }
-    }
+    removeListener(entry.contents, "before-input-event", entry.handler);
+    removeListener(entry.contents, "destroyed", entry.destroyedHandler);
   } catch (err) {
     logger.warn("devtools-f12: detach failed: " + describeError(err));
+  }
+}
+
+function dropWindowAttachment(entry) {
+  for (var i = 0; i < state.windowAttachments.length; i++) {
+    if (state.windowAttachments[i] === entry) {
+      state.windowAttachments.splice(i, 1);
+      return;
+    }
   }
 }
 
@@ -87,6 +105,7 @@ function attachWindow(win, logger) {
     logger.warn("devtools-f12: cannot watch a window without webContents; skipped");
     return false;
   }
+  var entry = { contents: contents, handler: null, destroyedHandler: null };
   var handler = function (event, input) {
     try {
       if (!isBareF12KeyDown(input)) {
@@ -102,13 +121,20 @@ function attachWindow(win, logger) {
       logger.warn("devtools-f12: input handling failed: " + describeError(err));
     }
   };
+  entry.handler = handler;
+  // A closed window takes its listeners with it; drop our record eagerly so
+  // long-lived apps with many transient windows cannot accumulate history.
+  entry.destroyedHandler = function () {
+    dropWindowAttachment(entry);
+  };
   try {
     contents.on("before-input-event", handler);
+    contents.on("destroyed", entry.destroyedHandler);
   } catch (err) {
     logger.warn("devtools-f12: attach failed: " + describeError(err));
     return false;
   }
-  state.windowAttachments.push({ contents: contents, handler: handler });
+  state.windowAttachments.push(entry);
   return true;
 }
 

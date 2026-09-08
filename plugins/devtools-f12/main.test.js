@@ -127,4 +127,29 @@ describe("devtools-f12", () => {
     expect(ctx.logger.warns.join("\n")).toMatch(/ctx\.raw absent/);
     plugin.deactivate(ctx);
   });
+
+  test("destroyed windows release their records; deactivate stays idempotent", () => {
+    const a = makeContents();
+    const b = makeContents();
+    const electron = makeElectron([a, b]);
+    const ctx = ctxWith(electron);
+    plugin.activate(ctx);
+    expect(a.listenerCount("before-input-event")).toBe(1);
+
+    // Closing a window drops its record eagerly.
+    a.emit("destroyed");
+    expect(a.listenerCount("before-input-event")).toBe(1); // handler died with the window
+    plugin.deactivate(ctx);
+    expect(b.listenerCount("before-input-event")).toBe(0);
+    expect(b.listenerCount("destroyed")).toBe(0);
+    expect(electron.app.listenerCount("browser-window-created")).toBe(0);
+
+    // Second deactivate is a no-op; reactivation attaches live windows exactly once.
+    plugin.deactivate(ctx);
+    plugin.activate(ctx);
+    expect(b.listenerCount("before-input-event")).toBe(1);
+    b.emit("before-input-event", f12Event(), { ...bareF12 });
+    expect(b.devToolsOpened).toBe(true);
+    plugin.deactivate(ctx);
+  });
 });
