@@ -72,9 +72,6 @@ jobs:
         run: bun install
       - name: Test plugin conformance fixtures
         run: bun test tests/plugin-conformance
-      - name: Typecheck hello-world plugin
-        working-directory: plugins/hello-world
-        run: bun run typecheck
 
   integration:
     runs-on: windows-latest
@@ -112,18 +109,17 @@ jobs:
         run: |
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "_pkg_stage"
           New-Item -ItemType Directory -Force -Path "_pkg_stage" | Out-Null
-          Copy-Item -Recurse -Force -LiteralPath "plugins/hello-world" -Destination "_pkg_stage/hello-world"
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "_pkg_stage/hello-world/node_modules"
-      - name: Pack hello-world plugin
-        run: cargo run -p tronhawk-package --bin pack -- _pkg_stage/hello-world hello-world.thx
+          Copy-Item -Recurse -Force -LiteralPath "plugins/glass-window" -Destination "_pkg_stage/glass-window"
+      - name: Pack glass-window plugin
+        run: cargo run -p tronhawk-package --bin pack -- _pkg_stage/glass-window glass-window.thx
       - name: Validate .thx artifact
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath "hello-world.thx" -PathType Leaf)) { throw "hello-world.thx not found" }
-          if ((Get-Item -LiteralPath "hello-world.thx").Length -eq 0) { throw "hello-world.thx is empty" }
+          if (-not (Test-Path -LiteralPath "glass-window.thx" -PathType Leaf)) { throw "glass-window.thx not found" }
+          if ((Get-Item -LiteralPath "glass-window.thx").Length -eq 0) { throw "glass-window.thx is empty" }
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "_thx_check"
-          Expand-Archive -LiteralPath "hello-world.thx" -DestinationPath "_thx_check"
-          if (-not (Test-Path -LiteralPath "_thx_check/manifest.json" -PathType Leaf)) { throw "manifest.json missing in hello-world.thx" }
+          Expand-Archive -LiteralPath "glass-window.thx" -DestinationPath "_thx_check"
+          if (-not (Test-Path -LiteralPath "_thx_check/manifest.json" -PathType Leaf)) { throw "manifest.json missing in glass-window.thx" }
           Get-Content -LiteralPath "_thx_check/manifest.json" -Raw | ConvertFrom-Json | Out-Null
 
   standalone-acceptance:

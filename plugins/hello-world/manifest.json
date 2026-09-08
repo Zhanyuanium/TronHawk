@@ -1,9 +1,0 @@
-{
-  "id": "com.example.hello-world",
-  "name": "Hello World",
-  "version": "0.1.0",
-  "author": "Example",
-  "tronhawk": "^0.1",
-  "entry": { "css": "style.css" },
-  "permissions": ["renderer.css"]
-}

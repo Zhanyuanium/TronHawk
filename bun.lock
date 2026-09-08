@@ -8,28 +8,8 @@
         "@electron/packager": "^20.3.0",
       },
     },
-    "plugins/hello-world": {
-      "name": "tronhawk-plugin-hello-world",
-      "version": "0.1.0",
-      "dependencies": {
-        "@tronhawk/sdk": "workspace:*",
-      },
-      "devDependencies": {
-        "typescript": "^5",
-      },
-    },
     "plugins/ui-tweaks": {
       "name": "tronhawk-plugin-ui-tweaks",
-      "version": "0.1.0",
-      "dependencies": {
-        "@tronhawk/sdk": "workspace:*",
-      },
-      "devDependencies": {
-        "typescript": "^5",
-      },
-    },
-    "plugins/window-effects": {
-      "name": "tronhawk-plugin-window-effects",
       "version": "0.1.0",
       "dependencies": {
         "@tronhawk/sdk": "workspace:*",
@@ -180,11 +160,7 @@
 
     "sumchecker": ["sumchecker@3.0.1", "https://registry.npmmirror.com/sumchecker/-/sumchecker-3.0.1.tgz", { "dependencies": { "debug": "^4.1.0" } }, "sha512-MvjXzkz/BOfyVDkG0oFOtBxHX2u3gKbMHIF/dXblZsgD3BWOFLmHovIpZY7BykJdAjcqRCBi1WYBNdEC9yI7vg=="],
 
-    "tronhawk-plugin-hello-world": ["tronhawk-plugin-hello-world@workspace:plugins/hello-world"],
-
     "tronhawk-plugin-ui-tweaks": ["tronhawk-plugin-ui-tweaks@workspace:plugins/ui-tweaks"],
-
-    "tronhawk-plugin-window-effects": ["tronhawk-plugin-window-effects@workspace:plugins/window-effects"],
 
     "typescript": ["typescript@5.9.3", "https://registry.npmmirror.com/typescript/-/typescript-5.9.3.tgz", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
