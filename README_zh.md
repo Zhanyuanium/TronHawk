@@ -88,7 +88,7 @@ apps/
   manager/         Tauri 图形界面：应用、插件、权限、日志
   test-app/        确定性 Electron 夹具应用，用于开发 + 集成测试
 sdk/               @tronhawk/sdk —— TypeScript 插件 API
-plugins/           示例插件（hello-world、dark-script、glass-window、ui-tweaks、window-effects）
+plugins/           示例插件（glass-window、ui-tweaks）与开发者模式插件（devtools-f12）
 tools/             create-tronhawk-plugin 脚手架
 vendor/            第三方源码 vendor（electron-hook + Detours）
 docs/              SPEC、AGENTS、PLAN、BACKLOG、PLUGIN-SDK、PLUGIN-REGISTRY、adr/
@@ -131,7 +131,7 @@ cd crates/runtime/js && bun install && bun run build
 cargo test --workspace                # Rust 单元测试
 
 cd sdk && bun test && bun run typecheck   # SDK 测试 + 类型检查
-cd plugins/hello-world && bun run typecheck
+cd plugins/ui-tweaks && bun run typecheck
 
 pwsh tests/integration.ps1            # 端到端：经注入器启动 test-app
 ```
@@ -140,7 +140,7 @@ pwsh tests/integration.ps1            # 端到端：经注入器启动 test-app
 
 ```sh
 cd sdk && bun install && bun test
-cd plugins/hello-world                # 看 manifest.json + src/ 了解插件形状
+cd plugins/ui-tweaks                # 看 manifest.json + src/ 了解插件形状
 ```
 
 ### 跑 Manager（Tauri 图形界面）

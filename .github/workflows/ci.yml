@@ -72,6 +72,11 @@ jobs:
         run: bun install
       - name: Test plugin conformance fixtures
         run: bun test tests/plugin-conformance
+      - name: Typecheck ui-tweaks plugin
+        working-directory: plugins/ui-tweaks
+        run: bun run typecheck
+      - name: Test devtools-f12 plugin lifecycle
+        run: bun test plugins/devtools-f12
 
   integration:
     runs-on: windows-latest
@@ -121,6 +126,14 @@ jobs:
           Expand-Archive -LiteralPath "glass-window.thx" -DestinationPath "_thx_check"
           if (-not (Test-Path -LiteralPath "_thx_check/manifest.json" -PathType Leaf)) { throw "manifest.json missing in glass-window.thx" }
           Get-Content -LiteralPath "_thx_check/manifest.json" -Raw | ConvertFrom-Json | Out-Null
+      - name: Pack devtools-f12 plugin
+        run: cargo run -p tronhawk-package --bin pack -- plugins/devtools-f12 devtools-f12.thx
+      - name: Validate devtools-f12 artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "devtools-f12.thx" -PathType Leaf)) { throw "devtools-f12.thx not found" }
+          if ((Get-Item -LiteralPath "devtools-f12.thx").Length -eq 0) { throw "devtools-f12.thx is empty" }
+          cargo run -p tronhawk-package --bin pack -- inspect devtools-f12.thx
 
   standalone-acceptance:
     # External-plugin flow with NO workspace link and NO Cargo context.

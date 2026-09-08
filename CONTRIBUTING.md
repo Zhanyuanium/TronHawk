@@ -53,7 +53,7 @@ TypeScript (SDK) and example plugins:
 
 ```sh
 cd sdk && bun test && bun run typecheck
-cd plugins/hello-world && bun run typecheck
+cd plugins/ui-tweaks && bun run typecheck
 ```
 
 Scaffolder CLI (`tools/create-tronhawk-plugin`):

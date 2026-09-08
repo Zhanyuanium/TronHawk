@@ -169,7 +169,7 @@ The `tronhawk` field (e.g. `"^0.1"`) is the host runtime protocol version, NOT t
 
 - Full API contract: `docs/PLUGIN-SDK.md` in the TronHawk repo
 - Scaffolder: `tools/create-tronhawk-plugin`
-- Examples: `plugins/` (`hello-world`, `dark-script`, `glass-window`, `ui-tweaks`, `window-effects`)
+- Examples: `plugins/` (`glass-window`, `ui-tweaks`, `devtools-f12`)
 
 ## License
 

@@ -1,7 +1,7 @@
 // File templates + content builders for scaffolded TronHawk plugins.
 //
-// Conventions mirrored from the in-repo example plugins (plugins/hello-world,
-// plugins/dark-script, plugins/glass-window): a bun package that depends on
+// Conventions mirrored from the in-repo example plugins (plugins/ui-tweaks,
+// plugins/glass-window): a bun package that depends on
 // the published `@tronhawk/sdk` registry release (types + testing helpers, no
 // host runtime), strict TS settings, and a `manifest.json` whose `tronhawk`
 // field is the host runtime protocol version ("^0.1"), NOT the SDK npm

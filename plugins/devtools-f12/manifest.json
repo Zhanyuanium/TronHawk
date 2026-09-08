@@ -5,5 +5,5 @@
   "author": "Example",
   "tronhawk": "^0.1",
   "entry": { "main": "main.js" },
-  "permissions": ["electron.window", "runtime.unsafe"]
+  "permissions": ["runtime.unsafe"]
 }

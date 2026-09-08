@@ -140,7 +140,7 @@ cargo run -p tronhawk-package --bin tronhawk-pack -- pack <path-to-plugin> <out.
 
 - 完整 API 契约：仓库 `docs/PLUGIN-SDK.md`
 - 脚手架：`tools/create-tronhawk-plugin`
-- 示例：`plugins/`（`hello-world`、`dark-script`、`glass-window`、`ui-tweaks`、`window-effects`）
+- 示例：`plugins/`（`glass-window`、`ui-tweaks`、`devtools-f12`）
 
 ## License
 

@@ -98,7 +98,7 @@ apps/
   manager/         Tauri GUI: apps, plugins, permissions, logs
   test-app/        Deterministic Electron fixture app used for dev + integration tests
 sdk/               @tronhawk/sdk — TypeScript plugin API
-plugins/           Example plugins (hello-world, dark-script, glass-window, ui-tweaks, window-effects)
+plugins/           Example plugins (glass-window, ui-tweaks) and developer-mode plugins (devtools-f12)
 tools/             create-tronhawk-plugin scaffolder
 vendor/            Vendored third-party source (electron-hook + Detours)
 docs/              SPEC, AGENTS, PLAN, BACKLOG, PLUGIN-SDK, PLUGIN-REGISTRY, adr/
@@ -142,7 +142,7 @@ cd crates/runtime/js && bun install && bun run build
 cargo test --workspace                # Rust unit tests
 
 cd sdk && bun test && bun run typecheck   # SDK tests + typecheck
-cd plugins/hello-world && bun run typecheck
+cd plugins/ui-tweaks && bun run typecheck
 
 pwsh tests/integration.ps1            # end-to-end: launch test-app via injector
 ```
@@ -151,7 +151,7 @@ pwsh tests/integration.ps1            # end-to-end: launch test-app via injector
 
 ```sh
 cd sdk && bun install && bun test
-cd plugins/hello-world                # read manifest.json + src/ for the shape
+cd plugins/ui-tweaks                # read manifest.json + src/ for the shape
 ```
 
 ### Run the Manager (Tauri GUI)

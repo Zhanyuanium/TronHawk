@@ -1,14 +1,33 @@
-// DevTools F12 — developer-mode main plugin: F12 toggles DevTools on the
-// focused window, via two complementary paths:
+// DevTools F12 — developer-mode main plugin: pressing F12 while a window of
+// the target app is focused toggles DevTools for that window.
 //
-//  1. globalShortcut F12 (system-wide) — registered only after app ready.
-//  2. per-window webContents `before-input-event` for F12 keyDown — works when
-//     the app window is focused even if the global accelerator is taken.
+// Mechanism: per-window `webContents` `before-input-event` listeners. There is
+// deliberately NO system-global shortcut: a global F12 would be hijacked
+// system-wide (breaking F12 in every other program) while only ever acting on
+// the target app's focused window, so the per-window path covers the whole
+// requirement with none of the side effects.
 //
 // Requires developer mode + the `runtime.unsafe` grant: `ctx.raw.electron` is
 // the real Electron module of the injected app (see docs/PLUGIN-SDK.md §ctx.raw
 // and ADR 0007). Without the grant this plugin logs a warning and does nothing.
-var state = { registered: false, fallbackWindows: [] };
+//
+// Lifecycle: every attached listener is tracked in `state` and removed in
+// `deactivate`, so disabling the plugin or revoking `runtime.unsafe` leaves no
+// live hooks behind.
+var state = {
+  active: false,
+  // { app, handler } for the single `browser-window-created` subscription.
+  appSubscription: null,
+  // [{ contents, handler }] — one entry per attached webContents.
+  windowAttachments: [],
+};
+
+function describeError(err) {
+  if (err && err.message) {
+    return err.message;
+  }
+  return String(err);
+}
 
 function getElectron(ctx) {
   if (ctx && ctx.raw && ctx.raw.electron) {
@@ -17,133 +36,164 @@ function getElectron(ctx) {
   return null;
 }
 
-function toggleDevTools(BrowserWindow, logger) {
-  try {
-    var win = BrowserWindow.getFocusedWindow();
-    if (win && win.webContents) {
-      if (win.webContents.isDevToolsOpened()) {
-        win.webContents.closeDevTools();
-      } else {
-        win.webContents.openDevTools();
-      }
-    }
-  } catch (err) {
-    try {
-      logger.warn("devtools-f12 toggle failed: " + (err && err.message ? err.message : err));
-    } catch (ignored) {}
-  }
-}
-
-function attachWindowFallback(electron, logger) {
-  try {
-    var app = electron.app;
-    var BrowserWindow = electron.BrowserWindow;
-    if (!app || !BrowserWindow) {
-      return;
-    }
-    var attach = function (win) {
-      try {
-        if (!win || !win.webContents) {
-          return;
-        }
-        win.webContents.on("before-input-event", function (event, input) {
-          try {
-            if (input && input.type === "keyDown" && (input.key === "F12" || input.code === "F12")) {
-              toggleDevTools(BrowserWindow, logger);
-            }
-          } catch (ignored) {}
-        });
-      } catch (ignored) {}
-    };
-    // Windows that already exist.
-    try {
-      var existing = BrowserWindow.getAllWindows();
-      for (var i = 0; i < existing.length; i++) {
-        attach(existing[i]);
-      }
-    } catch (ignored) {}
-    // Windows created later.
-    app.on("browser-window-created", function (event, win) {
-      attach(win);
-    });
-  } catch (ignored) {}
-}
-
-function registerGlobal(electron, logger) {
-  try {
-    var globalShortcut = electron.globalShortcut;
-    var BrowserWindow = electron.BrowserWindow;
-    if (!globalShortcut || !BrowserWindow) {
-      logger.warn("devtools-f12: globalShortcut/BrowserWindow unavailable");
-      return false;
-    }
-    if (state.registered) {
-      return true;
-    }
-    var ok = globalShortcut.register("F12", function () {
-      toggleDevTools(BrowserWindow, logger);
-    });
-    state.registered = !!ok;
-    return state.registered;
-  } catch (err) {
-    try {
-      logger.warn("devtools-f12 register failed: " + (err && err.message ? err.message : err));
-    } catch (ignored) {}
+// Only a bare F12 keyDown counts: no modifiers, no auto-repeat.
+function isBareF12KeyDown(input) {
+  if (!input || input.type !== "keyDown") {
     return false;
   }
+  if (input.key !== "F12" && input.code !== "F12") {
+    return false;
+  }
+  if (input.isAutoRepeat) {
+    return false;
+  }
+  if (input.shift || input.control || input.alt || input.meta) {
+    return false;
+  }
+  return true;
+}
+
+function toggleWebContentsDevTools(contents, logger) {
+  try {
+    if (contents.isDevToolsOpened()) {
+      contents.closeDevTools();
+    } else {
+      contents.openDevTools();
+    }
+  } catch (err) {
+    logger.warn("devtools-f12: toggle failed: " + describeError(err));
+  }
+}
+
+function detachWindowAttachment(entry, logger) {
+  try {
+    var contents = entry.contents;
+    if (contents) {
+      if (typeof contents.off === "function") {
+        contents.off("before-input-event", entry.handler);
+      } else if (typeof contents.removeListener === "function") {
+        contents.removeListener("before-input-event", entry.handler);
+      }
+    }
+  } catch (err) {
+    logger.warn("devtools-f12: detach failed: " + describeError(err));
+  }
+}
+
+// Returns true when the window is now watched.
+function attachWindow(win, logger) {
+  var contents = win ? win.webContents : null;
+  if (!contents || typeof contents.on !== "function") {
+    logger.warn("devtools-f12: cannot watch a window without webContents; skipped");
+    return false;
+  }
+  var handler = function (event, input) {
+    try {
+      if (!isBareF12KeyDown(input)) {
+        return;
+      }
+      if (event && typeof event.preventDefault === "function") {
+        event.preventDefault();
+      }
+      // Toggle the webContents the event belongs to — never re-resolve the
+      // focused window, which may already have moved on.
+      toggleWebContentsDevTools(contents, logger);
+    } catch (err) {
+      logger.warn("devtools-f12: input handling failed: " + describeError(err));
+    }
+  };
+  try {
+    contents.on("before-input-event", handler);
+  } catch (err) {
+    logger.warn("devtools-f12: attach failed: " + describeError(err));
+    return false;
+  }
+  state.windowAttachments.push({ contents: contents, handler: handler });
+  return true;
 }
 
 module.exports = {
   activate: function (ctx) {
+    // Defensive: never stack listeners across a repeated activate without an
+    // intervening deactivate.
+    if (state.active) {
+      module.exports.deactivate(ctx);
+    }
     try {
       var electron = getElectron(ctx);
       if (!electron) {
         ctx.logger.warn(
-          "devtools-f12: ctx.raw absent (needs developer mode + runtime.unsafe grant); F12 not registered"
+          "devtools-f12: ctx.raw absent (needs developer mode + runtime.unsafe grant); F12 not watched"
         );
         return;
       }
-      // globalShortcut requires app ready; defer when it is not.
       var app = electron.app;
-      var ready =
-        !app || (typeof app.isReady === "function" && app.isReady());
-      var doRegister = function () {
-        var ok = registerGlobal(electron, ctx.logger);
-        ctx.logger.info("devtools-f12 activated (F12 registered: " + ok + ")");
-      };
-      if (ready) {
-        doRegister();
-      } else if (app && typeof app.whenReady === "function") {
-        app.whenReady().then(doRegister, function (err) {
-          try {
-            ctx.logger.warn(
-              "devtools-f12: app not ready (" + (err && err.message ? err.message : err) + ")"
-            );
-          } catch (ignored) {}
-        });
-      } else {
-        doRegister();
+      var BrowserWindow = electron.BrowserWindow;
+      if (!app || !BrowserWindow) {
+        ctx.logger.warn("devtools-f12: app/BrowserWindow unavailable; F12 not watched");
+        return;
       }
-      // Focus-path fallback works regardless of global registration.
-      attachWindowFallback(electron, ctx.logger);
+      state.active = true;
+      var watched = 0;
+      try {
+        var existing = BrowserWindow.getAllWindows() || [];
+        for (var i = 0; i < existing.length; i++) {
+          if (attachWindow(existing[i], ctx.logger)) {
+            watched++;
+          }
+        }
+      } catch (err) {
+        ctx.logger.warn("devtools-f12: enumerating windows failed: " + describeError(err));
+      }
+      var onWindowCreated = function (event, win) {
+        if (!state.active) {
+          return;
+        }
+        attachWindow(win, ctx.logger);
+      };
+      try {
+        app.on("browser-window-created", onWindowCreated);
+        state.appSubscription = { app: app, handler: onWindowCreated };
+      } catch (err) {
+        ctx.logger.warn("devtools-f12: subscribing to new windows failed: " + describeError(err));
+      }
+      ctx.logger.info("devtools-f12 activated (windows watched: " + watched + ")");
     } catch (err) {
       try {
-        ctx.logger.warn("devtools-f12 activate failed: " + (err && err.message ? err.message : err));
+        ctx.logger.warn("devtools-f12: activate failed: " + describeError(err));
       } catch (ignored) {}
     }
   },
   deactivate: function (ctx) {
-    try {
-      var electron = getElectron(ctx);
-      if (electron && electron.globalShortcut) {
-        electron.globalShortcut.unregister("F12");
+    state.active = false;
+    var logger = ctx && ctx.logger ? ctx.logger : null;
+    var silent = {
+      warn: function () {},
+      info: function () {},
+    };
+    var log = logger || silent;
+    if (state.appSubscription) {
+      try {
+        var app = state.appSubscription.app;
+        var handler = state.appSubscription.handler;
+        if (app) {
+          if (typeof app.off === "function") {
+            app.off("browser-window-created", handler);
+          } else if (typeof app.removeListener === "function") {
+            app.removeListener("browser-window-created", handler);
+          }
+        }
+      } catch (err) {
+        log.warn("devtools-f12: unsubscribing from new windows failed: " + describeError(err));
       }
-    } catch (err) {
-      // Best effort cleanup.
+      state.appSubscription = null;
     }
-    state.registered = false;
+    for (var i = 0; i < state.windowAttachments.length; i++) {
+      detachWindowAttachment(state.windowAttachments[i], log);
+    }
+    state.windowAttachments = [];
     try {
-      ctx.logger.info("devtools-f12 deactivated");
+      log.info("devtools-f12 deactivated");
     } catch (ignored) {}
   },
 };

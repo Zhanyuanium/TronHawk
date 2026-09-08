@@ -129,8 +129,10 @@ expect on each app.
 
 ## Concrete example
 
-Two entries, matching the workspace example plugins `window-effects` (main) and `ui-tweaks`
-(renderer + CSS). `sha256` digits are illustrative.
+Two illustrative entries in the shape of a main plugin and a renderer + CSS
+plugin (`sha256` digits are illustrative; the `window-effects` entry below is
+fictional and no longer mirrors a workspace example — only `ui-tweaks` still
+exists under `plugins/`).
 
 ```json
 {
