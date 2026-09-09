@@ -17,8 +17,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 /// Protocol version carried in every message.
 pub const PROTOCOL_VERSION: &str = "0.1";
 
-/// Maximum accepted request frame size (bytes).
-const MAX_FRAME_SIZE: usize = 64 * 1024;
+/// Maximum accepted request/response frame size in bytes (1 MiB).
+/// Keep in sync with `MAX_FRAME_BYTES` in `crates/injector/assets/bootstrap.js`.
+const MAX_FRAME_SIZE: usize = 1024 * 1024;
 /// Read timeout for a single frame.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of connections handled concurrently. Accepting blocks while this many
@@ -1117,6 +1118,149 @@ mod tests {
         let expected = format!("{}\n", serde_json::to_string(&request).unwrap());
         assert_eq!(encoded, expected.into_bytes());
         assert!(encoded.ends_with(b"\n"));
+    }
+
+    /// Regression for issue #4: a legitimate ExecutionPlan carrying full plugin sources
+    /// (traffic-lights scale: ~50KiB css + ~8KiB renderer + ~6KiB second plugin, i.e. well
+    /// over the old 64KiB cap but far below 1MiB) must round-trip through the frame layer.
+    /// The payload shape mirrors `tronhawk_core::ExecutionPlan` (revision + PluginGrant
+    /// list with css/renderer/main sources) without depending on the core crate.
+    #[test]
+    fn large_plan_sized_response_roundtrips_through_read_frame() {
+        const OLD_LIMIT: usize = 64 * 1024;
+        // Traffic-lights magnitude: plugin 1 carries ~50KiB css + ~8KiB renderer,
+        // plugin 2 carries ~6KiB renderer; JSON envelope overhead pushes the total
+        // just past 64KiB.
+        // Mixed unit exercises JSON escape amplification (newline/quote/backslash
+        // each grow by one byte on the wire) and multi-byte UTF-8 (`中`/`文` stay
+        // 3 bytes/char raw and in JSON): `a`+LF+`b`+`"`+`c`+`\`+`d`+`中`+`文`.
+        fn repeat_to_bytes(unit: &str, target: usize) -> String {
+            let n = target.div_ceil(unit.as_bytes().len());
+            unit.repeat(n)
+        }
+        const UNIT: &str = "a\nb\"c\\d中文";
+        let css = repeat_to_bytes(UNIT, 50 * 1024);
+        let renderer = repeat_to_bytes(UNIT, 8 * 1024);
+        let second_renderer = repeat_to_bytes(UNIT, 6 * 1024);
+        let plan = serde_json::json!({
+            "revision": "test-revision",
+            "plugins": [
+                {
+                    "id": "traffic-lights",
+                    "version": "0.1.0",
+                    "granted": ["renderer.css", "renderer.script"],
+                    "css": css,
+                    "renderer": renderer,
+                    "main": null,
+                    "config": {}
+                },
+                {
+                    "id": "second-plugin",
+                    "version": "0.1.0",
+                    "granted": ["renderer.script"],
+                    "css": null,
+                    "renderer": second_renderer,
+                    "main": null,
+                    "config": {}
+                }
+            ]
+        });
+        let response = Response::ok(7, plan.clone());
+        let mut encoded = serde_json::to_string(&response).unwrap();
+        encoded.push('\n');
+        let content_len = encoded.len() - 1; // newline excluded, like read_frame counts
+        // Must sit in the regression window: rejected by the old 64KiB cap,
+        // accepted by the new 1MiB cap.
+        assert!(
+            content_len > OLD_LIMIT,
+            "fixture too small to reproduce issue #4: {content_len} bytes"
+        );
+        assert!(
+            content_len < MAX_FRAME_SIZE,
+            "fixture exceeds the new 1MiB cap: {content_len} bytes"
+        );
+        // Under the old limit this frame would have failed with "frame too large".
+        // New limit: read_frame accepts it and preserves the newline framing.
+        let frame = read_frame(&mut std::io::Cursor::new(encoded.as_bytes()))
+            .expect("large plan frame must be accepted under the 1MiB cap")
+            .expect("expected one complete frame");
+        assert!(frame.ends_with('\n'));
+        let decoded = decode_response_frame(&frame, 7).expect("large plan must decode");
+        assert_eq!(decoded["revision"], "test-revision");
+        // Escaped/multibyte sources must survive byte-for-byte (JSON escape
+        // amplification on the wire plus multi-byte UTF-8 must not corrupt).
+        assert_eq!(decoded["plugins"][0]["css"], plan["plugins"][0]["css"]);
+        assert_eq!(
+            decoded["plugins"][0]["renderer"],
+            plan["plugins"][0]["renderer"]
+        );
+        assert_eq!(
+            decoded["plugins"][1]["renderer"],
+            plan["plugins"][1]["renderer"]
+        );
+    }
+
+    /// The old 64KiB+1 boundary is now a legal frame; only frames past 1MiB are rejected.
+    #[test]
+    fn old_64kib_boundary_now_accepted_and_1mib_boundary_rejected() {
+        // 64KiB+1 content bytes (plus newline on the wire) sat just past the old
+        // limit — under the old cap this was the first rejected size.
+        let mut just_over_old = vec![b'x'; 64 * 1024 + 1];
+        just_over_old.push(b'\n');
+        let frame = read_frame(&mut std::io::Cursor::new(just_over_old))
+            .expect("64KiB+1 must be accepted under the 1MiB cap")
+            .expect("expected one complete frame");
+        assert!(frame.ends_with('\n'));
+
+        // Exactly 1MiB content bytes (newline excluded) is accepted, mirroring async.
+        let mut exact = vec![b'x'; MAX_FRAME_SIZE];
+        exact.push(b'\n');
+        let frame = read_frame(&mut std::io::Cursor::new(exact))
+            .expect("exactly 1MiB must be accepted under the 1MiB cap")
+            .expect("expected one complete frame");
+        assert!(frame.ends_with('\n'));
+
+        // The new boundary still rejects: MAX_FRAME_SIZE+1 content bytes.
+        let mut over_new = vec![b'x'; MAX_FRAME_SIZE + 1];
+        over_new.push(b'\n');
+        let error = read_frame(&mut std::io::Cursor::new(over_new)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "frame too large");
+    }
+
+    /// Async `read_frame_async` enforces the same boundaries as sync `read_frame`
+    /// (content bytes excluding the newline against 1MiB): 64KiB+1 and exactly
+    /// 1MiB are accepted, 1MiB+1 is rejected.
+    #[cfg(feature = "async-client")]
+    #[tokio::test]
+    async fn async_frame_boundaries_match_sync() {
+        // 64KiB+1: first size rejected by the old cap, legal now.
+        let mut just_over_old = vec![b'x'; 64 * 1024 + 1];
+        just_over_old.push(b'\n');
+        let mut reader = tokio::io::BufReader::new(&just_over_old[..]);
+        let frame = read_frame_async(&mut reader)
+            .await
+            .expect("async: 64KiB+1 must be accepted")
+            .expect("expected one complete frame");
+        assert!(frame.ends_with('\n'));
+
+        // Exactly 1MiB content bytes (newline excluded) is accepted, like sync.
+        let mut exact = vec![b'x'; MAX_FRAME_SIZE];
+        exact.push(b'\n');
+        let mut reader = tokio::io::BufReader::new(&exact[..]);
+        let frame = read_frame_async(&mut reader)
+            .await
+            .expect("async: exactly 1MiB must be accepted")
+            .expect("expected one complete frame");
+        assert!(frame.ends_with('\n'));
+
+        // 1MiB+1 content bytes is rejected, like sync.
+        let mut over_new = vec![b'x'; MAX_FRAME_SIZE + 1];
+        over_new.push(b'\n');
+        let mut reader = tokio::io::BufReader::new(&over_new[..]);
+        let error = read_frame_async(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "frame too large");
     }
 
     #[cfg(feature = "async-client")]
