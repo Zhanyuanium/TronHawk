@@ -7084,4 +7084,68 @@ mod tests {
         assert!(message.contains("status=200"), "{message}");
         assert!(message.contains("bytes=4"), "{message}");
     }
+
+    /// Regression for issue #4: a multi-plugin ExecutionPlan at traffic-lights scale
+    /// (~50KiB css + ~8KiB renderer for the first plugin, ~6KiB renderer for the
+    /// second) serializes past the old 64KiB frame cap, so the daemon must be able
+    /// to serve it once the transport cap is 1MiB. This test pins the size window;
+    /// the actual frame round-trip is covered by `tronhawk-ipc`
+    /// `large_plan_sized_response_roundtrips_through_read_frame`.
+    #[test]
+    fn large_execution_plan_serialization_fits_1mib_frame() {
+        use crate::PluginGrant;
+
+        // Same mixed unit as the ipc frame test: newline/quote/backslash exercise
+        // JSON escape amplification on the wire, CJK exercises multi-byte UTF-8.
+        fn repeat_to_bytes(unit: &str, target: usize) -> String {
+            let n = target.div_ceil(unit.as_bytes().len());
+            unit.repeat(n)
+        }
+        const UNIT: &str = "a\nb\"c\\d中文";
+        let grants = vec![
+            PluginGrant {
+                id: "traffic-lights".into(),
+                version: "0.1.0".into(),
+                granted: vec!["renderer.css".into(), "renderer.script".into()],
+                css: Some(repeat_to_bytes(UNIT, 50 * 1024)),
+                renderer: Some(repeat_to_bytes(UNIT, 8 * 1024)),
+                main: None,
+                config: BTreeMap::new(),
+            },
+            PluginGrant {
+                id: "second-plugin".into(),
+                version: "0.1.0".into(),
+                granted: vec!["renderer.script".into()],
+                css: None,
+                renderer: Some(repeat_to_bytes(UNIT, 6 * 1024)),
+                main: None,
+                config: BTreeMap::new(),
+            },
+        ];
+        let plan = ExecutionPlan {
+            revision: hash_json(&grants),
+            plugins: grants,
+        };
+        let encoded = serde_json::to_string(&plan).unwrap();
+        // Regression window: over the old 64KiB cap (issue #4 dropped every plan
+        // this size with "frame too large" / "ipc response too large"), under 1MiB.
+        assert!(
+            encoded.len() > 64 * 1024,
+            "fixture too small to reproduce issue #4: {} bytes",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() < 1024 * 1024,
+            "fixture exceeds the new 1MiB cap: {} bytes",
+            encoded.len()
+        );
+        // The full JSON-RPC response envelope (as served for getExecutionPlan via
+        // rpc_ok) must also fit the 1MiB frame.
+        let wire = serde_json::to_string(&rpc_ok(1, &plan)).unwrap();
+        assert!(
+            wire.len() < 1024 * 1024,
+            "response envelope exceeds the new 1MiB cap: {} bytes",
+            wire.len()
+        );
+    }
 }

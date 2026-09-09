@@ -13,6 +13,11 @@ const MAX_QUEUED_LOGS = 256;
 const MAX_LOG_BATCH = 16;
 const MAX_LOG_MESSAGE_BYTES = 1024;
 
+// IPC frame cap in wire/Buffer bytes (UTF-8, newline excluded). Keep in sync
+// with MAX_FRAME_SIZE in crates/ipc/src/lib.rs (1 MiB), which counts the same
+// bytes on the Rust side.
+const MAX_FRAME_BYTES = 1024 * 1024;
+
 function boundedMessage(value) {
   const message = typeof value === "string" ? value : String(value);
   if (Buffer.byteLength(message, "utf8") <= MAX_LOG_MESSAGE_BYTES) return message;
@@ -50,23 +55,44 @@ function sendIpc(port, secret, id, method, params, timeout = 5000) {
       sock.destroy();
       reject(new Error("ipc timeout"));
     });
-    let buf = "";
+    // Byte-accurate frame buffer: chunks are kept as Buffers (never per-chunk
+    // `toString()`) so a multi-byte UTF-8 character split across TCP segments
+    // cannot be corrupted. Size checks count UTF-8 bytes excluding the trailing
+    // newline, matching Rust read_frame in crates/ipc/src/lib.rs.
+    let chunks = [];
+    let totalLen = 0;
     sock.on("data", (d) => {
-      buf += d.toString();
-      // Match the wire frame limit used by the Rust client (crates/ipc MAX_FRAME_SIZE).
-      if (buf.length > 64 * 1024) {
-        sock.destroy();
-        reject(new Error("ipc response too large"));
-        return;
-      }
-      const nl = buf.indexOf("\n");
+      const chunk = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      // Earlier chunks were already confirmed LF-free, so only the new chunk
+      // needs scanning; its start offset is the pre-push total length.
+      const idx = chunk.indexOf(0x0a);
+      const nl = idx >= 0 ? totalLen + idx : -1;
+      chunks.push(chunk);
+      totalLen += chunk.length;
+      // The newline (when present) is located before any size decision, so a
+      // frame of exactly MAX_FRAME_BYTES content bytes is accepted (the
+      // newline itself never counts against the cap).
       if (nl >= 0) {
+        // Match the wire frame limit used by the Rust client (crates/ipc MAX_FRAME_SIZE,
+        // counted in UTF-8 bytes on both sides, newline excluded).
+        if (nl > MAX_FRAME_BYTES) {
+          sock.destroy();
+          reject(new Error("ipc response too large"));
+          return;
+        }
+        const frame = Buffer.concat(chunks, totalLen).subarray(0, nl).toString("utf8");
         sock.destroy();
         try {
-          resolve(JSON.parse(buf.slice(0, nl)));
+          resolve(JSON.parse(frame));
         } catch (e) {
           reject(e);
         }
+        return;
+      }
+      if (totalLen > MAX_FRAME_BYTES) {
+        sock.destroy();
+        reject(new Error("ipc response too large"));
+        return;
       }
     });
     sock.on("error", reject);

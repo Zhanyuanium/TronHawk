@@ -15,6 +15,10 @@ $core = $null
 $existingTestAppIds = @()
 $rpcId = 0
 
+# IPC frame cap in bytes (UTF-8, newline excluded). Keep in sync with MAX_FRAME_SIZE
+# in crates/ipc/src/lib.rs and MAX_FRAME_BYTES in crates/injector/assets/bootstrap.js.
+$maxFrameBytes = 1024 * 1024
+
 $priorPort = [Environment]::GetEnvironmentVariable("TRONHAWK_IPC_PORT", "Process")
 $priorRoot = [Environment]::GetEnvironmentVariable("TRONHAWK_STORAGE_ROOT", "Process")
 $priorSecret = [Environment]::GetEnvironmentVariable("TRONHAWK_IPC_SECRET", "Process")
@@ -100,8 +104,8 @@ function Invoke-CoreRpc {
         if ($null -eq $line) {
             throw "Core RPC '$Method' closed without a response"
         }
-        if ([System.Text.Encoding]::UTF8.GetByteCount($line) -gt 65536) {
-            throw "Core RPC '$Method' response exceeded 65536 bytes"
+        if ([System.Text.Encoding]::UTF8.GetByteCount($line) -gt $maxFrameBytes) {
+            throw "Core RPC '$Method' response exceeded $maxFrameBytes bytes"
         }
         try {
             $response = $line | ConvertFrom-Json -Depth 20
