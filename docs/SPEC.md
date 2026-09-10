@@ -155,7 +155,7 @@ Execution contexts:
   snapshot; `get(key)` reads synchronously from that snapshot, `set(key, value)` is a no-op for
   sandboxed plugins — config is persisted only via the Manager settings form.
 - **Restricted declarative capability config** (`electron.windowControls`): the host reads
-  exactly `region-height` (H, default 30, clamped 30..64) and `left-offset` (L, default 0,
+  exactly `overlay-region-height` (H, default 30, clamped 30..64) and `overlay-left-offset` (L, default 0,
   clamped 0..256) from the plan snapshot to size the overlay view (72xH at (m+L, 0)
   where m=(H-24)/2, default (3,0,72,30); constant 14px vector lights in 24x24 hit
   cells at pitch 24, gap 10, inset 5, vertical margin m=(H-24)/2). All values are CSS px (DIP), measured

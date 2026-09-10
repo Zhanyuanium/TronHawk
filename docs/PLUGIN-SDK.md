@@ -270,7 +270,7 @@ return `undefined` without a host call) and return a `Promise<void>` delivered b
   (pack-time gate), and Core drops the renderer payload without an effective `renderer.script`
   grant or the Developer-mode `runtime.unsafe` escape hatch (`core.renderer.script_required`).
 - Restricted declarative capability config: the host reads exactly two config keys for
-  overlay geometry — `region-height` (default 30, clamped to 30..64) and `left-offset`
+  overlay geometry — `overlay-region-height` (default 30, clamped to 30..64) and `overlay-left-offset`
   (default 0, clamped to 0..256) — from the read-only `plugin.config` snapshot of the
   current plan revision (manifest schema defaults overlaid with stored values by Core).
   All values are CSS px (DIP), measured the same way on every display; the host never
@@ -314,6 +314,12 @@ Declare a schema in `manifest.json`; the Manager auto-generates a settings form 
 Each field is `{ "type": "string" | "number" | "boolean", "default"?, "label"? }`; the schema is
 limited to 32 keys, and `object`/`array` field types are reserved for a future release. The schema
 is validated when the plugin is packed/installed.
+
+Plugin config schema keys MUST be kebab-case as `{subsystem}-{meaning}`.
+Use the `overlay-` prefix for geometry, the `tooltip-` prefix for labels,
+and the `host-` prefix for host-owned behavior. Bare generic names like
+`opacity` remain valid but are discouraged for new plugins. Global Core
+state (camelCase) is separate from plugin config and is unaffected.
 
 Config is stored per-application × per-plugin in Core and carried into the per-plugin plan grant as
 a merged snapshot (schema defaults overlaid with stored values). `ctx.config.get(key)` reads
