@@ -395,18 +395,18 @@ describe("window-controls geometry normalization", () => {
 
   test("custom height/adjustment shape the region: x = (H-24)/2+L, width always 72", () => {
     // H=40, L=10 -> x=8+10=18; three 24x24 cells tile the 72x40 view at m=8.
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": 40, "left-offset": 10 })).toEqual({
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": 40, "overlay-left-offset": 10 })).toEqual({
       x: 18,
       y: 0,
       width: 72,
       height: 40,
     });
     // H=40 with default adjustment: x tracks the vertical margin (m=8).
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": 40 })).toEqual({ x: 8, y: 0, width: 72, height: 40 });
-    expect(wc.windowControlsViewBounds({ "region-height": 64 })).toEqual({ x: 20, y: 0, width: 72, height: 64 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": 40 })).toEqual({ x: 8, y: 0, width: 72, height: 40 });
+    expect(wc.windowControlsViewBounds({ "overlay-region-height": 64 })).toEqual({ x: 20, y: 0, width: 72, height: 64 });
     // Cells stay 24x24 in an H-tall flex row (m=(H-24)/2); lights are fixed
     // 14px inline SVGs (sized by attributes, not CSS).
-    const css = wc.windowControlsViewCss({ "region-height": 40 });
+    const css = wc.windowControlsViewCss({ "overlay-region-height": 40 });
     expect(css).toContain("width:24px;height:24px");
     expect(css).toContain("height:40px");
     expect(css).toContain(".wc a svg{display:block;}");
@@ -414,19 +414,19 @@ describe("window-controls geometry normalization", () => {
   });
 
   test("wrong types fall back to defaults (no coercion)", () => {
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": "40", "left-offset": "10" })).toEqual({
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": "40", "overlay-left-offset": "10" })).toEqual({
       x: 3,
       y: 0,
       width: 72,
       height: 30,
     });
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": true, "left-offset": [10] })).toEqual({
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": true, "overlay-left-offset": [10] })).toEqual({
       x: 3,
       y: 0,
       width: 72,
       height: 30,
     });
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": NaN, "left-offset": Infinity })).toEqual({
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": NaN, "overlay-left-offset": Infinity })).toEqual({
       x: 3,
       y: 0,
       width: 72,
@@ -435,28 +435,28 @@ describe("window-controls geometry normalization", () => {
   });
 
   test("finite values round then clamp: height 30..64, adjustment 0..256", () => {
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": 24 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": 100 })).toEqual({ x: 20, y: 0, width: 72, height: 64 });
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": 29.6 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
-    expect(wc.normalizeWindowControlsGeometry({ "left-offset": -5 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
-    expect(wc.normalizeWindowControlsGeometry({ "left-offset": 1000 })).toEqual({ x: 259, y: 0, width: 72, height: 30 });
-    expect(wc.normalizeWindowControlsGeometry({ "left-offset": 10.4 })).toEqual({ x: 13, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": 24 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": 100 })).toEqual({ x: 20, y: 0, width: 72, height: 64 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": 29.6 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-left-offset": -5 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-left-offset": 1000 })).toEqual({ x: 259, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-left-offset": 10.4 })).toEqual({ x: 13, y: 0, width: 72, height: 30 });
   });
 
   test("normalization is exact and deterministic: values pass through untouched", () => {
     // Geometry is pure config math on CSS px: 30 in means exactly 30 out, on
     // every display — no environment reads, no adjustments.
-    const g = wc.normalizeWindowControlsGeometry({ "region-height": 30, "left-offset": 0 });
+    const g = wc.normalizeWindowControlsGeometry({ "overlay-region-height": 30, "overlay-left-offset": 0 });
     expect(g).toEqual({ x: 3, y: 0, width: 72, height: 30 });
     expect(Object.isFrozen(g)).toBe(true);
-    expect(wc.normalizeWindowControlsGeometry({ "region-height": 30, "left-offset": 0 })).toEqual(g);
+    expect(wc.normalizeWindowControlsGeometry({ "overlay-region-height": 30, "overlay-left-offset": 0 })).toEqual(g);
     expect(wc.sameWindowControlsGeometry(g, { x: 3, y: 0, width: 72, height: 30 })).toBe(true);
     expect(wc.sameWindowControlsGeometry(g, { x: 3, y: 0, width: 72, height: 31 })).toBe(false);
     expect(wc.sameWindowControlsGeometry(null, g)).toBe(false);
   });
 
   test("served HTML/CSS follow the instance geometry", () => {
-    const html = wc.windowControlsViewHtml("c".repeat(32), { "region-height": 48 });
+    const html = wc.windowControlsViewHtml("c".repeat(32), { "overlay-region-height": 48 });
     expect(html).toContain("width:24px;height:24px");
     expect(html).toContain("height:48px");
     expect(html).toContain('width="14" height="14"');
@@ -466,9 +466,15 @@ describe("window-controls geometry normalization", () => {
   });
 
   test("normalized geometries pass view builders through untouched (no re-default)", () => {
-    const g = wc.normalizeWindowControlsGeometry({ "region-height": 40, "left-offset": 10 });
+    const g = wc.normalizeWindowControlsGeometry({ "overlay-region-height": 40, "overlay-left-offset": 10 });
     expect(wc.windowControlsViewBounds(g)).toEqual({ x: 18, y: 0, width: 72, height: 40 });
     expect(wc.windowControlsViewCss(g)).toContain("width:24px;height:24px");
+  });
+
+  test("legacy bare keys are ignored with no shim (fall back to default geometry)", () => {
+    // Breaking rename: old `region-height` / `left-offset` carry no meaning.
+    expect(wc.normalizeWindowControlsGeometry({ "region-height": 40 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
+    expect(wc.normalizeWindowControlsGeometry({ "left-offset": 10 })).toEqual({ x: 3, y: 0, width: 72, height: 30 });
   });
 });
 
@@ -917,7 +923,7 @@ describe("ctx.windowControls trusted dispatch", () => {
       };
     `;
     const { win } = loadPlugins({
-      plugins: [pluginEntry(PID, WC_GRANTS, src, { "region-height": 40, "left-offset": 10 })],
+      plugins: [pluginEntry(PID, WC_GRANTS, src, { "overlay-region-height": 40, "overlay-left-offset": 10 })],
     });
     await waitFor(() => pluginMessages(PID, "info", "WC-READY").length > 0, "mounted");
     expect(FakeWebContentsView.created).toHaveLength(1);
@@ -953,7 +959,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     // Same plugin, new config height: fingerprint changes, VM respawns, the
     // old view is destroyed and a fresh one mounts under the new geometry
     // (H=48 -> m=12, x=12).
-    applyPlan(planFor("r2", [pluginEntry(PID, WC_GRANTS, src, { "region-height": 48 })]));
+    applyPlan(planFor("r2", [pluginEntry(PID, WC_GRANTS, src, { "overlay-region-height": 48 })]));
     await waitFor(() => FakeWebContentsView.created.length >= 2, "rebuilt view constructed");
     await waitFor(() => pluginMessages(PID, "info", "WC-READY").length >= 2, "remounted r2");
     const newView = overlayViewForWindow(win);
@@ -984,7 +990,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     const { win } = loadPlugins({
       plugins: [
         pluginEntry(PID, WC_GRANTS, srcA),
-        pluginEntry(PID2, WC_GRANTS, srcB, { "region-height": 40 }),
+        pluginEntry(PID2, WC_GRANTS, srcB, { "overlay-region-height": 40 }),
       ],
     });
     await waitFor(() => pluginMessages(PID, "info", "A-READY").length > 0, "A mounted");
@@ -1024,7 +1030,7 @@ describe("ctx.windowControls trusted dispatch", () => {
     const { win } = loadPlugins({
       plugins: [
         pluginEntry(PID, WC_GRANTS, srcA),
-        pluginEntry(PID2, WC_GRANTS, srcB, { "region-height": 40 }),
+        pluginEntry(PID2, WC_GRANTS, srcB, { "overlay-region-height": 40 }),
       ],
     });
     await sleep(30); // A mounts into the in-flight load; B must not join it.

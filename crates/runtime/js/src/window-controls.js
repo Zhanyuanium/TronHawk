@@ -70,10 +70,10 @@ function isFiniteGeometryNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-// Normalize a plugin config snapshot (`{ "region-height", "left-offset" }`)
-// to a frozen `{ x, y, width, height }` geometry. `region-height` H defaults
+// Normalize a plugin config snapshot (`{ "overlay-region-height", "overlay-left-offset" }`)
+// to a frozen `{ x, y, width, height }` geometry. `overlay-region-height` H defaults
 // to 30; finite values round to whole px, then clamp to 30..64 (24 is never
-// valid). `left-offset` is a RELATIVE adjustment L defaulting to 0 — the view
+// valid). `overlay-left-offset` is a RELATIVE adjustment L defaulting to 0 — the view
 // origin is x = m+L (vertical margin m=(H-24)/2 plus L, so the cluster keeps
 // a balanced left inset as H grows: default H=30 -> x=3; H=40 -> x=8);
 // finite values round, then clamp
@@ -85,8 +85,8 @@ function isFiniteGeometryNumber(value) {
 // No DPR/scaleFactor reads: H in means exactly H out on every display.
 function normalizeWindowControlsGeometry(input) {
   const src = input && typeof input === "object" ? input : {};
-  const rawHeight = src["region-height"];
-  const rawAdjust = src["left-offset"];
+  const rawHeight = src["overlay-region-height"];
+  const rawAdjust = src["overlay-left-offset"];
   const height = isFiniteGeometryNumber(rawHeight)
     ? Math.min(
         WINDOW_CONTROLS_REGION_HEIGHT_MAX,
